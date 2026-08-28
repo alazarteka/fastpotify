@@ -24,8 +24,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 /// Spotify's own desktop client identity, the one librespot streams with.
@@ -72,6 +72,15 @@ pub const WEB_SCOPES: &[&str] = &[
 const AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_REQUEST_LINE_BYTES: usize = 2048;
+const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+const MAX_CALLBACK_BODY_BYTES: usize = 0;
+const MAX_QUERY_VALUE_BYTES: usize = 4096;
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_REFRESH_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_SCOPE_BYTES: usize = 8 * 1024;
 /// Refresh this long before the access token expires.
 const REFRESH_MARGIN: Duration = Duration::from_secs(90);
 
@@ -141,14 +150,55 @@ pub fn begin(grant: Grant) -> Flow {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenResponse {
     pub access_token: String,
+    pub token_type: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
+    pub expires_in: u64,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl TokenResponse {
+    fn validate(&self) -> Result<()> {
+        validate_token_value("access token", &self.access_token, MAX_ACCESS_TOKEN_BYTES)?;
+        if !self.token_type.eq_ignore_ascii_case("bearer") {
+            bail!("Spotify returned an unsupported token type");
+        }
+        if !(1..=7 * 24 * 60 * 60).contains(&self.expires_in) {
+            bail!("Spotify returned an invalid token lifetime");
+        }
+        if let Some(refresh) = &self.refresh_token {
+            validate_token_value("refresh token", refresh, MAX_REFRESH_TOKEN_BYTES)?;
+        }
+        if let Some(scope) = &self.scope {
+            validate_scope(scope)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_token_value(label: &str, value: &str, limit: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > limit
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        bail!("Spotify returned an invalid {label}");
+    }
+    Ok(())
+}
+
+fn validate_scope(scope: &str) -> Result<()> {
+    if scope.len() > MAX_SCOPE_BYTES
+        || !scope
+            .bytes()
+            .all(|byte| byte == b' ' || (byte.is_ascii_graphic() && byte != b'"'))
+    {
+        bail!("Spotify returned an invalid scope list");
+    }
+    Ok(())
 }
 
 /// Listens for Spotify's redirect and returns the authorization code.
@@ -164,77 +214,288 @@ pub async fn wait_for_code(
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("unable to listen on {address} for the Spotify redirect"))?;
-    let deadline = tokio::time::sleep(LOGIN_TIMEOUT);
-    tokio::pin!(deadline);
+    let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
 
     loop {
-        let (mut stream, _) = tokio::select! {
+        let (mut stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted.context("redirect listener failed")?,
-            _ = cancel.changed() => {
-                if *cancel.borrow() { bail!("sign-in cancelled"); }
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() { bail!("sign-in cancelled"); }
                 continue;
             }
-            _ = &mut deadline => bail!("sign-in timed out; try again"),
+            _ = tokio::time::sleep_until(deadline) => bail!("sign-in timed out; try again"),
         };
-
-        let mut reader = BufReader::new(&mut stream);
-        let mut request_line = String::new();
-        if reader.read_line(&mut request_line).await.is_err() {
+        if !peer.ip().is_loopback() {
             continue;
         }
-        let outcome = parse_request_line(&request_line, expected_state);
-        let (status, body) = match &outcome {
-            Ok(_) => ("200 OK", success_page()),
-            Err(error) => ("400 Bad Request", failure_page(&error.to_string())),
-        };
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-        match outcome {
-            Ok(code) => return Ok(code),
-            Err(error) => {
-                // A favicon request or a stale tab is not the redirect; keep waiting.
-                log::debug!("ignored request on the redirect listener: {error}");
-                continue;
+        let connection_deadline =
+            deadline.min(tokio::time::Instant::now() + CONNECTION_TIMEOUT);
+        let outcome = tokio::select! {
+            handled = tokio::time::timeout_at(
+                connection_deadline,
+                serve_callback(&mut stream, expected_state, port),
+            ) => handled.ok().and_then(|result| result.ok()),
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() { bail!("sign-in cancelled"); }
+                None
             }
+            _ = tokio::time::sleep_until(deadline) => bail!("sign-in timed out; try again"),
+        };
+        if let Some(code) = outcome {
+            return Ok(code);
+        }
+        // A malformed request, stale tab, favicon, or slow local peer is not
+        // the redirect. Keep the one global deadline and accept another.
+        log::debug!("ignored an invalid request on the OAuth callback listener");
+    }
+}
+
+async fn serve_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+    port: u16,
+) -> Result<String> {
+    let request = read_request_head(stream).await?;
+    let outcome = parse_callback_request(&request, expected_state, port);
+    let (status, body) = if outcome.is_ok() {
+        ("200 OK", success_page())
+    } else {
+        ("400 Bad Request", failure_page())
+    };
+    write_callback_response(stream, status, body).await?;
+    outcome
+}
+
+async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut request = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let count = stream.read(&mut chunk).await.context("callback read failed")?;
+        if count == 0 {
+            bail!("callback connection closed before its headers");
+        }
+        if request.len() + count > MAX_REQUEST_HEAD_BYTES {
+            bail!("callback request headers are too large");
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if let Some(line_end) = find_bytes(&request, b"\r\n") {
+            if line_end > MAX_REQUEST_LINE_BYTES {
+                bail!("callback request line is too large");
+            }
+        } else if request.len() > MAX_REQUEST_LINE_BYTES {
+            bail!("callback request line is too large");
+        }
+        if find_bytes(&request, b"\r\n\r\n").is_some() {
+            return Ok(request);
         }
     }
 }
 
-fn parse_request_line(line: &str, expected_state: &str) -> Result<String> {
-    let target = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("malformed request"))?;
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn parse_callback_request(request: &[u8], expected_state: &str, port: u16) -> Result<String> {
+    if request.len() > MAX_REQUEST_HEAD_BYTES {
+        bail!("callback request headers are too large");
+    }
+    let end = find_bytes(request, b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("callback request headers are incomplete"))?;
+    if request.len() - end - 4 > MAX_CALLBACK_BODY_BYTES {
+        bail!("callback request bodies are not accepted");
+    }
+    let head = std::str::from_utf8(&request[..end])
+        .context("callback request headers are not UTF-8")?;
+    if head.bytes().any(|byte| {
+        byte == 0 || (byte < 0x20 && byte != b'\r' && byte != b'\n' && byte != b'\t')
+    }) {
+        bail!("callback request contains control characters");
+    }
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("callback request line is missing"))?;
+    if request_line.len() > MAX_REQUEST_LINE_BYTES {
+        bail!("callback request line is too large");
+    }
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if parts.next().is_some() || method != "GET" || version != "HTTP/1.1" || target.is_empty() {
+        bail!("callback must be an exact HTTP/1.1 GET");
+    }
+    if target.len() > MAX_REQUEST_LINE_BYTES || target.contains('#') || !target.starts_with('/') {
+        bail!("callback request target is invalid");
+    }
+
+    let mut host = None;
+    let mut content_length = None;
+    for (index, line) in lines.enumerate() {
+        if index >= 64 || line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
+            bail!("callback request headers are malformed");
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow!("callback request header is malformed"))?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        {
+            bail!("callback request header name is invalid");
+        }
+        let value = value.trim();
+        if value.bytes().any(|byte| byte < 0x20 && byte != b'\t') {
+            bail!("callback request header value is invalid");
+        }
+        if name.eq_ignore_ascii_case("host") {
+            if host.replace(value).is_some() {
+                bail!("callback request has duplicate Host headers");
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                bail!("callback request has duplicate Content-Length headers");
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .context("callback Content-Length is invalid")?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("expect")
+        {
+            bail!("callback request body framing is not accepted");
+        }
+    }
+    let expected_host = format!("127.0.0.1:{port}");
+    if host != Some(expected_host.as_str()) {
+        bail!("callback Host does not match the loopback listener");
+    }
+    if content_length.unwrap_or(0) != MAX_CALLBACK_BODY_BYTES {
+        bail!("callback request bodies are not accepted");
+    }
+
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != REDIRECT_PATH {
-        bail!("unexpected path {path}");
+        bail!("callback path is not the registered redirect path");
     }
     let mut code = None;
     let mut state = None;
     let mut error = None;
     for pair in query.split('&') {
+        if pair.is_empty() {
+            bail!("callback query is malformed");
+        }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if value.len() > MAX_QUERY_VALUE_BYTES {
+            bail!("callback query value is too large");
+        }
+        if !valid_percent_encoding(value.as_bytes()) {
+            bail!("callback query encoding is invalid");
+        }
         let value = urlencoding::decode(value)
-            .map(|value| value.into_owned())
-            .unwrap_or_else(|_| value.to_string());
+            .context("callback query encoding is invalid")?
+            .into_owned();
+        if value.len() > MAX_QUERY_VALUE_BYTES
+            || value
+                .bytes()
+                .any(|byte| byte == 0 || byte == b'\r' || byte == b'\n')
+        {
+            bail!("callback query value is invalid");
+        }
         match key {
-            "code" => code = Some(value),
-            "state" => state = Some(value),
-            "error" => error = Some(value),
+            "code" => set_once(&mut code, value, "code")?,
+            "state" => set_once(&mut state, value, "state")?,
+            "error" => set_once(&mut error, value, "error")?,
             _ => {}
         }
     }
-    if let Some(error) = error {
-        bail!("Spotify refused the sign-in: {error}");
+    if !state
+        .as_deref()
+        .is_some_and(|received| constant_time_eq(received.as_bytes(), expected_state.as_bytes()))
+    {
+        bail!("callback state mismatch");
     }
-    if state.as_deref() != Some(expected_state) {
-        bail!("state mismatch");
+    if error.is_some() {
+        bail!("Spotify declined the sign-in");
     }
-    code.ok_or_else(|| anyhow!("Spotify did not return an authorization code"))
+    let code = code.ok_or_else(|| anyhow!("Spotify did not return an authorization code"))?;
+    if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_graphic()) {
+        bail!("Spotify returned an invalid authorization code");
+    }
+    Ok(code)
+}
+
+fn valid_percent_encoding(value: &[u8]) -> bool {
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] == b'%' {
+            if index + 2 >= value.len()
+                || !value[index + 1].is_ascii_hexdigit()
+                || !value[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn set_once(slot: &mut Option<String>, value: String, label: &str) -> Result<()> {
+    if slot.replace(value).is_some() {
+        bail!("callback has a duplicate {label} parameter");
+    }
+    Ok(())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
+}
+
+async fn write_callback_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+) -> Result<()> {
+    let response = callback_response(status, body);
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("callback response write failed")?;
+    stream
+        .shutdown()
+        .await
+        .context("callback response shutdown failed")
+}
+
+fn callback_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Referrer-Policy: no-referrer\r\n\
+Cache-Control: no-store, max-age=0\r\n\
+Pragma: no-cache\r\n\
+Cross-Origin-Opener-Policy: same-origin\r\n\
+Connection: close\r\n\
+Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 pub async fn exchange_code(
@@ -273,31 +534,59 @@ pub async fn refresh(
 }
 
 async fn token_request(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<TokenResponse> {
-    let response = http
+    let mut response = http
         .post(TOKEN_URL)
         .form(form)
         .send()
         .await
         .context("token request failed")?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
+    {
+        bail!("Spotify token response is too large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("token response body failed")?
+    {
+        append_bounded(&mut body, &chunk, MAX_TOKEN_RESPONSE_BYTES)?;
+    }
     if !status.is_success() {
-        let detail = serde_json::from_str::<serde_json::Value>(&text)
+        let detail = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
             .and_then(|value| {
                 value["error_description"]
                     .as_str()
                     .or(value["error"].as_str())
-                    .map(str::to_string)
+                    .and_then(safe_provider_detail)
             })
-            .unwrap_or_else(|| redact(&text));
+            .unwrap_or_else(|| "request was rejected".into());
         bail!("Spotify rejected the token request ({status}): {detail}");
     }
-    serde_json::from_str(&text).context("unexpected token response")
+    let token: TokenResponse = serde_json::from_slice(&body).context("unexpected token response")?;
+    token.validate()?;
+    Ok(token)
 }
 
-fn redact(text: &str) -> String {
-    text.chars().take(200).collect()
+fn append_bounded(output: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<()> {
+    if chunk.len() > limit.saturating_sub(output.len()) {
+        bail!("response body exceeds the {limit}-byte limit");
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn safe_provider_detail(value: &str) -> Option<String> {
+    let detail: String = value
+        .chars()
+        .filter(|character| character.is_ascii_graphic() || *character == ' ')
+        .take(160)
+        .collect();
+    (!detail.trim().is_empty()).then(|| detail.trim().to_string())
 }
 
 /// The Web API grant as kept on disk between runs.
@@ -318,15 +607,17 @@ impl StoredToken {
         response: TokenResponse,
         previous_refresh: Option<&str>,
     ) -> Result<Self> {
+        response.validate()?;
         let refresh_token = response
             .refresh_token
             .or_else(|| previous_refresh.map(str::to_string))
             .ok_or_else(|| anyhow!("Spotify did not return a refresh token"))?;
+        validate_token_value("refresh token", &refresh_token, MAX_REFRESH_TOKEN_BYTES)?;
         Ok(Self {
             client_id: client_id.to_string(),
             access_token: response.access_token,
             refresh_token,
-            expires_at: now_secs() + response.expires_in.unwrap_or(3600),
+            expires_at: now_secs().saturating_add(response.expires_in),
             scope: response.scope.unwrap_or_default(),
         })
     }
@@ -335,13 +626,28 @@ impl StoredToken {
         now_secs() + REFRESH_MARGIN.as_secs() >= self.expires_at
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if self.client_id.is_empty()
+            || self.client_id.len() > 512
+            || !self.client_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            bail!("stored Spotify client id is invalid");
+        }
+        validate_token_value("stored access token", &self.access_token, MAX_ACCESS_TOKEN_BYTES)?;
+        validate_token_value(
+            "stored refresh token",
+            &self.refresh_token,
+            MAX_REFRESH_TOKEN_BYTES,
+        )?;
+        validate_scope(&self.scope)
+    }
+
     /// Whether the grant covers every scope in `scopes`. A grant cannot be
     /// widened by a refresh, only by the browser.
     pub fn has_scopes(&self, scopes: &[&str]) -> bool {
         let granted: Vec<&str> = self.scope.split_whitespace().collect();
         scopes.iter().all(|scope| granted.contains(scope))
     }
-
 }
 
 fn now_secs() -> u64 {
@@ -351,34 +657,20 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn page(title: &str, heading: &str, body: &str, accent: &str) -> String {
-    format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title>\
-<style>:root{{color-scheme:dark}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1114;color:#e8eaed;font-family:Inter,system-ui,sans-serif}}\
-main{{max-width:28rem;padding:2.5rem;border-radius:1.25rem;background:#181b20;box-shadow:0 20px 60px rgba(0,0,0,.5);text-align:center}}\
-.mark{{width:64px;height:64px;border-radius:50%;background:{accent};display:grid;place-items:center;margin:0 auto 1.25rem}}\
-.mark svg{{width:30px;height:30px;fill:#0f1114}}h1{{font-size:1.4rem;margin:.25rem 0 .5rem}}p{{color:#a5adba;line-height:1.5;margin:0}}</style>\
-<main><div class=\"mark\"><svg viewBox=\"0 0 24 24\"><path d=\"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z\"/></svg></div>\
-<h1>{heading}</h1><p>{body}</p></main><script>setTimeout(function(){{window.close()}},1500)</script></html>"
-    )
+const SUCCESS_PAGE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Signed in to Fastpotify</title>\
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1114;color:#e8eaed;font-family:system-ui,sans-serif}main{max-width:28rem;padding:2.5rem;border-radius:1.25rem;background:#181b20;text-align:center}.mark{width:64px;height:64px;border-radius:50%;background:#1ed760;display:grid;place-items:center;margin:0 auto 1.25rem}.mark svg{width:30px;height:30px;fill:#0f1114}h1{font-size:1.4rem;margin:.25rem 0 .5rem}p{color:#a5adba;line-height:1.5;margin:0}</style>\
+<main><div class=\"mark\"><svg viewBox=\"0 0 24 24\"><path d=\"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z\"/></svg></div><h1>You are signed in</h1><p>You can close this tab and return to Fastpotify.</p></main></html>";
+
+const FAILURE_PAGE: &str = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Fastpotify sign-in did not complete</title>\
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1114;color:#e8eaed;font-family:system-ui,sans-serif}main{max-width:28rem;padding:2.5rem;border-radius:1.25rem;background:#181b20;text-align:center}.mark{width:64px;height:64px;border-radius:50%;background:#f5717f;display:grid;place-items:center;margin:0 auto 1.25rem}.mark svg{width:30px;height:30px;fill:#0f1114}h1{font-size:1.4rem;margin:.25rem 0 .5rem}p{color:#a5adba;line-height:1.5;margin:0}</style>\
+<main><div class=\"mark\"><svg viewBox=\"0 0 24 24\"><path d=\"M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z\"/></svg></div><h1>Sign-in did not complete</h1><p>Return to Fastpotify and try again.</p></main></html>";
+
+fn success_page() -> &'static str {
+    SUCCESS_PAGE
 }
 
-fn success_page() -> String {
-    page(
-        "Signed in to Fastpotify",
-        "You're signed in",
-        "You can close this tab and go back to Fastpotify.",
-        "#1ed760",
-    )
-}
-
-fn failure_page(reason: &str) -> String {
-    page(
-        "Sign-in failed",
-        "Sign-in didn't complete",
-        &format!("{reason}. Return to Fastpotify and try again."),
-        "#f5717f",
-    )
+fn failure_page() -> &'static str {
+    FAILURE_PAGE
 }
 
 #[cfg(test)]
@@ -411,26 +703,140 @@ mod tests {
         assert_eq!(Grant::web_api(Some("  ")).client_id, DEFAULT_WEB_CLIENT_ID);
     }
 
+    fn callback(target: &str) -> Vec<u8> {
+        format!(
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{WEB_REDIRECT_PORT}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
     #[test]
-    fn request_line_parsing() {
-        let code =
-            parse_request_line("GET /login?code=abc%20d&state=s1 HTTP/1.1\r\n", "s1").unwrap();
-        assert_eq!(code, "abc d");
-        assert!(parse_request_line("GET /login?code=abc&state=other HTTP/1.1", "s1").is_err());
-        assert!(parse_request_line("GET /favicon.ico HTTP/1.1", "s1").is_err());
+    fn callback_accepts_only_the_exact_get_and_loopback_host() {
+        let request = callback("/login?code=abc%2Dd&state=s1");
+        let code = parse_callback_request(&request, "s1", WEB_REDIRECT_PORT).unwrap();
+        assert_eq!(code, "abc-d");
+
+        for invalid in [
+            "POST /login?code=abc&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
+            "GET /login?code=abc&state=s1 HTTP/1.0\r\nHost: 127.0.0.1:8989\r\n\r\n",
+            "GET http://127.0.0.1:8989/login?code=abc&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
+            "GET /favicon.ico?code=abc&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
+            "GET /login?code=abc&state=s1 HTTP/1.1\r\nHost: localhost:8989\r\n\r\n",
+        ] {
+            assert!(
+                parse_callback_request(invalid.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn callback_validates_state_before_provider_errors_and_never_reflects_input() {
+        let wrong_state = callback("/login?error=%3Cscript%3E&state=wrong");
+        let error = parse_callback_request(&wrong_state, "s1", WEB_REDIRECT_PORT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "callback state mismatch");
+
+        let denied = callback("/login?error=%3Cscript%3E&state=s1");
+        let error = parse_callback_request(&denied, "s1", WEB_REDIRECT_PORT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Spotify declined the sign-in");
+        assert!(!failure_page().contains("script"));
+        assert!(!failure_page().contains("wrong"));
+    }
+
+    #[test]
+    fn callback_rejects_duplicates_bodies_and_oversize_inputs() {
+        for target in [
+            "/login?code=a&code=b&state=s1",
+            "/login?code=a&state=s1&state=s1",
+            "/login?code=a&state=s1&error=denied&error=again",
+            "/login?code=%GG&state=s1",
+        ] {
+            assert!(
+                parse_callback_request(&callback(target), "s1", WEB_REDIRECT_PORT).is_err()
+            );
+        }
+
+        let length = b"GET /login?code=a&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\nContent-Length: 1\r\n\r\n";
+        let chunked = b"GET /login?code=a&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let trailing = b"GET /login?code=a&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\nx";
+        assert!(parse_callback_request(length, "s1", WEB_REDIRECT_PORT).is_err());
+        assert!(parse_callback_request(chunked, "s1", WEB_REDIRECT_PORT).is_err());
+        assert!(parse_callback_request(trailing, "s1", WEB_REDIRECT_PORT).is_err());
+
+        let oversized = format!(
+            "GET /login?code={}&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
+            "a".repeat(MAX_REQUEST_LINE_BYTES)
+        );
         assert!(
-            parse_request_line("GET /login?error=access_denied&state=s1 HTTP/1.1", "s1").is_err()
+            parse_callback_request(oversized.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err()
+        );
+    }
+
+    #[test]
+    fn callback_pages_have_non_reflecting_browser_defences() {
+        let response = callback_response("400 Bad Request", failure_page());
+        for header in [
+            "Content-Security-Policy: default-src 'none'",
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: no-referrer",
+            "Cache-Control: no-store, max-age=0",
+            "Pragma: no-cache",
+            "Cross-Origin-Opener-Policy: same-origin",
+        ] {
+            assert!(response.contains(header));
+        }
+        assert!(!response.contains("<script"));
+    }
+
+    #[test]
+    fn bounded_response_assembly_rejects_chunked_oversize() {
+        let mut output = Vec::new();
+        append_bounded(&mut output, b"1234", 8).unwrap();
+        append_bounded(&mut output, b"5678", 8).unwrap();
+        assert!(append_bounded(&mut output, b"9", 8).is_err());
+        assert_eq!(output.len(), 8);
+    }
+
+    fn token_response() -> TokenResponse {
+        TokenResponse {
+            access_token: "access".into(),
+            token_type: "Bearer".into(),
+            refresh_token: Some("refresh".into()),
+            expires_in: 3600,
+            scope: Some("user-read-private".into()),
+        }
+    }
+
+    #[test]
+    fn token_response_is_strictly_bounded_and_typed() {
+        assert!(token_response().validate().is_ok());
+        let mut invalid = token_response();
+        invalid.access_token = "has whitespace".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = token_response();
+        invalid.token_type = "MAC".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = token_response();
+        invalid.expires_in = 0;
+        assert!(invalid.validate().is_err());
+        let mut invalid = token_response();
+        invalid.refresh_token = Some("r".repeat(MAX_REFRESH_TOKEN_BYTES + 1));
+        assert!(invalid.validate().is_err());
+        assert!(
+            serde_json::from_str::<TokenResponse>(
+                r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"extra":1}"#
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn stored_token_round_trips_and_tracks_expiry() {
-        let response = TokenResponse {
-            access_token: "a".into(),
-            refresh_token: Some("r".into()),
-            expires_in: Some(3600),
-            scope: Some("x".into()),
-        };
+        let mut response = token_response();
+        response.scope = Some("x".into());
         let token = StoredToken::from_response("id", response, None).unwrap();
         assert!(!token.needs_refresh());
         assert!(token.has_scopes(&["x"]));

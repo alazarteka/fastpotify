@@ -348,23 +348,42 @@ pub fn load_json_migrating<T: Serialize + DeserializeOwned>(
     id: SecretId,
     legacy: &LegacySecret,
 ) -> Result<Option<T>> {
-    load_json_migrating_with(store, id, legacy)
+    load_json_migrating_with(store, id, legacy, &|_| Ok(()))
+}
+
+/// As [`load_json_migrating`], with semantic validation before any legacy
+/// copy can be deleted.
+pub fn load_json_migrating_validated<T: Serialize + DeserializeOwned>(
+    store: &dyn SecretStore,
+    id: SecretId,
+    legacy: &LegacySecret,
+    validate: impl Fn(&T) -> Result<()>,
+) -> Result<Option<T>> {
+    load_json_migrating_with(store, id, legacy, &validate)
 }
 
 fn load_json_migrating_with<T: Serialize + DeserializeOwned>(
     store: &dyn SecretStore,
     id: SecretId,
     legacy: &dyn LegacyIo,
+    validate: &dyn Fn(&T) -> Result<()>,
 ) -> Result<Option<T>> {
     let current = load_json::<T>(store, id)?;
+    if let Some(value) = &current {
+        validate(value)?;
+    }
     let old_bytes = legacy.load(id)?;
     let old = match old_bytes {
-        Some(bytes) => Some(serde_json::from_slice::<T>(&bytes).map_err(|error| {
-            SecretError::Corrupt {
-                kind: id.label(),
-                reason: format!("legacy JSON: {error}"),
-            }
-        })?),
+        Some(bytes) => {
+            let value = serde_json::from_slice::<T>(&bytes).map_err(|error| {
+                SecretError::Corrupt {
+                    kind: id.label(),
+                    reason: format!("legacy JSON: {error}"),
+                }
+            })?;
+            validate(&value)?;
+            Some(value)
+        }
         None => None,
     };
 
@@ -828,7 +847,36 @@ mod tests {
             value: Mutex::new(Some(encoded_example())),
             fail_delete: false,
         };
-        assert!(load_json_migrating_with::<ExampleSecret>(&store, SecretId::WebApi, &legacy).is_err());
+        assert!(
+            load_json_migrating_with::<ExampleSecret>(
+                &store,
+                SecretId::WebApi,
+                &legacy,
+                &|_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(legacy.value.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn migration_preserves_legacy_on_semantic_validation_failure() {
+        let store = MockStore::default();
+        let legacy = MockLegacy {
+            value: Mutex::new(Some(encoded_example())),
+            fail_delete: false,
+        };
+        let result = load_json_migrating_with::<ExampleSecret>(
+            &store,
+            SecretId::WebApi,
+            &legacy,
+            &|_| Err(SecretError::Corrupt {
+                kind: SecretId::WebApi.label(),
+                reason: "injected validation failure".into(),
+            }),
+        );
+        assert!(result.is_err());
+        assert_eq!(store.0.lock().unwrap().stores, 0);
         assert!(legacy.value.lock().unwrap().is_some());
     }
 
@@ -846,8 +894,13 @@ mod tests {
                 fail_delete: false,
             };
             assert!(
-                load_json_migrating_with::<ExampleSecret>(&store, SecretId::WebApi, &legacy)
-                    .is_err()
+                load_json_migrating_with::<ExampleSecret>(
+                    &store,
+                    SecretId::WebApi,
+                    &legacy,
+                    &|_| Ok(())
+                )
+                .is_err()
             );
             assert!(legacy.value.lock().unwrap().is_some());
         }
@@ -860,13 +913,22 @@ mod tests {
             value: Mutex::new(Some(encoded_example())),
             fail_delete: true,
         };
-        assert!(load_json_migrating_with::<ExampleSecret>(&store, SecretId::Playback, &legacy).is_err());
+        assert!(
+            load_json_migrating_with::<ExampleSecret>(
+                &store,
+                SecretId::Playback,
+                &legacy,
+                &|_| Ok(())
+            )
+            .is_err()
+        );
         assert!(legacy.value.lock().unwrap().is_some());
         legacy.fail_delete = false;
         let migrated = load_json_migrating_with::<ExampleSecret>(
             &store,
             SecretId::Playback,
             &legacy,
+            &|_| Ok(()),
         )
         .unwrap()
         .unwrap();

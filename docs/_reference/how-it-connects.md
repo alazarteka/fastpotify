@@ -25,6 +25,14 @@ streaming-identity tokens. Measured during development, every endpoint
 answers `429` within the first request. Two narrow grants are what actually
 works, and each one happens exactly once per machine.
 
+Each browser redirect returns to a short-lived listener bound only to
+`127.0.0.1`. It accepts one bounded HTTP GET on the registered path and port,
+requires the unpredictable PKCE state before interpreting Spotify's result,
+and times out slow local connections. Its success and failure pages are
+static, non-reflecting, non-cacheable, and carry a restrictive browser content
+policy. Token responses from Spotify are also read under a fixed size limit
+and validated before they can be stored or used.
+
 By default the Web API uses the shared public application also used by
 spotify-player, ncspot, and Omarchy Spotify, whose allowance Spotify
 divides among everyone running any of them. An application of your own

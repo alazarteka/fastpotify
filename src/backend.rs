@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
+use librespot_protocol::authentication::AuthenticationType;
 use tokio::sync::{mpsc, watch};
 
 use crate::api::models::*;
@@ -520,6 +521,7 @@ impl Backend {
         let http = reqwest::Client::builder()
             .user_agent(concat!("fastpotify/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("unable to build the HTTP client");
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
@@ -752,10 +754,18 @@ impl Worker {
     /// On startup, resume a saved Web API grant. The local engine follows
     /// once the plan is known (`on_account_checked`), never before.
     fn restore_session(&mut self) {
-        let token = crate::secrets::load_json_migrating::<crate::auth::StoredToken>(
+        let token = crate::secrets::load_json_migrating_validated::<crate::auth::StoredToken>(
             self.secrets.as_ref(),
             SecretId::WebApi,
             &self.dirs.legacy_web_secret(),
+            |token| {
+                token
+                    .validate()
+                    .map_err(|error| crate::secrets::SecretError::Corrupt {
+                        kind: SecretId::WebApi.label(),
+                        reason: error.to_string(),
+                    })
+            },
         );
         match token {
             Ok(Some(token)) if !token.has_scopes(crate::auth::WEB_SCOPES) => {
@@ -967,10 +977,30 @@ impl Worker {
     }
 
     fn saved_playback_credentials(&self) -> crate::secrets::Result<Option<Credentials>> {
-        crate::secrets::load_json_migrating(
+        crate::secrets::load_json_migrating_validated(
             self.secrets.as_ref(),
             SecretId::Playback,
             &self.dirs.legacy_playback_secret(),
+            |credentials| {
+                let username_valid = credentials
+                    .username
+                    .as_deref()
+                    .is_some_and(|username| {
+                        !username.trim().is_empty() && username.len() <= 512
+                    });
+                if !username_valid
+                    || credentials.auth_data.is_empty()
+                    || credentials.auth_data.len() > 512 * 1024
+                    || credentials.auth_type
+                        != AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS
+                {
+                    return Err(crate::secrets::SecretError::Corrupt {
+                        kind: SecretId::Playback.label(),
+                        reason: "credential shape or authentication type is invalid".into(),
+                    });
+                }
+                Ok(())
+            }
         )
     }
 
