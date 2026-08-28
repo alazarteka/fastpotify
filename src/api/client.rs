@@ -37,6 +37,8 @@ pub enum ApiError {
     RateLimited,
     #[error("your Spotify sign-in expired; please sign in again")]
     SignInExpired(String),
+    #[error("Spotify refreshed the sign-in, but it could not be stored safely: {0}")]
+    CredentialPersistence(String),
     #[error("network error: {0}")]
     Network(String),
     #[error("unexpected response from Spotify: {0}")]
@@ -86,63 +88,93 @@ impl TokenProvider {
         }
     }
 
-    async fn invalidate(&self) {
+    async fn invalidate(&self) -> Result<()> {
         let Self::Web(tokens) = self;
-        let _ = tokens.access_token(true).await;
+        tokens.access_token(true).await.map(drop)
     }
 }
 
 /// The Web API grant, refreshed and persisted as it ages.
 pub struct WebTokens {
     http: reqwest::Client,
-    token: tokio::sync::Mutex<crate::auth::StoredToken>,
-    path: std::path::PathBuf,
+    token: Mutex<Option<crate::auth::StoredToken>>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    store: Arc<dyn crate::secrets::SecretStore>,
 }
 
 impl WebTokens {
     pub fn new(
         http: reqwest::Client,
         token: crate::auth::StoredToken,
-        path: std::path::PathBuf,
+        store: Arc<dyn crate::secrets::SecretStore>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             http,
-            token: tokio::sync::Mutex::new(token),
-            path,
+            token: Mutex::new(Some(token)),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            store,
         })
+    }
+
+    /// Revokes this in-process provider synchronously. A refresh already on
+    /// the network must acquire `token` again before persisting, so sign-out
+    /// can clear and then delete without a late task recreating the file.
+    pub fn deactivate(&self) {
+        *self.token.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+
+    fn current(&self) -> Result<crate::auth::StoredToken> {
+        self.token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .ok_or(ApiError::NotSignedIn)
     }
 
     /// A valid access token, refreshing first when it is close to expiry or
     /// `force` asks for a fresh one after a 401.
     async fn access_token(&self, force: bool) -> Result<String> {
-        let mut guard = self.token.lock().await;
-        if force || guard.needs_refresh() {
-            let client_id = guard.client_id.clone();
-            let refresh_token = guard.refresh_token.clone();
-            match crate::auth::refresh(&self.http, &client_id, &refresh_token).await {
-                Ok(response) => match crate::auth::StoredToken::from_response(
-                    &client_id,
-                    response,
-                    Some(&refresh_token),
-                ) {
-                    Ok(updated) => {
-                        let _ = updated.save(&self.path);
-                        *guard = updated;
-                    }
-                    Err(error) => {
-                        log::warn!("token refresh returned an unusable response: {error}")
-                    }
-                },
-                Err(error) => {
-                    // A hard refresh failure means the grant is gone.
-                    if force || guard.needs_refresh() {
-                        return Err(ApiError::SignInExpired(error.to_string()));
-                    }
-                    log::warn!("token refresh failed, using the current token: {error}");
-                }
-            }
+        let current = self.current()?;
+        if !force && !current.needs_refresh() {
+            return Ok(current.access_token);
         }
-        Ok(guard.access_token.clone())
+
+        let _refresh = self.refresh_lock.lock().await;
+        let current = self.current()?;
+        if !force && !current.needs_refresh() {
+            return Ok(current.access_token);
+        }
+        let client_id = current.client_id.clone();
+        let refresh_token = current.refresh_token.clone();
+        let response = crate::auth::refresh(&self.http, &client_id, &refresh_token)
+            .await
+            .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
+        let updated = crate::auth::StoredToken::from_response(
+            &client_id,
+            response,
+            Some(&refresh_token),
+        )
+        .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
+
+        let mut guard = self
+            .token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(live) = guard.as_ref() else {
+            return Err(ApiError::NotSignedIn);
+        };
+        if live.client_id != client_id || live.refresh_token != refresh_token {
+            return Ok(live.access_token.clone());
+        }
+        crate::secrets::store_json(
+            self.store.as_ref(),
+            crate::secrets::SecretId::WebApi,
+            &updated,
+        )
+        .map_err(|error| ApiError::CredentialPersistence(error.to_string()))?;
+        let access_token = updated.access_token.clone();
+        *guard = Some(updated);
+        Ok(access_token)
     }
 }
 
@@ -347,7 +379,7 @@ impl ApiClient {
 
             if status == StatusCode::UNAUTHORIZED && attempt == 1 {
                 // The access token was rejected; force a refresh and retry once.
-                provider.invalidate().await;
+                provider.invalidate().await?;
                 continue;
             }
             if status == StatusCode::TOO_MANY_REQUESTS && attempt <= RATE_LIMIT_RETRIES {

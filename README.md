@@ -114,15 +114,22 @@ Press **Sign in with Spotify**. Your browser opens Spotify's own consent
 page (Authorization Code with PKCE); Fastpotify never sees your password.
 When Spotify redirects back to the app, your library, search, and control
 of other devices work immediately. The refresh token is stored in the
-platform's state directory (`~/.local/state/fastpotify` on Linux), so the
-browser is needed once per machine.
+platform's state directory as an owner-private file, so the browser is needed
+once per machine.
 
 Playing music **on this computer** is one more one-time browser approval.
 Spotify treats streaming as a separate grant for its own client identity,
 which is what librespot plays with. Take it from the device menu ("Play
 here, set up once") or Settings; it needs Spotify Premium, and librespot
-stores a reusable credential so it also never asks again. Browsing and
-remote control work on any account without this step.
+returns a reusable credential that Fastpotify stores separately from the Web
+grant, so it also never asks again. Browsing and remote control work on any
+account without this step.
+
+These files avoid Keychain prompts and use the conventional desktop/Linux
+threat model: directories are owner-only (0700) and credential files are
+owner-only (0600) on Unix. They are not encrypted with a key stored beside
+them. FileVault or full-disk encryption protects a powered-off disk, but
+malware already running as your account can read the credentials.
 
 By default the Web API uses the shared public application also used by
 spotify-player, ncspot, and Omarchy Spotify. If you hit rate limits you can

@@ -17,6 +17,7 @@ use crate::api::{ApiClient, ApiError, NetActivity, PlayRequest, TokenProvider, W
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
 use crate::player::{Engine, EngineConfig, EngineEvent, LocalState, PlayerCommand};
+use crate::secrets::{PrivateFileStore, SecretId, SecretStore};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -355,9 +356,14 @@ pub enum Command {
     },
     Shutdown,
     /// Internal: the Web API browser flow produced a grant.
-    WebSignedIn(Box<crate::auth::StoredToken>),
-    /// Internal: a browser flow ended (success or not).
-    SignInEnded,
+    WebSignedIn {
+        token: Box<crate::auth::StoredToken>,
+        epoch: u64,
+    },
+    WebSignInFailed {
+        message: Option<String>,
+        epoch: u64,
+    },
     /// Internal: the Web API said which plan the account is on (`None` when
     /// it could not tell).
     AccountChecked {
@@ -366,10 +372,17 @@ pub enum Command {
     /// Internal: the playback grant produced a streaming access token.
     PlaybackAuthorized {
         access_token: String,
+        epoch: u64,
+    },
+    PlaybackAuthorizationFailed {
+        message: Option<String>,
+        epoch: u64,
     },
     /// Internal: an engine connection attempt finished.
     EngineConnected {
         engine: Box<Option<Engine>>,
+        credential: Option<Credentials>,
+        epoch: u64,
         error: Option<String>,
     },
     /// Internal: librespot's session ended on its own.
@@ -601,6 +614,8 @@ struct Worker {
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
     engine: Option<Arc<Engine>>,
+    web_tokens: Option<Arc<WebTokens>>,
+    secrets: Arc<dyn SecretStore>,
     /// True while a playback grant or engine connection is in flight, so a
     /// second attempt does not pile up.
     engine_busy: bool,
@@ -609,6 +624,11 @@ struct Worker {
     premium: Option<bool>,
     cancel_signin: Option<watch::Sender<bool>>,
     reconnects: Vec<Instant>,
+    /// Invalidates browser flows that finish after cancellation by sign-out
+    /// or application switching.
+    auth_epoch: u64,
+    /// Invalidates playback handshakes that finish after sign-out.
+    credential_epoch: u64,
 }
 
 impl Worker {
@@ -624,6 +644,8 @@ impl Worker {
         commands: mpsc::UnboundedSender<Command>,
         waker: Waker,
     ) -> Self {
+        let secrets: Arc<dyn SecretStore> =
+            Arc::new(PrivateFileStore::new(dirs.secrets_dir()));
         Self {
             dirs,
             engine_config,
@@ -635,11 +657,15 @@ impl Worker {
             commands,
             waker,
             engine: None,
+            web_tokens: None,
+            secrets,
             engine_busy: false,
             signed_in: false,
             premium: None,
             cancel_signin: None,
             reconnects: Vec::new(),
+            auth_epoch: 0,
+            credential_epoch: 0,
         }
     }
 
@@ -677,14 +703,31 @@ impl Worker {
                 },
                 Command::Api(request) => self.dispatch(request),
                 Command::Accent { url } => self.accent(url),
-                Command::WebSignedIn(token) => self.on_web_signed_in(*token),
-                Command::PlaybackAuthorized { access_token } => {
-                    self.connect_engine(Credentials::with_access_token(access_token))
+                Command::WebSignedIn { token, epoch } => {
+                    self.on_web_signed_in(*token, epoch)
                 }
-                Command::EngineConnected { engine, error } => {
-                    self.on_engine_connected(*engine, error)
+                Command::WebSignInFailed { message, epoch } => {
+                    self.on_web_sign_in_failed(message, epoch)
                 }
-                Command::SignInEnded => self.cancel_signin = None,
+                Command::PlaybackAuthorized {
+                    access_token,
+                    epoch,
+                } => {
+                    if epoch == self.auth_epoch {
+                        self.connect_engine(Credentials::with_access_token(access_token));
+                    }
+                }
+                Command::PlaybackAuthorizationFailed { message, epoch } => {
+                    self.on_playback_authorization_failed(message, epoch)
+                }
+                Command::EngineConnected {
+                    engine,
+                    credential,
+                    epoch,
+                    error,
+                } => {
+                    self.on_engine_connected(*engine, credential, epoch, error)
+                }
                 Command::AccountChecked { premium } => self.on_account_checked(premium),
                 Command::Reconnect => self.reconnect_engine(),
                 Command::CheckForUpdates => self.check_for_updates(),
@@ -709,15 +752,20 @@ impl Worker {
     /// On startup, resume a saved Web API grant. The local engine follows
     /// once the plan is known (`on_account_checked`), never before.
     fn restore_session(&mut self) {
-        match crate::auth::StoredToken::load(&self.dirs.web_token_file()) {
-            Some(token) if !token.has_scopes(crate::auth::WEB_SCOPES) => {
+        let token = crate::secrets::load_json_migrating::<crate::auth::StoredToken>(
+            self.secrets.as_ref(),
+            SecretId::WebApi,
+            &self.dirs.legacy_web_secret(),
+        );
+        match token {
+            Ok(Some(token)) if !token.has_scopes(crate::auth::WEB_SCOPES) => {
                 // Granted before a scope this version relies on; only the
                 // browser can widen it.
                 self.emit(Event::Auth(AuthStatus::Failed(
                     "Fastpotify needs one more Spotify permission. Please sign in again.".into(),
                 )));
             }
-            Some(token) => {
+            Ok(Some(token)) => {
                 self.activate_web_token(token);
                 self.emit(Event::Auth(AuthStatus::Connecting));
                 self.dispatch(ApiRequest::Me);
@@ -726,23 +774,46 @@ impl Worker {
                     username: String::new(),
                 }));
             }
-            None => self.emit(Event::Auth(AuthStatus::SignedOut)),
+            Ok(None) => self.emit(Event::Auth(AuthStatus::SignedOut)),
+            Err(error) => self.emit(Event::Auth(AuthStatus::Failed(format!(
+                "Stored Spotify sign-in could not be read safely: {error}"
+            )))),
         }
     }
 
-    fn activate_web_token(&self, token: crate::auth::StoredToken) {
+    fn deactivate_web_token(&mut self) {
+        self.api.set_token_provider(None);
+        if let Some(tokens) = self.web_tokens.take() {
+            tokens.deactivate();
+        }
+    }
+
+    fn activate_web_token(&mut self, token: crate::auth::StoredToken) {
+        self.deactivate_web_token();
         self.emit(Event::WebApp {
             client_id: token.client_id.clone(),
         });
-        let tokens = WebTokens::new(self.http.clone(), token, self.dirs.web_token_file());
+        let tokens = WebTokens::new(self.http.clone(), token, Arc::clone(&self.secrets));
         self.api
-            .set_token_provider(Some(TokenProvider::Web(tokens)));
+            .set_token_provider(Some(TokenProvider::Web(Arc::clone(&tokens))));
+        self.web_tokens = Some(tokens);
     }
 
-    fn on_web_signed_in(&mut self, token: crate::auth::StoredToken) {
+    fn on_web_signed_in(&mut self, token: crate::auth::StoredToken, epoch: u64) {
+        if epoch != self.auth_epoch {
+            return;
+        }
         self.cancel_signin = None;
-        if let Err(error) = token.save(&self.dirs.web_token_file()) {
-            log::warn!("unable to save the Spotify sign-in: {error}");
+        if let Err(error) =
+            crate::secrets::store_json(self.secrets.as_ref(), SecretId::WebApi, &token)
+        {
+            self.emit(Event::Auth(AuthStatus::Failed(
+                "Spotify approved the sign-in, but Fastpotify could not store it safely.".into(),
+            )));
+            self.emit(Event::Error(format!(
+                "Sign-in was not activated because credential storage failed: {error}"
+            )));
+            return;
         }
         self.activate_web_token(token);
         self.signed_in = true;
@@ -750,6 +821,17 @@ impl Worker {
             username: String::new(),
         }));
         self.dispatch(ApiRequest::Me);
+    }
+
+    fn on_web_sign_in_failed(&mut self, message: Option<String>, epoch: u64) {
+        if epoch != self.auth_epoch {
+            return;
+        }
+        self.cancel_signin = None;
+        self.emit(Event::Auth(AuthStatus::SignedOut));
+        if let Some(message) = message {
+            self.emit(Event::Error(format!("Sign-in failed: {message}")));
+        }
     }
 
     fn sign_in(&mut self) {
@@ -767,9 +849,8 @@ impl Worker {
             log::warn!("unable to open a browser: {error}");
         }
         let http = self.http.clone();
-        let events = self.events.clone();
-        let waker = self.waker.clone();
         let commands = self.commands.clone();
+        let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
                 let code =
@@ -781,16 +862,17 @@ impl Worker {
             .await;
             match result {
                 Ok(token) => {
-                    let _ = commands.send(Command::WebSignedIn(Box::new(token)));
+                    let _ = commands.send(Command::WebSignedIn {
+                        token: Box::new(token),
+                        epoch,
+                    });
                 }
                 Err(error) => {
-                    let _ = events.send(Event::Auth(AuthStatus::SignedOut));
                     let message = error.to_string();
-                    if !message.contains("cancelled") {
-                        let _ = events.send(Event::Error(format!("Sign-in failed: {message}")));
-                    }
-                    waker.wake();
-                    let _ = commands.send(Command::SignInEnded);
+                    let _ = commands.send(Command::WebSignInFailed {
+                        message: (!message.contains("cancelled")).then_some(message),
+                        epoch,
+                    });
                 }
             }
         });
@@ -803,27 +885,53 @@ impl Worker {
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
         }
+        self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.web_client_id = client_id;
-        self.api.set_token_provider(None);
-        crate::auth::StoredToken::remove(&self.dirs.web_token_file());
+        self.deactivate_web_token();
         self.signed_in = false;
         self.emit(Event::Auth(AuthStatus::SignedOut));
+        if let Err(error) = crate::secrets::clear_secret_copies(
+            self.secrets.as_ref(),
+            SecretId::WebApi,
+            &self.dirs.legacy_web_secret(),
+        ) {
+            self.emit(Event::Error(format!(
+                "The Web sign-in was cleared from memory, but stored credentials remain: {error}"
+            )));
+            return;
+        }
         self.sign_in();
     }
 
     fn sign_out(&mut self) {
-        self.signed_in = false;
-        if let Some(engine) = self.engine.take() {
-            engine.shutdown();
-        }
-        if let Some(cancel) = self.cancel_signin.take() {
-            let _ = cancel.send(true);
-        }
-        self.api.set_token_provider(None);
-        crate::auth::StoredToken::remove(&self.dirs.web_token_file());
-        let _ = std::fs::remove_file(self.dirs.credentials_dir().join("credentials.json"));
+        let secrets = Arc::clone(&self.secrets);
+        let web_legacy = self.dirs.legacy_web_secret();
+        let playback_legacy = self.dirs.legacy_playback_secret();
+        let cleared = crate::secrets::clear_all_secrets(
+            secrets.as_ref(),
+            &web_legacy,
+            &playback_legacy,
+            || {
+                self.signed_in = false;
+                self.auth_epoch = self.auth_epoch.wrapping_add(1);
+                self.credential_epoch = self.credential_epoch.wrapping_add(1);
+                self.engine_busy = false;
+                if let Some(engine) = self.engine.take() {
+                    engine.shutdown();
+                }
+                if let Some(cancel) = self.cancel_signin.take() {
+                    let _ = cancel.send(true);
+                }
+                self.deactivate_web_token();
+            },
+        );
         self.emit(Event::Playback(LocalPlayback::Unavailable));
         self.emit(Event::Auth(AuthStatus::SignedOut));
+        if let Err(error) = cleared {
+            self.emit(Event::Error(format!(
+                "Signed out for this run, but some stored credentials could not be deleted: {error}"
+            )));
+        }
     }
 
     // ---- local playback engine -------------------------------------------
@@ -849,14 +957,21 @@ impl Worker {
         if self.engine.is_some() || self.engine_busy || self.premium == Some(false) {
             return;
         }
-        let credentials = self
-            .engine_config
-            .open_cache()
-            .ok()
-            .and_then(|cache| cache.credentials());
-        if let Some(credentials) = credentials {
-            self.connect_engine(credentials);
+        match self.saved_playback_credentials() {
+            Ok(Some(credentials)) => self.connect_engine(credentials),
+            Ok(None) => {}
+            Err(error) => self.emit(Event::Playback(LocalPlayback::Failed(format!(
+                "Stored playback credentials could not be read safely: {error}"
+            )))),
         }
+    }
+
+    fn saved_playback_credentials(&self) -> crate::secrets::Result<Option<Credentials>> {
+        crate::secrets::load_json_migrating(
+            self.secrets.as_ref(),
+            SecretId::Playback,
+            &self.dirs.legacy_playback_secret(),
+        )
     }
 
     /// Reconnect the engine after its session dropped or audio settings changed.
@@ -906,9 +1021,8 @@ impl Worker {
             log::warn!("unable to open a browser: {error}");
         }
         let http = self.http.clone();
-        let events = self.events.clone();
-        let waker = self.waker.clone();
         let commands = self.commands.clone();
+        let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
                 let code =
@@ -920,28 +1034,37 @@ impl Worker {
                 Ok(token) => {
                     let _ = commands.send(Command::PlaybackAuthorized {
                         access_token: token.access_token,
+                        epoch,
                     });
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if message.contains("cancelled") {
-                        let _ = events.send(Event::Playback(LocalPlayback::Unavailable));
-                    } else {
-                        let _ = events.send(Event::Playback(LocalPlayback::Failed(message)));
-                    }
-                    waker.wake();
-                    let _ = commands.send(Command::SignInEnded);
+                    let _ = commands.send(Command::PlaybackAuthorizationFailed {
+                        message: (!message.contains("cancelled")).then_some(message),
+                        epoch,
+                    });
                 }
             }
         });
     }
 
+    fn on_playback_authorization_failed(&mut self, message: Option<String>, epoch: u64) {
+        if epoch != self.auth_epoch {
+            return;
+        }
+        self.cancel_signin = None;
+        match message {
+            Some(message) => self.emit(Event::Playback(LocalPlayback::Failed(message))),
+            None => self.emit(Event::Playback(LocalPlayback::Unavailable)),
+        }
+    }
+
     /// Spawn an engine connection so a slow or hung librespot handshake can
     /// never block the command loop (this was the cause of the app freezing
-    /// on "Connecting to Spotify"). `Engine::connect` stores the reusable
-    /// credential itself, so authorizing once is enough.
+    /// on "Connecting to Spotify"). The reusable credential comes back to
+    /// the command loop and must be durably stored before the engine is used.
     fn connect_engine(&mut self, credentials: Credentials) {
-        if self.engine_busy {
+        if self.engine_busy || !self.signed_in {
             return;
         }
         if self.premium == Some(false) {
@@ -955,15 +1078,17 @@ impl Worker {
         self.emit(Event::Playback(LocalPlayback::Connecting));
         let config = self.engine_config.clone();
         let notify = self.engine_notify();
-        let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
+        let epoch = self.credential_epoch;
         tokio::spawn(async move {
             let cache = match config.open_cache() {
                 Ok(cache) => cache,
                 Err(error) => {
                     let _ = commands.send(Command::EngineConnected {
                         engine: Box::new(None),
+                        credential: None,
+                        epoch,
                         error: Some(error.to_string()),
                     });
                     return;
@@ -975,40 +1100,74 @@ impl Worker {
             )
             .await;
             let outcome = match attempt {
-                Ok(Ok(engine)) => Command::EngineConnected {
+                Ok(Ok((engine, credential))) => Command::EngineConnected {
                     engine: Box::new(Some(engine)),
+                    credential: Some(credential),
+                    epoch,
                     error: None,
                 },
                 Ok(Err(error)) => {
                     log::error!("engine connect failed: {error:#}");
                     Command::EngineConnected {
                         engine: Box::new(None),
+                        credential: None,
+                        epoch,
                         error: Some(friendly_connect_error(&error)),
                     }
                 }
                 Err(_) => Command::EngineConnected {
                     engine: Box::new(None),
+                    credential: None,
+                    epoch,
                     error: Some("Connecting to Spotify timed out".into()),
                 },
             };
             let _ = commands.send(outcome);
-            let _ = events;
             waker.wake();
         });
     }
 
-    fn on_engine_connected(&mut self, engine: Option<Engine>, error: Option<String>) {
+    fn on_engine_connected(
+        &mut self,
+        engine: Option<Engine>,
+        credential: Option<Credentials>,
+        epoch: u64,
+        error: Option<String>,
+    ) {
+        if epoch != self.credential_epoch || !self.signed_in {
+            if let Some(engine) = engine {
+                engine.shutdown();
+            }
+            return;
+        }
         self.engine_busy = false;
-        match engine {
-            Some(engine) => {
+        match (engine, credential) {
+            (Some(engine), Some(credential)) => {
+                if let Err(error) = crate::secrets::store_json(
+                    self.secrets.as_ref(),
+                    SecretId::Playback,
+                    &credential,
+                ) {
+                    engine.shutdown();
+                    self.emit(Event::Playback(LocalPlayback::Failed(format!(
+                        "Spotify connected, but its playback credential could not be stored safely: {error}"
+                    ))));
+                    return;
+                }
                 let device_id = engine.device_id().to_string();
                 self.engine = Some(Arc::new(engine));
                 self.reconnects.clear();
                 self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
             }
-            None => {
+            (None, _) => {
                 let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
                 self.emit(Event::Playback(LocalPlayback::Failed(message)));
+            }
+            (Some(engine), None) => {
+                engine.shutdown();
+                self.emit(Event::Playback(LocalPlayback::Failed(
+                    "Spotify did not return a reusable playback credential".into(),
+                )));
             }
         }
     }
@@ -1024,16 +1183,14 @@ impl Worker {
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
             }
-            let credential_stored = self
-                .engine_config
-                .open_cache()
-                .ok()
-                .and_then(|cache| cache.credentials())
-                .is_some();
-            if credential_stored {
-                self.emit(Event::Playback(LocalPlayback::Failed(
+            match self.saved_playback_credentials() {
+                Ok(Some(_)) => self.emit(Event::Playback(LocalPlayback::Failed(
                     PREMIUM_NEEDED.into(),
-                )));
+                ))),
+                Ok(None) => {}
+                Err(error) => self.emit(Event::Playback(LocalPlayback::Failed(format!(
+                    "Stored playback credentials could not be read safely: {error}"
+                )))),
             }
             return;
         }

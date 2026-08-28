@@ -31,6 +31,7 @@ use librespot_playback::{
     mixer::{self, Mixer, MixerConfig, NoOpVolume, VolumeGetter},
     player::{Player, PlayerEvent},
 };
+use librespot_protocol::authentication::AuthenticationType;
 use sha1::{Digest, Sha1};
 
 use crate::sink::{ErrorHook, RodioSink};
@@ -45,7 +46,6 @@ pub struct EngineConfig {
     pub backend: Option<String>,
     pub audio_device: Option<String>,
     pub initial_volume: u16,
-    pub credentials_dir: PathBuf,
     pub volume_dir: PathBuf,
     pub audio_cache_dir: Option<PathBuf>,
     pub audio_cache_limit: Option<u64>,
@@ -60,7 +60,7 @@ impl EngineConfig {
 
     pub fn open_cache(&self) -> Result<Cache> {
         Cache::new(
-            Some(self.credentials_dir.as_path()),
+            None,
             Some(self.volume_dir.as_path()),
             self.audio_cache_dir.as_deref(),
             self.audio_cache_limit,
@@ -238,7 +238,7 @@ impl Engine {
         credentials: Credentials,
         cache: Cache,
         notify: Notify,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Credentials)> {
         let device_id = config.device_id();
         let session_config = SessionConfig {
             device_id: device_id.clone(),
@@ -296,10 +296,24 @@ impl Engine {
         .await
         .context("unable to connect to Spotify")?;
 
+        // librespot 0.8 exposes the reusable credential only on the live
+        // session. Its Cache writer is warning-only, so Fastpotify disables
+        // that plaintext path and persists this value through SecretStore.
+        let username = session.username();
+        let auth_data = session.auth_data();
+        if username.trim().is_empty() || auth_data.is_empty() {
+            anyhow::bail!("Spotify did not return a reusable playback credential");
+        }
+        let reusable = Credentials {
+            username: Some(username.clone()),
+            auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+            auth_data,
+        };
+
         {
             let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
             current.connected = true;
-            current.username = session.username();
+            current.username = username;
             notify(EngineEvent::State(current.clone()));
         }
 
@@ -321,14 +335,17 @@ impl Engine {
             }
         });
 
-        Ok(Self {
-            player,
-            spirc: Arc::new(spirc),
-            session,
-            mixer,
-            device_id,
-            shutting_down,
-        })
+        Ok((
+            Self {
+                player,
+                spirc: Arc::new(spirc),
+                session,
+                mixer,
+                device_id,
+                shutting_down,
+            },
+            reusable,
+        ))
     }
 
     pub fn device_id(&self) -> &str {
@@ -715,7 +732,6 @@ mod tests {
             backend: None,
             audio_device: None,
             initial_volume: 1,
-            credentials_dir: PathBuf::new(),
             volume_dir: PathBuf::new(),
             audio_cache_dir: None,
             audio_cache_limit: None,

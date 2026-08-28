@@ -47,9 +47,20 @@ impl AppDirs {
         self.state.join("session.json")
     }
 
-    /// The Web API OAuth grant (access + refresh token).
-    pub fn web_token_file(&self) -> PathBuf {
+    /// Versioned owner-private Web and playback credential files.
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.state.join("secrets-v1")
+    }
+
+    /// The legacy Web API OAuth grant, migrated on first safe read.
+    pub fn legacy_web_token_file(&self) -> PathBuf {
         self.state.join("web_api_token.json")
+    }
+
+    pub fn legacy_web_secret(&self) -> crate::secrets::LegacySecret {
+        let primary = self.legacy_web_token_file();
+        crate::secrets::LegacySecret::new(primary.clone())
+            .with_stale(primary.with_extension("json.tmp"))
     }
 
     /// The log of the current run, replaced at every start.
@@ -62,8 +73,15 @@ impl AppDirs {
         self.state.join("panic.log")
     }
 
-    pub fn credentials_dir(&self) -> PathBuf {
+    /// The directory librespot versions before 0.8 integration used directly.
+    pub fn legacy_credentials_dir(&self) -> PathBuf {
         self.state.join("credentials")
+    }
+
+    pub fn legacy_playback_secret(&self) -> crate::secrets::LegacySecret {
+        crate::secrets::LegacySecret::new(
+            self.legacy_credentials_dir().join("credentials.json"),
+        )
     }
 
     pub fn volume_dir(&self) -> PathBuf {
@@ -88,8 +106,9 @@ impl AppDirs {
 
     pub fn ensure(&self) -> std::io::Result<()> {
         for dir in [&self.config, &self.state, &self.cache] {
-            std::fs::create_dir_all(dir)?;
+            crate::secrets::ensure_private_dir(dir).map_err(std::io::Error::other)?;
         }
+        crate::secrets::ensure_private_dir(&self.secrets_dir()).map_err(std::io::Error::other)?;
         Ok(())
     }
 }

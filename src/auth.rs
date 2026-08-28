@@ -16,7 +16,6 @@
 //! listener.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -111,7 +110,7 @@ impl Grant {
 }
 
 /// A started sign-in: the URL to open and the secrets needed to finish it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Flow {
     pub verifier: String,
     pub state: String,
@@ -141,7 +140,7 @@ pub fn begin(grant: Grant) -> Flow {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -302,7 +301,7 @@ fn redact(text: &str) -> String {
 }
 
 /// The Web API grant as kept on disk between runs.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StoredToken {
     pub client_id: String,
     pub access_token: String,
@@ -343,39 +342,6 @@ impl StoredToken {
         scopes.iter().all(|scope| granted.contains(scope))
     }
 
-    pub fn load(path: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&text).ok()
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let text = serde_json::to_string_pretty(self)?;
-        let temporary = path.with_extension("json.tmp");
-        write_private(&temporary, text.as_bytes())?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    }
-
-    pub fn remove(path: &Path) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.flush()
 }
 
 fn now_secs() -> u64 {
@@ -474,11 +440,5 @@ mod tests {
             ..token.clone()
         };
         assert!(expired.needs_refresh());
-        let dir = std::env::temp_dir().join(format!("fastpotify-token-{}", std::process::id()));
-        let path = dir.join("token.json");
-        token.save(&path).unwrap();
-        assert_eq!(StoredToken::load(&path), Some(token));
-        StoredToken::remove(&path);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

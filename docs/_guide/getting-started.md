@@ -48,9 +48,11 @@ Spotify's own consent page; your password never touches Fastpotify. When
 Spotify redirects back, your library loads and you can search, browse, and
 control your other devices immediately.
 
-The sign-in is stored as a refresh token in your platform's state directory
-(`~/.local/state/fastpotify` on Linux), so the browser is needed once per
-machine. The next launch goes straight to your library.
+The sign-in is stored as an owner-private refresh-token file in your
+platform's state directory, so the browser is needed once per machine. The
+next launch goes straight to your library. This deliberately avoids system
+credential prompts; see [Settings & Files](/settings-and-files/) for the
+local-file threat model.
 
 ## Enable playback on this computer
 

@@ -470,8 +470,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             &palette,
             "Sign-in",
             &format!(
-                "Credentials are kept in {}",
-                app.dirs.credentials_dir().display()
+                "Owner-private files in {}. Software running as you can read them; disk encryption protects only data at rest.",
+                app.dirs.secrets_dir().display()
             ),
             |_| {},
         );

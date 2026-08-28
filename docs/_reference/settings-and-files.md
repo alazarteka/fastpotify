@@ -11,8 +11,8 @@ Fastpotify follows each platform's conventions. On Linux:
 | What | Where | Safe to delete? |
 | --- | --- | --- |
 | Settings | `~/.config/fastpotify/settings.json` | Yes, you lose preferences |
-| Web API sign-in | `~/.local/state/fastpotify/web_api_token.json` | Yes, you sign in again |
-| Playback credential | `~/.local/state/fastpotify/credentials/` | Yes, you approve playback again |
+| Web API sign-in | `~/.local/state/fastpotify/secrets-v1/web-api.secret` | Yes, you sign in again |
+| Playback credential | `~/.local/state/fastpotify/secrets-v1/playback.secret` | Yes, you approve playback again |
 | Last session | `~/.local/state/fastpotify/session.json` | Yes |
 | Audio cache | `~/.cache/fastpotify/audio/` | Always |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
@@ -21,9 +21,21 @@ Fastpotify follows each platform's conventions. On Linux:
 | Crash log | `~/.local/state/fastpotify/panic.log` | Always |
 
 Clearing caches never signs you out; credentials live in *state*, not
-*cache*, precisely so cleanup tools cannot log you out. Both credential
-files are written with owner-only permissions. Signing out from Settings
-deletes both.
+*cache*, precisely so cleanup tools cannot log you out. Web and playback
+credentials are separate versioned items. On Unix, Fastpotify makes their
+directories mode 0700 and files mode 0600, validates ownership and modes on
+read, and replaces files atomically. Windows uses the account ACL inherited
+from the local application-data directory. A legacy credential is deleted
+only after the new item was written, read back, and compared successfully.
+Signing out clears the live providers and playback engine first, attempts to
+delete both new and legacy locations, and reports any partial failure.
+
+This backend is deliberately prompt-free local storage, not a Keychain and
+not application-level encryption. A key beside an encrypted file would not
+improve this threat model, so Fastpotify does not add one. FileVault, BitLocker,
+or another full-disk encryption system protects credentials while the disk is
+offline. Malware or another process already running as your user can read the
+files while you are logged in.
 
 On macOS, settings, state, and the logs are in
 `~/Library/Application Support/me.paolino.fastpotify` and the caches in

@@ -16,8 +16,9 @@ credentials for them separately:
 2. **Streaming** is actually playing audio on this computer, through
    [librespot](https://github.com/librespot-org/librespot). This runs the
    same browser flow once against Spotify's streaming client identity, after
-   which librespot stores its own reusable credential. Premium is required,
-   because that is what Spotify's streaming protocol requires.
+   which Fastpotify reconstructs and stores librespot's reusable credential.
+   Premium is required, because that is what Spotify's streaming protocol
+   requires.
 
 Why not one grant? Because Spotify throttles Web API calls made with
 streaming-identity tokens. Measured during development, every endpoint
@@ -32,8 +33,9 @@ how, in five minutes.
 
 ## What the client stores
 
-- The Web API refresh token and librespot's reusable credential, owner-only,
-  in the state directory ([where](/settings-and-files/)).
+- The Web API refresh token and librespot's reusable credential, as separate
+  owner-private files in the state directory
+  ([where and threat model](/settings-and-files/)).
 - Downloaded audio and artwork, in the cache directory, within the budget
   you set.
 - Lyrics, in the cache directory, for a month.

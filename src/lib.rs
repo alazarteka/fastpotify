@@ -21,6 +21,7 @@ pub mod model;
 pub mod paths;
 pub mod player;
 pub mod settings;
+pub mod secrets;
 pub mod single_instance;
 pub mod sink;
 pub mod system_fonts;

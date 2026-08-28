@@ -3411,7 +3411,6 @@ pub fn engine_config(dirs: &AppDirs, settings: &Settings) -> EngineConfig {
             .clone()
             .filter(|device| !device.trim().is_empty()),
         initial_volume: settings.volume,
-        credentials_dir: dirs.credentials_dir(),
         volume_dir: dirs.volume_dir(),
         audio_cache_dir: settings.audio_cache.then(|| dirs.audio_cache_dir()),
         audio_cache_limit: Some(settings.audio_cache_mb.max(64) * 1024 * 1024),
