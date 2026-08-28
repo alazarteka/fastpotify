@@ -374,10 +374,6 @@ pub enum Command {
     },
     /// Internal: librespot's session ended on its own.
     Reconnect,
-    /// Look for Spotify Connect receivers on the local network.
-    DiscoverReceivers,
-    /// Hand the account to a receiver so it joins Spotify Connect.
-    ActivateReceiver(Box<crate::zeroconf::Receiver>),
     /// Ask GitHub whether a newer release exists.
     CheckForUpdates,
     /// The words of a track, from LRCLIB.
@@ -408,12 +404,6 @@ pub struct LyricsRequest {
 pub enum Event {
     Auth(AuthStatus),
     Playback(LocalPlayback),
-    /// Receivers seen on the local network that Spotify has not listed.
-    Receivers(Vec<crate::zeroconf::Receiver>),
-    ReceiverActivated {
-        name: String,
-        result: Result<(), String>,
-    },
     Local(Box<LocalState>),
     Api(Box<ApiResponse>),
     Accent {
@@ -697,8 +687,6 @@ impl Worker {
                 Command::SignInEnded => self.cancel_signin = None,
                 Command::AccountChecked { premium } => self.on_account_checked(premium),
                 Command::Reconnect => self.reconnect_engine(),
-                Command::DiscoverReceivers => self.discover_receivers(),
-                Command::ActivateReceiver(receiver) => self.activate_receiver(*receiver),
                 Command::CheckForUpdates => self.check_for_updates(),
                 Command::Lyrics(request) => self.fetch_lyrics(*request),
                 Command::LoadPlaylistCache { id } => self.load_playlist_cache(id),
@@ -1050,52 +1038,6 @@ impl Worker {
             return;
         }
         self.resume_engine();
-    }
-
-    // ---- receivers on the local network -----------------------------------
-
-    /// Browses for receivers Spotify's device list does not know about. The
-    /// browse blocks, so it runs off the runtime's worker threads.
-    fn discover_receivers(&self) {
-        let events = self.events.clone();
-        let waker = self.waker.clone();
-        tokio::task::spawn_blocking(move || {
-            match crate::zeroconf::discover(std::time::Duration::from_secs(3)) {
-                Ok(receivers) => {
-                    let _ = events.send(Event::Receivers(receivers));
-                    waker.wake();
-                }
-                Err(error) => log::debug!("no receivers found on the network: {error}"),
-            }
-        });
-    }
-
-    /// Hands the stored playback credential to a receiver, which makes it log
-    /// in and appear in the ordinary device list.
-    fn activate_receiver(&self, receiver: crate::zeroconf::Receiver) {
-        let events = self.events.clone();
-        let waker = self.waker.clone();
-        let credentials_dir = self.dirs.credentials_dir();
-        tokio::task::spawn_blocking(move || {
-            let name = receiver.name.clone();
-            let result = (|| -> Result<(), String> {
-                let credentials = crate::zeroconf::Credentials::load(&credentials_dir)
-                    .map_err(|_| {
-                        "Enable playback on this computer first, so there is an account to hand over"
-                            .to_string()
-                    })?;
-                let http = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(8))
-                    .build()
-                    .map_err(|error| error.to_string())?;
-                let info = crate::zeroconf::get_info(&http, &receiver)
-                    .map_err(|error| error.to_string())?;
-                crate::zeroconf::add_user(&http, &receiver, &info, &credentials, "Fastpotify")
-                    .map_err(|error| error.to_string())
-            })();
-            let _ = events.send(Event::ReceiverActivated { name, result });
-            waker.wake();
-        });
     }
 
     fn check_for_updates(&self) {

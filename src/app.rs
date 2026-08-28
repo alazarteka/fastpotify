@@ -149,11 +149,6 @@ pub struct App {
     /// Serial of the newest playback poll sent; older answers are stale.
     remote_poll_seq: u64,
     pub devices: Vec<Device>,
-    /// Receivers seen on the local network. Spotify lists a receiver only
-    /// once it has an account, so these are the ones it cannot see yet.
-    pub receivers: Vec<crate::zeroconf::Receiver>,
-    /// The receiver currently being handed the account, by name.
-    pub activating_receiver: Option<String>,
     pub devices_loading: bool,
     devices_fetched_at: Option<Instant>,
     pub selected_device: Option<String>,
@@ -332,8 +327,6 @@ impl App {
             remote_poll_pending: false,
             remote_poll_seq: 0,
             devices: Vec::new(),
-            receivers: Vec::new(),
-            activating_receiver: None,
             devices_loading: false,
             devices_fetched_at: None,
             selected_device: None,
@@ -728,20 +721,6 @@ impl App {
             match event {
                 Event::Auth(status) => self.handle_auth(status),
                 Event::Playback(status) => self.handle_playback(status),
-                Event::Receivers(receivers) => self.receivers = receivers,
-                Event::ReceiverActivated { name, result } => {
-                    self.activating_receiver = None;
-                    match result {
-                        Ok(()) => {
-                            self.toast(format!("{name} is ready"));
-                            // It takes a moment to appear in the device list.
-                            self.pending_transfer_to = Some((name, Instant::now()));
-                            self.devices_fetched_at = None;
-                            self.refresh_devices();
-                        }
-                        Err(error) => self.toast_error(format!("{name}: {error}")),
-                    }
-                }
                 Event::Local(state) => self.handle_local(*state),
                 Event::Api(response) => self.handle_api(*response),
                 Event::Accent { url, color } => {
@@ -3045,16 +3024,9 @@ impl App {
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
             }
             Action::Transfer(device_id) => self.transfer(device_id),
-            Action::ActivateReceiver(receiver) => {
-                if self.activating_receiver.is_none() {
-                    self.activating_receiver = Some(receiver.name.clone());
-                    self.backend.send(Command::ActivateReceiver(receiver));
-                }
-            }
             Action::RefreshDevices => {
                 self.devices_fetched_at = None;
                 self.refresh_devices();
-                self.backend.send(Command::DiscoverReceivers);
             }
             Action::RefreshQueue => self.refresh_queue(true),
             Action::CopyLink(uri) => {
@@ -3141,9 +3113,6 @@ impl App {
                 self.show_devices = !self.show_devices;
                 if self.show_devices {
                     self.refresh_devices();
-                    // Receivers waiting on the network are invisible to the
-                    // Web API, so look for them ourselves.
-                    self.backend.send(Command::DiscoverReceivers);
                 }
             }
             Action::SettingsChanged => {
