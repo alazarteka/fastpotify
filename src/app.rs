@@ -729,8 +729,14 @@ impl App {
                     self.accents.insert(url, tint);
                 }
                 Event::Error(message) => self.toast_error(message),
-                Event::Lyrics { uri, result } => {
-                    if self.lyrics_uri.as_deref() == Some(uri.as_str()) {
+                Event::Lyrics {
+                    uri,
+                    allow_lrclib,
+                    result,
+                } => {
+                    if self.lyrics_uri.as_deref() == Some(uri.as_str())
+                        && allow_lrclib == self.settings.lrclib_lyrics
+                    {
                         self.lyrics = match result {
                             Ok(found) => Loadable::Loaded(found),
                             Err(error) => Loadable::Failed(error),
@@ -917,6 +923,7 @@ impl App {
         self.lyrics = Loadable::Loading;
         self.backend.send(Command::Lyrics(Box::new(LyricsRequest {
             uri: now.uri,
+            allow_lrclib: self.settings.lrclib_lyrics,
             query: crate::lyrics::Query {
                 artist: now
                     .artists
@@ -3122,6 +3129,13 @@ impl App {
                     ThemeChoice::Light => egui::ThemePreference::Light,
                     ThemeChoice::System => egui::ThemePreference::System,
                 });
+            }
+            Action::LyricsSourceChanged => {
+                self.lyrics_uri = None;
+                self.lyrics = Loadable::NotLoaded;
+                if self.show_lyrics_panel {
+                    self.request_lyrics();
+                }
             }
             Action::RestartEngine => {
                 self.save_settings();

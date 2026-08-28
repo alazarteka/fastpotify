@@ -4,6 +4,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
+const MAX_SESSION_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
@@ -58,6 +61,11 @@ pub struct Settings {
     pub keep_playing_in_background: bool,
     /// Ask GitHub once a day whether a newer release exists.
     pub check_for_updates: bool,
+    /// Ask LRCLIB when Spotify itself has no lyrics for a track.
+    pub lrclib_lyrics: bool,
+    /// The external-service toggles were chosen after their data disclosure
+    /// was added. Missing/false forces both opt-ins off on load.
+    pub external_services_disclosed: bool,
     /// Context URIs pinned to the top of the sidebar, in pin order.
     pub pinned_contexts: Vec<String>,
 }
@@ -83,7 +91,9 @@ impl Default for Settings {
             web_client_id: None,
             playback_authorized: false,
             keep_playing_in_background: true,
-            check_for_updates: true,
+            check_for_updates: false,
+            lrclib_lyrics: false,
+            external_services_disclosed: false,
             pinned_contexts: Vec::new(),
         }
     }
@@ -91,19 +101,33 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
-                log::warn!("settings at {} are unreadable: {error}", path.display());
+        match crate::secrets::read_private_bounded(path, MAX_SETTINGS_BYTES) {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(mut settings) => {
+                    Self::enforce_external_service_consent(&mut settings);
+                    settings
+                }
+                Err(error) => {
+                    log::warn!("settings at {} are unreadable: {error}", path.display());
+                    Self::default()
+                }
+            },
+            Ok(None) => Self::default(),
+            Err(error) => {
+                log::warn!("settings at {} could not be read safely: {error}", path.display());
                 Self::default()
-            }),
-            Err(_) => Self::default(),
+            }
+        }
+    }
+
+    fn enforce_external_service_consent(settings: &mut Self) {
+        if !settings.external_services_disclosed {
+            settings.check_for_updates = false;
+            settings.lrclib_lyrics = false;
         }
     }
 
     pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let text = match serde_json::to_string_pretty(self) {
             Ok(text) => text,
             Err(error) => {
@@ -111,10 +135,7 @@ impl Settings {
                 return;
             }
         };
-        let temporary = path.with_extension("json.tmp");
-        let written =
-            std::fs::write(&temporary, text).and_then(|()| std::fs::rename(&temporary, path));
-        if let Err(error) = written {
+        if let Err(error) = crate::secrets::write_private_atomic(path, text.as_bytes()) {
             log::warn!("unable to save settings to {}: {error}", path.display());
         }
     }
@@ -155,18 +176,55 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        crate::secrets::read_private_bounded(path, MAX_SESSION_BYTES)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            let _ = crate::secrets::write_private_atomic(path, &bytes);
         }
-        if let Ok(text) = serde_json::to_string(self) {
-            let _ = std::fs::write(path, text);
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_services_are_off_by_default() {
+        let settings = Settings::default();
+        assert!(!settings.check_for_updates);
+        assert!(!settings.lrclib_lyrics);
+        assert!(!settings.external_services_disclosed);
+    }
+
+    #[test]
+    fn pre_disclosure_settings_cannot_preserve_implicit_network_opt_ins() {
+        let mut settings = Settings {
+            check_for_updates: true,
+            lrclib_lyrics: true,
+            external_services_disclosed: false,
+            ..Settings::default()
+        };
+        Settings::enforce_external_service_consent(&mut settings);
+        assert!(!settings.check_for_updates);
+        assert!(!settings.lrclib_lyrics);
+    }
+
+    #[test]
+    fn disclosed_opt_ins_are_preserved() {
+        let mut settings = Settings {
+            check_for_updates: true,
+            lrclib_lyrics: true,
+            external_services_disclosed: true,
+            ..Settings::default()
+        };
+        Settings::enforce_external_service_consent(&mut settings);
+        assert!(settings.check_for_updates);
+        assert!(settings.lrclib_lyrics);
     }
 }

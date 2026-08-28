@@ -4,8 +4,8 @@
 //! and no key. It serves plain lyrics and, for many tracks, synced ones in
 //! LRC form, a timestamp per line, which is what lets the panel follow the
 //! song instead of guessing. Spotify's own transcription is asked first when
-//! the streaming session is signed in; LRCLIB answers for everything else,
-//! wherever it plays.
+//! the streaming session is signed in. LRCLIB is an explicit, default-off
+//! fallback because its query discloses track metadata to another service.
 //!
 //! Matching is the work. What a player reports rarely matches a database
 //! exactly, so an exact lookup goes first and a search is ranked after it,
@@ -21,7 +21,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 
-const API: &str = "https://lrclib.net/api";
+const GET_URL: &str = "https://lrclib.net/api/get";
+const SEARCH_URL: &str = "https://lrclib.net/api/search";
+const MAX_LRCLIB_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_QUERY_FIELD_BYTES: usize = 512;
 /// Lyrics do not change; a cached answer is good for this long.
 const CACHE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// A candidate this far from the playing track's length is another
@@ -139,6 +142,12 @@ async fn lookup(http: &reqwest::Client, query: &Query) -> Result<Option<Lyrics>>
     if title.is_empty() || artist.is_empty() {
         return Ok(None);
     }
+    if title.len() > MAX_QUERY_FIELD_BYTES
+        || artist.len() > MAX_QUERY_FIELD_BYTES
+        || query.album.len() > MAX_QUERY_FIELD_BYTES
+    {
+        anyhow::bail!("track metadata is too large for a lyrics lookup");
+    }
     let duration = (query.duration_ms / 1000).to_string();
     let mut exact = vec![
         ("artist_name", artist.as_str()),
@@ -175,26 +184,53 @@ async fn get<T: DeserializeOwned>(
     path: &str,
     params: &[(&str, &str)],
 ) -> Result<Option<T>> {
-    let response = http
-        .get(format!("{API}{path}"))
+    let url = endpoint(path)?;
+    let mut response = http
+        .get(url)
         .query(params)
         .header("Accept", "application/json")
         .send()
         .await
         .context("cannot reach LRCLIB")?;
     let status = response.status();
+    if status.is_redirection() {
+        anyhow::bail!("LRCLIB redirect refused");
+    }
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
         return Ok(None);
     }
     if !status.is_success() {
         anyhow::bail!("LRCLIB answered {status}");
     }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_LRCLIB_BODY_BYTES as u64)
+    {
+        anyhow::bail!("LRCLIB answer is too large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("LRCLIB body failed")? {
+        append_bounded(&mut body, &chunk, MAX_LRCLIB_BODY_BYTES)?;
+    }
     Ok(Some(
-        response
-            .json()
-            .await
-            .context("unexpected answer from LRCLIB")?,
+        serde_json::from_slice(&body).context("unexpected answer from LRCLIB")?,
     ))
+}
+
+fn endpoint(path: &str) -> Result<&'static str> {
+    match path {
+        "/get" => GET_URL,
+        "/search" => SEARCH_URL,
+        _ => anyhow::bail!("invalid LRCLIB endpoint"),
+    }
+}
+
+fn append_bounded(output: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<()> {
+    if chunk.len() > limit.saturating_sub(output.len()) {
+        anyhow::bail!("LRCLIB answer exceeds the {limit}-byte limit");
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -574,24 +610,24 @@ fn cache_key(query: &Query) -> String {
 }
 
 fn read_cache(path: &PathBuf) -> Option<Option<Lyrics>> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let bytes = crate::secrets::read_private_bounded(path, MAX_LRCLIB_BODY_BYTES)
+        .ok()
+        .flatten()?;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
     if modified.elapsed().unwrap_or(CACHE_LIFETIME) >= CACHE_LIFETIME {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Cached>(&text)
+    serde_json::from_slice::<Cached>(&bytes)
         .ok()
         .map(|cached| cached.found)
 }
 
 fn write_cache(path: &Path, found: &Option<Lyrics>) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string(&Cached {
+    if let Ok(bytes) = serde_json::to_vec(&Cached {
         found: found.clone(),
     }) {
-        let _ = std::fs::write(path, text);
+        let _ = crate::secrets::write_private_atomic(path, &bytes);
     }
 }
 
@@ -611,6 +647,19 @@ mod tests {
         assert_eq!(clean_title("Hyphen - Ated"), "Hyphen - Ated");
         assert_eq!(clean_title("(Remastered)"), "(Remastered)", "never empty");
         assert_eq!(clean_title("Feat\u{200b}ure"), "Feature");
+    }
+
+    #[test]
+    fn lrclib_endpoints_and_chunked_bodies_are_bounded() {
+        assert_eq!(endpoint("/get").unwrap(), GET_URL);
+        assert_eq!(endpoint("/search").unwrap(), SEARCH_URL);
+        assert!(endpoint("//localhost").is_err());
+        assert!(endpoint("https://example.test").is_err());
+
+        let mut body = Vec::new();
+        append_bounded(&mut body, b"1234", 8).unwrap();
+        append_bounded(&mut body, b"5678", 8).unwrap();
+        assert!(append_bounded(&mut body, b"9", 8).is_err());
     }
 
     #[test]

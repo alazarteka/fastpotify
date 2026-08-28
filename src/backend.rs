@@ -413,6 +413,7 @@ pub struct LyricsRequest {
     /// The track the answer is for, so a stale one is ignored.
     pub uri: String,
     pub query: crate::lyrics::Query,
+    pub allow_lrclib: bool,
 }
 
 pub enum Event {
@@ -433,6 +434,7 @@ pub enum Event {
     /// The words of a track, or `None` when nobody has transcribed it.
     Lyrics {
         uri: String,
+        allow_lrclib: bool,
         result: Result<Option<crate::lyrics::Lyrics>, String>,
     },
     /// A playlist's items as last cached, with the snapshot they belong to.
@@ -1254,16 +1256,19 @@ impl Worker {
         let engine = self.engine.clone();
         tokio::spawn(async move {
             // Spotify's own words go first: they follow the recording
-            // exactly. Everything else, a signed-out session included,
-            // falls back to LRCLIB.
+            // exactly. LRCLIB is contacted only after the user opts in.
             let result = match spotify_lyrics(engine, &request.uri, &cache_dir).await {
                 Some(found) => Ok(Some(found)),
-                None => crate::lyrics::fetch(&http, &cache_dir, &request.query)
-                    .await
-                    .map_err(|error| format!("{error:#}")),
+                None if request.allow_lrclib => {
+                    crate::lyrics::fetch(&http, &cache_dir, &request.query)
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                }
+                None => Ok(None),
             };
             let _ = events.send(Event::Lyrics {
                 uri: request.uri,
+                allow_lrclib: request.allow_lrclib,
                 result,
             });
             waker.wake();

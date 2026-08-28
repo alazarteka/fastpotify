@@ -1,16 +1,16 @@
 //! Whether a newer release exists, from GitHub's releases.
 //!
-//! Most people never look at a releases page, so a build they downloaded
-//! once is the one they keep, bugs included. Asking once a day and pointing
-//! at the release page is cheap, and the only thing that leaves the machine
-//! is the request itself.
+//! This default-off check uses one fixed API endpoint and points only at one
+//! fixed releases page. The API response cannot choose a browser destination.
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/crmne/fastpotify/releases/latest";
+const RELEASE_PAGE_URL: &str = "https://github.com/crmne/fastpotify/releases/latest";
+const MAX_RELEASE_BODY_BYTES: usize = 64 * 1024;
 
 /// How often a running app asks again.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -26,36 +26,77 @@ pub struct Release {
 #[derive(Deserialize)]
 struct LatestRelease {
     tag_name: String,
-    html_url: String,
 }
 
 /// The newest release, when it is newer than this build.
 pub async fn newer_release(http: &reqwest::Client) -> Result<Option<Release>> {
-    let latest: LatestRelease = http
+    let mut response = http
         .get(LATEST_RELEASE_URL)
         .header("Accept", "application/vnd.github+json")
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await
-        .context("unexpected release listing")?;
-    let version = latest.tag_name.trim_start_matches('v').to_string();
-    Ok(
-        is_newer(&version, env!("CARGO_PKG_VERSION")).then_some(Release {
-            version,
-            url: latest.html_url,
-        }),
-    )
+        .context("release check failed")?;
+    if response.status().is_redirection() {
+        bail!("release check refused an HTTP redirect");
+    }
+    if !response.status().is_success() {
+        bail!("release check answered {}", response.status());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELEASE_BODY_BYTES as u64)
+    {
+        bail!("release listing is too large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("release body failed")? {
+        append_bounded(&mut body, &chunk, MAX_RELEASE_BODY_BYTES)?;
+    }
+    parse_release_body(&body, env!("CARGO_PKG_VERSION"))
 }
 
 /// `major.minor.patch`; anything else (a pre-release tag, say) is `None`.
 fn parse(version: &str) -> Option<[u64; 3]> {
-    let mut parts = version
-        .trim()
-        .split('.')
-        .map(|part| part.parse::<u64>().ok());
-    Some([parts.next()??, parts.next()??, parts.next()??])
+    if version.is_empty() || version.len() > 64 {
+        return None;
+    }
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut parsed = [0u64; 3];
+    for (index, part) in parts.into_iter().enumerate() {
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return None;
+        }
+        parsed[index] = part.parse().ok()?;
+    }
+    Some(parsed)
+}
+
+fn parse_release_body(body: &[u8], current: &str) -> Result<Option<Release>> {
+    let latest: LatestRelease =
+        serde_json::from_slice(body).context("unexpected release listing")?;
+    let version = latest
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&latest.tag_name);
+    parse(version).context("release tag is not a strict semantic version")?;
+    Ok(is_newer(version, current).then(|| Release {
+        version: version.to_string(),
+        url: RELEASE_PAGE_URL.to_string(),
+    }))
+}
+
+fn append_bounded(output: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<()> {
+    if chunk.len() > limit.saturating_sub(output.len()) {
+        bail!("release listing exceeds the {limit}-byte limit");
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// Whether `candidate` is a later version than `current`. Unparseable
@@ -84,5 +125,25 @@ mod tests {
             "pre-releases are not announced"
         );
         assert!(!is_newer("nightly", "0.1.3"));
+        assert!(!is_newer("0.2.0.1", "0.1.3"));
+        assert!(!is_newer(" 0.2.0", "0.1.3"));
+        assert!(!is_newer("01.2.0", "0.1.3"));
+        assert!(!is_newer("0.02.0", "0.1.3"));
+    }
+
+    #[test]
+    fn release_page_never_comes_from_the_api() {
+        let body = br#"{"tag_name":"v9.9.9","html_url":"http://127.0.0.1/secret"}"#;
+        let release = parse_release_body(body, "0.2.0").unwrap().unwrap();
+        assert_eq!(release.version, "9.9.9");
+        assert_eq!(release.url, RELEASE_PAGE_URL);
+    }
+
+    #[test]
+    fn chunked_release_body_is_bounded() {
+        let mut body = Vec::new();
+        append_bounded(&mut body, b"1234", 8).unwrap();
+        append_bounded(&mut body, b"5678", 8).unwrap();
+        assert!(append_bounded(&mut body, b"9", 8).is_err());
     }
 }

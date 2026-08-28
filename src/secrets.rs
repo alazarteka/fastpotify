@@ -499,6 +499,124 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Atomically replaces any application-private file with owner-only mode.
+/// This is also used for privacy-sensitive settings, caches, and logs.
+pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "private file has no parent directory".into(),
+    })?;
+    ensure_private_dir(parent)?;
+    if destination_exists(path)? {
+        // Older non-secret application files may predate the private writer
+        // and have the process umask rather than 0600. They still have to be
+        // regular, singly linked, and ours; the atomic replacement below is
+        // always 0600.
+        validate_path_as_private_file(path, false)?;
+    }
+    let stem = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let mut created = None;
+    for _ in 0..32 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{stem}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
+            Ok(file) => {
+                created = Some((temporary, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io("create a temporary private file", &temporary, error)),
+        }
+    }
+    let (temporary, mut file) = created.ok_or_else(|| SecretError::UnsafePath {
+        path: parent.to_path_buf(),
+        reason: "could not allocate a fresh temporary filename".into(),
+    })?;
+    let result = (|| {
+        validate_open_file(&temporary, &file, true)?;
+        file.write_all(contents)
+            .map_err(|error| io("write a temporary private file", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| io("sync a temporary private file", &temporary, error))?;
+        drop(file);
+        atomic_replace(&temporary, path)?;
+        sync_parent(parent)?;
+        match read_private_file(path, contents.len(), true)? {
+            Some(read_back) if read_back == contents => Ok(()),
+            _ => Err(SecretError::Verification {
+                kind: "private file",
+            }),
+        }
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Opens a private file for a fresh log. Existing unsafe paths are rejected
+/// instead of followed.
+pub fn open_private_truncate(path: &Path) -> Result<File> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "private file has no parent directory".into(),
+    })?;
+    ensure_private_dir(parent)?;
+    if destination_exists(path)? {
+        validate_path_as_private_file(path, false)?;
+    }
+    let mut options = OpenOptions::new();
+    // Do not truncate until the opened handle and the filename have both
+    // passed validation. This keeps a last-moment symlink swap from
+    // truncating its target before it is rejected.
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| io("open a private file", path, error))?;
+    validate_open_file(path, &file, false)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| io("set owner-only file permissions on", path, error))?;
+    }
+    validate_open_file(path, &file, true)?;
+    file.set_len(0)
+        .map_err(|error| io("truncate a private file", path, error))?;
+    Ok(file)
+}
+
+/// Reads an application-owned file under a size cap. Legacy process-umask
+/// modes are accepted because the parent is 0700; symlinks, foreign owners,
+/// and hard links are still rejected. The next atomic write replaces it with
+/// a 0600 file.
+pub fn read_private_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "private file has no parent directory".into(),
+    })?;
+    ensure_private_dir(parent)?;
+    read_private_file(path, limit, false)
+}
+
 fn validate_or_harden_directory(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     if is_link_or_reparse(metadata) || !metadata.is_dir() {
         return Err(SecretError::UnsafePath {
@@ -978,6 +1096,37 @@ mod tests {
         assert!(store.load(SecretId::WebApi).is_err());
         assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink());
         let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn general_private_writers_harden_old_files_without_following_links() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-private-file-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&root).unwrap();
+        let settings = root.join("settings.json");
+        std::fs::write(&settings, b"old").unwrap();
+        std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_atomic(&settings, b"new").unwrap();
+        assert_eq!(std::fs::read(&settings).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&settings).unwrap().mode() & 0o777, 0o600);
+
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"do not truncate").unwrap();
+        let log = root.join("fastpotify.log");
+        std::os::unix::fs::symlink(&victim, &log).unwrap();
+        assert!(open_private_truncate(&log).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
+
+        let _ = std::fs::remove_file(log);
+        let _ = std::fs::remove_file(victim);
+        let _ = std::fs::remove_file(settings);
         let _ = std::fs::remove_dir(root);
     }
 }

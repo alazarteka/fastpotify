@@ -63,11 +63,10 @@ playing track beside the page. When the lyrics are timed, the line being
 sung is highlighted and the panel follows along; click any line to jump the
 song there. Scrolling by hand stops the following, and **Follow** in the
 panel's header picks the song back up. When this computer is signed in
-for playback, the words come from Spotify itself. Otherwise, and for
-tracks Spotify has no words for, they come from
-[LRCLIB](https://lrclib.net), an open database that needs no account, so
-they work for whatever is playing, on this computer or another device;
-podcasts and tracks nobody has transcribed say so.
+for playback, the words come from Spotify itself. The optional LRCLIB
+fallback is off by default. Settings explains the artist, title, album, and
+duration it sends to [LRCLIB](https://lrclib.net) before you enable it.
+Podcasts and tracks nobody has transcribed say so.
 
 ![The lyrics panel beside a playlist, following the song](/assets/images/lyrics.png)
 

@@ -314,17 +314,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
-        widgets::setting_row(
-            ui,
-            &palette,
-            "Tell me when a new version is out",
-            "Asks GitHub once a day. Nothing about you is sent.",
-            |ui| {
-                if widgets::switch(ui, &palette, &mut app.settings.check_for_updates).changed() {
-                    changed = true;
-                }
-            },
-        );
         if cfg!(target_os = "linux") {
             widgets::setting_row(
                 ui,
@@ -408,6 +397,40 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 theme::subtle(ui, &palette, "Playback settings are applied.");
             }
         });
+    });
+
+    section(ui, &palette, "External services", |ui| {
+        theme::subtle(
+            ui,
+            &palette,
+            "Both services are off until you enable them. Fastpotify has no telemetry.",
+        );
+        ui.add_space(6.0);
+        widgets::setting_row(
+            ui,
+            &palette,
+            "Tell me when a new version is out",
+            "Contacts api.github.com at most once a day. GitHub receives your IP address, request time, and Fastpotify version in the User-Agent.",
+            |ui| {
+                if widgets::switch(ui, &palette, &mut app.settings.check_for_updates).changed() {
+                    app.settings.external_services_disclosed = true;
+                    changed = true;
+                }
+            },
+        );
+        widgets::setting_row(
+            ui,
+            &palette,
+            "Use LRCLIB lyrics fallback",
+            "When Spotify lyrics are unavailable, sends the track artist, title, album, and duration to lrclib.net. LRCLIB also receives your IP address and Fastpotify User-Agent.",
+            |ui| {
+                if widgets::switch(ui, &palette, &mut app.settings.lrclib_lyrics).changed() {
+                    app.settings.external_services_disclosed = true;
+                    app.actions.push(Action::LyricsSourceChanged);
+                    changed = true;
+                }
+            },
+        );
     });
 
     section(ui, &palette, "Appearance", |ui| {

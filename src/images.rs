@@ -1,13 +1,15 @@
 //! Album art: fetched once, kept on disk, decoded by egui on demand.
 //!
 //! [`ArtLoader`] plugs into egui's image pipeline as a bytes loader for
-//! `http(s)` URIs, so every view simply asks for `ui.image(url)`. The first
+//! approved HTTPS Spotify CDN URIs, so every view simply asks for
+//! `ui.image(url)`. The first
 //! request for a URL starts a background download (or a disk-cache read);
 //! until it lands egui shows a placeholder. Entries that no view has drawn
 //! for a while are evicted so a long browsing session does not accumulate
 //! textures without bound.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +19,9 @@ use sha1::{Digest, Sha1};
 
 const STALE_AFTER: Duration = Duration::from_secs(150);
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ART_REDIRECTS: usize = 3;
+const MAX_ART_DIMENSION: u32 = 8192;
+const MAX_ART_PIXELS: u64 = 16_777_216;
 
 enum Entry {
     Pending,
@@ -41,7 +46,7 @@ pub struct ArtLoader {
 
 impl ArtLoader {
     pub fn new(http: reqwest::Client, runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
-        let _ = std::fs::create_dir_all(&cache_dir);
+        let _ = crate::secrets::ensure_private_dir(&cache_dir);
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
@@ -102,6 +107,13 @@ impl Inner {
     }
 
     async fn fetch(self: &Arc<Self>, url: &str) -> Result<Arc<[u8]>, String> {
+        let requested = validate_art_url(url).map_err(|error| {
+            log::warn!(
+                "blocked artwork from host {}: {error}",
+                safe_art_host(url)
+            );
+            error
+        })?;
         if let Some(Entry::Ready { bytes, .. }) = self
             .entries
             .lock()
@@ -113,40 +125,86 @@ impl Inner {
         let path = self.cache_path(url);
         let cached = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || std::fs::read(path).ok()
+            move || {
+                crate::secrets::read_private_bounded(&path, MAX_ART_BYTES)
+                    .ok()
+                    .flatten()
+            }
         })
         .await
         .ok()
         .flatten();
-        let bytes: Vec<u8> = match cached {
-            Some(bytes) if !bytes.is_empty() => bytes,
-            _ => {
-                let response = self
-                    .http
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !response.status().is_success() {
-                    return Err(format!("artwork request failed: {}", response.status()));
+        let bytes: Vec<u8> = if let Some(bytes) = cached {
+            match validate_art_bytes(&bytes, None) {
+                Ok(()) => bytes,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&path);
+                    self.download_art(requested, &path).await?
                 }
-                let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-                if bytes.len() > MAX_ART_BYTES {
-                    return Err("artwork is too large".to_string());
-                }
-                let bytes = bytes.to_vec();
-                let write_path = path.clone();
-                let payload = bytes.clone();
-                self.runtime.spawn_blocking(move || {
-                    let temporary = write_path.with_extension("part");
-                    if std::fs::write(&temporary, &payload).is_ok() {
-                        let _ = std::fs::rename(&temporary, &write_path);
-                    }
-                });
-                bytes
             }
+        } else {
+            self.download_art(requested, &path).await?
         };
         Ok(Arc::from(bytes))
+    }
+
+    async fn download_art(
+        &self,
+        mut current: reqwest::Url,
+        cache_path: &std::path::Path,
+    ) -> Result<Vec<u8>, String> {
+        for redirects in 0..=MAX_ART_REDIRECTS {
+            let mut response = self
+                .http
+                .get(current.clone())
+                .header("Accept", "image/jpeg, image/png")
+                .send()
+                .await
+                .map_err(|_| "artwork request failed".to_string())?;
+            if response.status().is_redirection() {
+                if redirects == MAX_ART_REDIRECTS {
+                    return Err("artwork redirected too many times".into());
+                }
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| "artwork redirect has no valid Location".to_string())?;
+                current = redirect_target(&current, location)?;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(format!("artwork request failed: {}", response.status()));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_ART_BYTES as u64)
+            {
+                return Err("artwork is too large".into());
+            }
+            let mime = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(allowed_mime)
+                .ok_or_else(|| "artwork has an unsupported content type".to_string())?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| "artwork body failed".to_string())?
+            {
+                append_art_chunk(&mut bytes, &chunk)?;
+            }
+            validate_art_bytes(&bytes, Some(mime))?;
+            let write_path = cache_path.to_path_buf();
+            let payload = bytes.clone();
+            self.runtime.spawn_blocking(move || {
+                let _ = crate::secrets::write_private_atomic(&write_path, &payload);
+            });
+            return Ok(bytes);
+        }
+        Err("artwork redirected too many times".into())
     }
 
     fn start(self: &Arc<Self>, ctx: &egui::Context, url: String) {
@@ -177,7 +235,10 @@ impl BytesLoader for ArtLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !(uri.starts_with("https://") || uri.starts_with("http://")) {
+        let Ok(parsed) = reqwest::Url::parse(uri) else {
+            return Err(LoadError::NotSupported);
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
             return Err(LoadError::NotSupported);
         }
         let mut entries = self.inner.entries.lock().unwrap_or_else(|p| p.into_inner());
@@ -231,10 +292,141 @@ impl BytesLoader for ArtLoader {
     }
 }
 
+fn validate_art_url(value: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "artwork URL is invalid".to_string())?;
+    if url.scheme() != "https" {
+        return Err("artwork URL is not HTTPS".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("artwork URL contains user information".into());
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err("artwork URL uses a nonstandard port".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "artwork URL has no host".to_string())?;
+    if !allowed_art_host(host) {
+        return Err("artwork URL host is not an approved Spotify CDN".into());
+    }
+    if url.fragment().is_some() {
+        return Err("artwork URL contains a fragment".into());
+    }
+    Ok(url)
+}
+
+/// Enough origin information to diagnose a newly used Spotify CDN without
+/// ever putting a path, query string, fragment, or user information in logs.
+fn safe_art_host(value: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.chars().take(255).collect::<String>())
+        })
+        .unwrap_or_else(|| "<invalid>".to_string())
+}
+
+fn allowed_art_host(host: &str) -> bool {
+    fn under(host: &str, suffix: &str) -> bool {
+        host == suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    }
+    if under(host, "scdn.co") || under(host, "spotifycdn.com") {
+        return true;
+    }
+    #[cfg(feature = "demo")]
+    if host == "picsum.photos" || host == "fastly.picsum.photos" {
+        return true;
+    }
+    false
+}
+
+fn redirect_target(current: &reqwest::Url, location: &str) -> Result<reqwest::Url, String> {
+    let next = current
+        .join(location)
+        .map_err(|_| "artwork redirect Location is invalid".to_string())?;
+    validate_art_url(next.as_str())
+}
+
+fn append_art_chunk(output: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if chunk.len() > MAX_ART_BYTES.saturating_sub(output.len()) {
+        return Err("artwork is too large".into());
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn allowed_mime(value: &str) -> Option<&'static str> {
+    let mime = value.split(';').next()?.trim();
+    if mime.eq_ignore_ascii_case("image/jpeg") || mime.eq_ignore_ascii_case("image/jpg") {
+        Some("image/jpeg")
+    } else if mime.eq_ignore_ascii_case("image/png") {
+        Some("image/png")
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArtFormat {
+    Jpeg,
+    Png,
+}
+
+fn art_format(bytes: &[u8]) -> Option<ArtFormat> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(ArtFormat::Jpeg)
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ArtFormat::Png)
+    } else {
+        None
+    }
+}
+
+fn validate_art_bytes(bytes: &[u8], mime: Option<&str>) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_ART_BYTES {
+        return Err("artwork is empty or too large".into());
+    }
+    let format = art_format(bytes)
+        .ok_or_else(|| "artwork signature is not JPEG or PNG".to_string())?;
+    if let Some(mime) = mime {
+        let matches = (mime == "image/jpeg" && format == ArtFormat::Jpeg)
+            || (mime == "image/png" && format == ArtFormat::Png);
+        if !matches {
+            return Err("artwork content type does not match its signature".into());
+        }
+    }
+    let (width, height) = match format {
+        ArtFormat::Png if bytes.len() >= 24 && &bytes[12..16] == b"IHDR" => (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        ),
+        ArtFormat::Png => return Err("PNG artwork has no valid IHDR".into()),
+        ArtFormat::Jpeg => image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|_| "JPEG artwork header is invalid".to_string())?
+            .into_dimensions()
+            .map_err(|_| "JPEG artwork dimensions are invalid".to_string())?,
+    };
+    if width == 0
+        || height == 0
+        || width > MAX_ART_DIMENSION
+        || height > MAX_ART_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_ART_PIXELS
+    {
+        return Err("artwork dimensions exceed the pixel budget".into());
+    }
+    Ok(())
+}
+
 /// A colour that represents an album cover, suitable for tinting a dark or
 /// light surface: the most common saturated hue, with its lightness pulled
 /// into a range that still reads as a background.
 pub fn accent_color(bytes: &[u8]) -> Option<[u8; 3]> {
+    validate_art_bytes(bytes, None).ok()?;
     let decoded = image::load_from_memory(bytes).ok()?;
     let small = decoded.thumbnail(48, 48).to_rgb8();
     let mut buckets: HashMap<(u8, u8, u8), (u64, [u64; 3])> = HashMap::new();
@@ -267,6 +459,83 @@ pub fn accent_color(bytes: &[u8]) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artwork_urls_are_https_and_limited_to_spotify_cdns() {
+        for valid in [
+            "https://i.scdn.co/image/abc",
+            "https://mosaic.scdn.co/640/abc",
+            "https://image-cdn-ak.spotifycdn.com/image/abc",
+            "https://i.scdn.co:443/image/abc?size=640",
+        ] {
+            assert!(validate_art_url(valid).is_ok(), "expected {valid} to pass");
+        }
+        assert_eq!(
+            safe_art_host("https://user:secret@example.test/private?token=secret"),
+            "example.test"
+        );
+        for invalid in [
+            "http://i.scdn.co/image/abc",
+            "https://127.0.0.1/image/abc",
+            "https://[::1]/image/abc",
+            "https://localhost/image/abc",
+            "https://user@i.scdn.co/image/abc",
+            "https://user:password@i.scdn.co/image/abc",
+            "https://i.scdn.co:8443/image/abc",
+            "https://evilscdn.co/image/abc",
+            "https://scdn.co.example.test/image/abc",
+        ] {
+            assert!(
+                validate_art_url(invalid).is_err(),
+                "expected {invalid} to fail"
+            );
+        }
+    }
+
+    #[test]
+    fn artwork_redirects_revalidate_every_destination() {
+        let current = validate_art_url("https://i.scdn.co/image/abc").unwrap();
+        assert!(redirect_target(&current, "/image/next").is_ok());
+        assert!(
+            redirect_target(&current, "https://image-cdn-ak.spotifycdn.com/image/next").is_ok()
+        );
+        assert!(redirect_target(&current, "https://localhost/secret").is_err());
+        assert!(redirect_target(&current, "http://i.scdn.co/image/next").is_err());
+        assert!(redirect_target(&current, "https://i.scdn.co:444/image/next").is_err());
+    }
+
+    #[test]
+    fn chunked_artwork_cannot_cross_the_byte_cap() {
+        let mut bytes = vec![0u8; MAX_ART_BYTES - 2];
+        append_art_chunk(&mut bytes, &[1, 2]).unwrap();
+        assert!(append_art_chunk(&mut bytes, &[3]).is_err());
+        assert_eq!(bytes.len(), MAX_ART_BYTES);
+    }
+
+    #[test]
+    fn artwork_mime_magic_and_pixel_budget_must_agree() {
+        let mut image = image::RgbImage::new(2, 2);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgb([42, 42, 42]);
+        }
+        let mut png = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert!(validate_art_bytes(&png, Some("image/png")).is_ok());
+        assert!(validate_art_bytes(&png, Some("image/jpeg")).is_err());
+        assert!(validate_art_bytes(b"not an image", Some("image/png")).is_err());
+
+        let mut oversized = vec![0u8; 24];
+        oversized[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        oversized[12..16].copy_from_slice(b"IHDR");
+        oversized[16..20].copy_from_slice(&10_000u32.to_be_bytes());
+        oversized[20..24].copy_from_slice(&10_000u32.to_be_bytes());
+        assert!(validate_art_bytes(&oversized, Some("image/png")).is_err());
+    }
 
     #[test]
     fn accent_color_finds_dominant_hue() {

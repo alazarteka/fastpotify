@@ -530,6 +530,8 @@ pub enum Action {
     ToggleLyricsPanel,
     ToggleDevicesPopup,
     SettingsChanged,
+    /// Re-request lyrics under the newly chosen external-service policy.
+    LyricsSourceChanged,
     RestartEngine,
     EnablePlayback,
     ShowWindow,

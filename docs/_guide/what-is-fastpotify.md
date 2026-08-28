@@ -51,7 +51,7 @@ This is a young project, and it says so:
 - Sign-in happens twice in a lifetime, not once: the Web API and streaming
   are separate grants at Spotify. [How it connects](/how-it-connects/)
   explains why.
-- No lyrics, no video podcasts, no social features.
+- No video podcasts or social features.
 - Playlist reordering is a menu action, not drag-and-drop.
 - Fastpotify is an **unofficial** client built on Spotify's public Web API
   and librespot. Spotify changes these from time to time; when they do,

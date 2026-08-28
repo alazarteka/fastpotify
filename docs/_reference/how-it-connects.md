@@ -47,13 +47,31 @@ how, in five minutes.
 - Downloaded audio and artwork, in the cache directory, within the budget
   you set.
 - Lyrics, in the cache directory, for a month.
-- Nothing else. There is no telemetry, no analytics, and no server of ours.
-  Besides Spotify (and its album art CDN), the app talks to
-  [lrclib.net](https://lrclib.net) while the lyrics panel is open and
-  Spotify itself has no words for the track, sending the track's artist,
-  title, album, and length, and to
-  api.github.com once a day to learn whether a newer release exists, which
-  Settings can turn off.
+- Nothing else. There is no telemetry, no analytics, and no Fastpotify server.
+
+Two optional external services are disclosed in Settings and are off by
+default:
+
+- **LRCLIB fallback:** when Spotify lyrics are unavailable (including when
+  local playback is not signed in), sends the track's artist, title, album,
+  and duration to the fixed `https://lrclib.net` API.
+  LRCLIB also receives the connection's IP address, time, and Fastpotify
+  User-Agent. Responses are not redirected and are capped at 2 MiB.
+- **Release checks:** contacts the fixed GitHub API endpoint at most once a
+  day. GitHub receives the connection's IP address, time, and Fastpotify
+  version in the User-Agent. The response is capped at 64 KiB, must name a
+  strict `major.minor.patch` version, cannot redirect, and cannot choose the
+  release page Fastpotify opens.
+
+Artwork is accepted only over HTTPS on port 443 from `scdn.co` or
+`spotifycdn.com` and their subdomains. Every redirect is rechecked against the
+same policy, downloads are capped at 8 MiB, and the JPEG/PNG signature, MIME
+type, dimensions, and pixel budget must agree before decoding. No real-account
+authentication was used while establishing this policy. A gated live check
+still needs to confirm the complete set of hosts currently returned by
+Spotify; a future legitimate host will be rejected until it is evaluated and
+explicitly added. A rejection log records only the host and policy reason,
+never the URL path, query, fragment, or user information.
 
 ## When Spotify pushes back
 
