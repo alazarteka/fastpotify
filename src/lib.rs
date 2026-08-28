@@ -14,7 +14,10 @@ pub mod media;
 #[cfg(target_os = "linux")]
 #[path = "mpris.rs"]
 pub mod media_controls;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+#[path = "media_macos.rs"]
+pub mod media_controls;
+#[cfg(windows)]
 #[path = "media_native.rs"]
 pub mod media_controls;
 pub mod model;

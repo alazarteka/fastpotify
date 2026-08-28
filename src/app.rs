@@ -412,6 +412,13 @@ impl App {
         self.window_hidden = false;
         self.hide_intent = false;
         self.wants_show = false;
+        // MPRemoteCommandCenter must be registered only after eframe has made
+        // NSApplication. The process-level service stays attached while this
+        // window is later closed to the status item.
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &mut self.media_controls {
+            controls.attach();
+        }
         if let Some(tray) = &mut self.tray {
             tray.attach();
         }
