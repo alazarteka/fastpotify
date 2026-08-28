@@ -60,8 +60,15 @@ One readable JSON file, written atomically. The interesting fields:
 | `theme` | `dark` | `dark`, `light`, or `system` |
 | `accent_from_art` | `true` | Tint pages with album art |
 | `keep_playing_in_background` | `true` | Close to tray |
-| `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
+| `check_for_updates` | `false` | Ask GitHub at most once a day for a newer release |
+| `lrclib_lyrics` | `false` | Ask LRCLIB when Spotify lyrics are unavailable |
+| `external_services_disclosed` | `false` | Records that the external-service choices were made after their disclosure was shown |
 | `web_client_id` | none | Your own Spotify app id, if you set one |
+
+Both external-service options are off by default. Older settings written
+before the disclosure marker existed are migrated with both options off, even
+if an old build had enabled release checks by default. Enabling either switch
+in Settings records that the disclosure was shown.
 
 ## Command line
 
@@ -72,10 +79,12 @@ fastpotify [OPTIONS]
   -v, --verbose         More logs from librespot and the API client
 ```
 
+The log directory is owner-only and both log files are owner-only on Unix.
 `fastpotify.log` in the state directory is what to attach to a bug report:
 it holds the last run's output, the same lines `fastpotify -v` prints, so a
 run with `-v` says the most. If the app vanished, `panic.log` next to it
-says where it died; attach that too.
+says where it died; attach that too. The panic log contains only the most
+recent bounded crash record rather than growing indefinitely.
 
 ## Demo mode
 

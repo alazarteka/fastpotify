@@ -193,7 +193,7 @@ fn main() -> eframe::Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter));
     // Launched from a desktop, stderr goes nowhere; keep the run's log where
     // a bug report can find it.
-    match std::fs::File::create(dirs.log_file()) {
+    match fastpotify::secrets::open_private_truncate(&dirs.log_file()) {
         Ok(file) => {
             logger.target(env_logger::Target::Pipe(Box::new(Tee(file))));
         }
@@ -365,7 +365,9 @@ impl std::io::Write for Tee {
     }
 }
 
-/// Records every panic in `path` before the process dies of it.
+const MAX_PANIC_LOG_BYTES: usize = 16 * 1024;
+
+/// Records the last panic in `path` before the process dies of it.
 ///
 /// Release builds abort on panic and, on Windows, have no console, so a
 /// crash would otherwise leave nothing behind to put in a bug report.
@@ -374,21 +376,79 @@ fn log_panics(path: std::path::PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
         previous(info);
         let thread = std::thread::current();
-        let entry = format!(
-            "{} fastpotify {} on thread {:?}: {info}\n",
+        let mut entry = BoundedLog::new(MAX_PANIC_LOG_BYTES);
+        use std::fmt::Write as _;
+        let _ = write!(
+            &mut entry,
+            "{} fastpotify {} on thread {:?}: {info}",
             jiff::Timestamp::now(),
             env!("CARGO_PKG_VERSION"),
             thread.name().unwrap_or("unnamed"),
         );
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path);
-        if let Ok(mut file) = file {
-            use std::io::Write;
-            let _ = file.write_all(entry.as_bytes());
-        }
+        entry.finish();
+        let _ = fastpotify::secrets::write_private_atomic(&path, entry.as_bytes());
     }));
+}
+
+/// A formatting sink that cannot grow a crash record past its byte budget.
+/// Unexpected control characters are replaced so one panic cannot forge a
+/// second record or terminal escape sequence.
+struct BoundedLog {
+    text: String,
+    limit: usize,
+}
+
+impl BoundedLog {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::with_capacity(limit.min(1024)),
+            limit,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
+
+    fn finish(&mut self) {
+        if self.text.len() < self.limit {
+            self.text.push('\n');
+        }
+    }
+}
+
+impl std::fmt::Write for BoundedLog {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        for character in value.chars() {
+            let safe = if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            };
+            if self.text.len() + safe.len_utf8() > self.limit.saturating_sub(1) {
+                break;
+            }
+            self.text.push(safe);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod panic_log_tests {
+    use super::*;
+
+    #[test]
+    fn panic_log_sink_is_bounded_and_strips_terminal_controls() {
+        use std::fmt::Write as _;
+
+        let mut log = BoundedLog::new(8);
+        write!(&mut log, "ab\u{1b}{}", "c".repeat(20)).unwrap();
+        log.finish();
+        assert!(log.as_bytes().len() <= 8);
+        assert!(!log.text.contains('\u{1b}'));
+        assert!(log.text.ends_with('\n'));
+    }
 }
 
 fn native_options(fullscreen: bool) -> eframe::NativeOptions {
