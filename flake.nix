@@ -19,6 +19,9 @@
       ...
     }:
     let
+      # Git flakes expose the commit time. This is stable for a given source
+      # revision and is also the value release CI exports to non-Nix builds.
+      sourceDateEpoch = toString (self.lastModified or 1);
       systems = [
         "aarch64-darwin"
         "x86_64-darwin"
@@ -77,6 +80,19 @@
             )
           );
         };
+
+        # Dependency policy runs only in a disposable, secret-free environment.
+        # Keeping the tools in the locked flake avoids `cargo install` and its
+        # additional, independently resolved dependency graph.
+        policy = pkgs.mkShellNoCC {
+          packages = with pkgs; [
+            (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            cacert
+            cargo-deny
+            cargo-vet
+            gitMinimal
+          ];
+        };
       });
 
       packages = forAllSystems (pkgs: rec {
@@ -107,6 +123,15 @@
             version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
+            strictDeps = true;
+            CARGO_NET_OFFLINE = "true";
+            SOURCE_DATE_EPOCH = sourceDateEpoch;
+
+            # buildRustPackage vendors the exact Cargo.lock graph before the
+            # sandboxed build. These flags make accidental lockfile drift fatal.
+            cargoBuildFlags = [ "--locked" ];
+            cargoCheckFlags = [ "--locked" ];
+            doCheck = true;
 
             nativeBuildInputs =
               with pkgs;

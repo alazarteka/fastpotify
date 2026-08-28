@@ -1,0 +1,4 @@
+# cargo-vet imports lock
+#
+# No external audit sets are trusted yet. Add an import only after reviewing
+# the publisher and commit the cargo-vet-generated locked subset with it.

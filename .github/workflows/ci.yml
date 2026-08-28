@@ -6,43 +6,85 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions: {}
+
 env:
+  CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
 jobs:
+  policy:
+    name: dependency policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install locked Nix
+        uses: cachix/install-nix-action@51f3067b56fe8ae331890c77d4e454f6d60615ff # v31.10.2
+        with:
+          extra_nix_config: |
+            sandbox = true
+      - name: Validate locked flake inputs
+        run: nix flake metadata --no-write-lock-file
+      - name: Enforce dependency policy in the secret-free sandbox
+        run: nix develop .#policy --no-write-lock-file --command bash supply-chain/check.sh
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
       - name: GUI build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpulse-dev libxkbcommon-dev \
             libwayland-dev libgl1-mesa-dev
-      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the reviewed Cargo graph
+        run: cargo fetch --locked
       # The demo feature carries the headless render test that lays out every
-      # page, panel, and dialog without a display.
-      - run: cargo test --features demo
+      # page, panel, and dialog without a display. Project code runs only after
+      # the locked fetch, offline, and in a job with no secrets.
+      - name: Test offline
+        run: cargo test --frozen --features demo
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - name: GUI build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libpulse-dev libxkbcommon-dev \
             libwayland-dev libgl1-mesa-dev
-      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the reviewed Cargo graph
+        run: cargo fetch --locked
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --features demo -- -D warnings
+      - run: cargo clippy --frozen --all-targets --features demo -- -D warnings
