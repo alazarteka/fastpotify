@@ -199,9 +199,6 @@ pub struct App {
     /// A play request made while the local engine was still connecting; it
     /// starts the moment the engine reports ready.
     queued_play: Option<PlayRequest>,
-    /// A receiver just activated, waiting for Spotify to list it so playback
-    /// can move there.
-    pending_transfer_to: Option<(String, Instant)>,
     /// When to take a confirming look at remote playback after a command.
     remote_recheck_at: Option<Instant>,
     pub seek_preview: Option<f32>,
@@ -361,7 +358,6 @@ impl App {
             pending_play_keys: Vec::new(),
             pending_play_at: None,
             queued_play: None,
-            pending_transfer_to: None,
             remote_recheck_at: None,
             seek_preview: None,
             volume_preview: None,
@@ -1584,21 +1580,6 @@ impl App {
                 match result {
                     Ok(devices) => {
                         self.devices = devices;
-                        if let Some((name, since)) = self.pending_transfer_to.clone() {
-                            let matching = self
-                                .devices
-                                .iter()
-                                .find(|device| device.name == name)
-                                .and_then(|device| device.id.clone());
-                            if let Some(id) = matching {
-                                self.pending_transfer_to = None;
-                                self.transfer(id);
-                            } else if since.elapsed() > Duration::from_secs(20) {
-                                self.pending_transfer_to = None;
-                            } else {
-                                self.devices_fetched_at = None;
-                            }
-                        }
                         if let Some(selected) = &self.selected_device
                             && !self
                                 .devices
