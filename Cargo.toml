@@ -83,9 +83,16 @@ souvlaki = { version = "0.8", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 # Serving AppKit while no window exists (the status item lives on the main
 # thread), and leaving the Dock while hidden.
+# dispatch2 lets Apple media callbacks schedule their egui wake on that thread
+# without invoking egui from inside the callback.
+block2 = { version = "0.6", default-features = false, features = ["std"] }
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSDictionary", "NSObject", "NSObjCRuntime", "NSRunLoop", "NSString", "NSValue"] }
+# Souvlaki still publishes its established title/artwork dictionary, while
+# maintained typed bindings own macOS command registration and live timeline.
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
 [target.'cfg(windows)'.dependencies]
 # A hidden window for the media controls to belong to, and message loops.
