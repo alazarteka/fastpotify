@@ -94,10 +94,11 @@ Audit the current graph in this order because compromise has different reach:
    `security-framework`, `cpal`, `rodio`, `tray-icon`, `souvlaki`, `memmap2`,
    and their system-library edges.
 3. Authentication, cryptography, and network input: `librespot-*`, `reqwest`,
-   `rustls*`, `ring`, `mdns-sd`, token persistence, and redirect/listener code.
-   The locked graph currently contains two `rustls-webpki` versions, including
-   the legacy line discussed in `Cargo.toml`; cargo-deny has no blanket advisory
-   exception for it.
+   `rustls*`, `ring`, token persistence, and redirect/listener code. The direct
+   `mdns-sd` LAN-provisioning stack has been removed; its reappearance is a
+   regression. The locked graph currently contains two `rustls-webpki`
+   versions, including the legacy line discussed in `Cargo.toml`; cargo-deny
+   has no blanket advisory exception for it.
 4. Remaining parsing, media, UI, and utility dependencies.
 
 Imports from another cargo-vet project are direct trust decisions. Review the
