@@ -1,5 +1,4 @@
+
 # cargo-vet audits file
-#
-# Deliberately empty at bootstrap. Add only reviews actually performed by an
-# identified reviewer; generated exemptions belong in config.toml and are not
-# audits.
+
+[audits]
