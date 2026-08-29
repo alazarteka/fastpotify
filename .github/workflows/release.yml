@@ -378,6 +378,8 @@ jobs:
     name: attest final release artifacts
     needs: [policy, build, macos-sign]
     runs-on: ubuntu-24.04
+    outputs:
+      release_artifact_id: ${{ steps.release-set.outputs.artifact-id }}
     permissions:
       actions: read
       attestations: write
@@ -429,6 +431,7 @@ jobs:
             "dist/fastpotify-${RELEASE_TAG}-attestation.json"
 
       - name: Upload attested release set
+        id: release-set
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-ready
@@ -457,10 +460,11 @@ jobs:
       - name: Download attested release set
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: release-ready
+          artifact-ids: ${{ needs.attest.outputs.release_artifact_id }}
           path: dist
+          merge-multiple: true
 
-      - name: Recheck tag and final checksums
+      - name: Recheck tag and assemble the exact release set
         env:
           EXPECTED_SOURCE_COMMIT: ${{ needs.policy.outputs.source_commit }}
           EXPECTED_TAG_OBJECT: ${{ needs.policy.outputs.tag_object }}
@@ -469,11 +473,148 @@ jobs:
           set -euo pipefail
           bash supply-chain/verify-release-ref.sh
           (cd dist && sha256sum --check SHA256SUMS)
+          shopt -s nullglob
+          files=(dist/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "the attested release set is empty" >&2
+            exit 1
+          fi
+          expected="$RUNNER_TEMP/release-assets.expected"
+          : > "$expected"
+          for file in "${files[@]}"; do
+            name="${file##*/}"
+            if [ ! -f "$file" ] || [ ! -s "$file" ]; then
+              echo "release asset is not a nonempty regular file: $name" >&2
+              exit 1
+            fi
+            if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              echo "release asset has a name GitHub may rewrite: $name" >&2
+              exit 1
+            fi
+            digest="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            size="$(stat --printf='%s' "$file")"
+            printf '%s\tsha256:%s\t%s\tuploaded\n' \
+              "$name" "$digest" "$size" >> "$expected"
+          done
+          LC_ALL=C sort -o "$expected" "$expected"
 
-      - name: Publish immutable release inputs
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
-        with:
-          tag_name: ${{ needs.policy.outputs.tag_name }}
-          files: dist/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+      - name: Create and verify a new draft release
+        id: draft
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.policy.outputs.tag_name }}
+          SOURCE_COMMIT: ${{ needs.policy.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          api_headers=(
+            --header "Accept: application/vnd.github+json"
+            --header "Authorization: Bearer $GITHUB_TOKEN"
+            --header "X-GitHub-Api-Version: 2026-03-10"
+          )
+
+          # The by-tag endpoint omits drafts, so inspect the authenticated,
+          # paginated release list. Any prior draft or published release makes
+          # this run terminal; a rerun must never reuse or replace its assets.
+          page=1
+          while :; do
+            releases="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+              "${api_headers[@]}" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page")"
+            jq -e 'type == "array"' <<< "$releases" >/dev/null
+            if jq -e --arg tag "$RELEASE_TAG" \
+              'any(.[]; .tag_name == $tag)' <<< "$releases" >/dev/null; then
+              echo "a GitHub release already exists for $RELEASE_TAG" >&2
+              exit 1
+            fi
+            count="$(jq 'length' <<< "$releases")"
+            if [ "$count" -lt 100 ]; then
+              break
+            fi
+            page=$((page + 1))
+            if [ "$page" -gt 1000 ]; then
+              echo "release preflight exceeded its pagination bound" >&2
+              exit 1
+            fi
+          done
+
+          payload="$(jq -cn \
+            --arg tag "$RELEASE_TAG" \
+            --arg commit "$SOURCE_COMMIT" \
+            '{tag_name:$tag,target_commitish:$commit,name:$tag,draft:true,prerelease:false,generate_release_notes:true}')"
+          draft="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --request POST "${api_headers[@]}" \
+            --data "$payload" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases")"
+          release_id="$(jq -er --arg tag "$RELEASE_TAG" \
+            'select(.draft == true and .tag_name == $tag) | .id | select(type == "number")' \
+            <<< "$draft")"
+          upload_url="$(jq -er '.upload_url | select(type == "string") | sub("\\{.*$"; "")' \
+            <<< "$draft")"
+          printf 'release_id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
+
+          shopt -s nullglob
+          for file in dist/*; do
+            name="${file##*/}"
+            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
+            local_digest="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            local_size="$(stat --printf='%s' "$file")"
+            asset="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+              --request POST "${api_headers[@]}" \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$file" "$upload_url?name=$encoded_name")"
+            jq -e \
+              --arg name "$name" \
+              --arg digest "sha256:$local_digest" \
+              --argjson size "$local_size" \
+              '.name == $name and .digest == $digest and .size == $size and .state == "uploaded"' \
+              <<< "$asset" >/dev/null
+          done
+
+          assets="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            "${api_headers[@]}" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100")"
+          jq -e 'type == "array" and length < 100' <<< "$assets" >/dev/null
+          jq -r '.[] | [.name, .digest, (.size | tostring), .state] | @tsv' \
+            <<< "$assets" | LC_ALL=C sort > "$RUNNER_TEMP/release-assets.actual"
+          diff -u "$RUNNER_TEMP/release-assets.expected" \
+            "$RUNNER_TEMP/release-assets.actual"
+
+      # Publishing is deliberately the final command in the workflow. The
+      # draft remains mutable only while its complete remote asset set can be
+      # compared with the locally attested set.
+      - name: Recheck and publish the verified draft
+        env:
+          EXPECTED_SOURCE_COMMIT: ${{ needs.policy.outputs.source_commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.policy.outputs.tag_object }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          RELEASE_TAG: ${{ needs.policy.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          bash supply-chain/verify-release-ref.sh
+          (cd dist && sha256sum --check SHA256SUMS)
+          api_headers=(
+            --header "Accept: application/vnd.github+json"
+            --header "Authorization: Bearer $GITHUB_TOKEN"
+            --header "X-GitHub-Api-Version: 2026-03-10"
+          )
+          draft="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            "${api_headers[@]}" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          jq -e --arg tag "$RELEASE_TAG" --arg id "$RELEASE_ID" \
+            '.id == ($id | tonumber) and .tag_name == $tag and .draft == true and .immutable == false' \
+            <<< "$draft" >/dev/null
+          assets="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            "${api_headers[@]}" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")"
+          jq -e 'type == "array" and length < 100' <<< "$assets" >/dev/null
+          jq -r '.[] | [.name, .digest, (.size | tostring), .state] | @tsv' \
+            <<< "$assets" | LC_ALL=C sort > "$RUNNER_TEMP/release-assets.final"
+          diff -u "$RUNNER_TEMP/release-assets.expected" \
+            "$RUNNER_TEMP/release-assets.final"
+          exec curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --request PATCH "${api_headers[@]}" \
+            --header 'Content-Type: application/json' \
+            --data '{"draft":false}' \
+            --output /dev/null \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"

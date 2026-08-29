@@ -124,8 +124,14 @@ The release workflow separates five trust zones:
 4. **Attestation** downloads only final release artifacts, verifies their
    per-job hashes, creates a consolidated SHA-256 manifest, and uses GitHub OIDC
    to attest exactly those checksums.
-5. **Publishing** is separately gated by `release-publishing`, rechecks that the
-   tag object has not changed, and is the only job with `contents: write`.
+5. **Publishing** is separately gated by `release-publishing` and is the only
+   job with `contents: write`. It refuses every existing draft or published
+   release for the tag, creates one new draft without retrying an
+   `already_exists` race, uploads without replacement, and compares every
+   remote asset name, size, state, and GitHub SHA-256 digest with the attested
+   local set. It then rechecks the tag and publishes the draft as the workflow's
+   final transition. A failed run deliberately leaves its draft for an owner to
+   inspect and remove; reruns fail closed rather than reuse it.
 
 Before setting repository variable `FASTPOTIFY_RELEASE_POLICY` to `1`, an owner
 must configure all of the following:
@@ -173,7 +179,6 @@ with each immutable commit.
 | `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
 | `actions/download-artifact` | `v7.0.0` | `37930b1c2abaa49bbe596cd826c3c89aef350131` |
 | `actions/attest` | `v4.0.0` | `c32b4b8b198b65d0bd9d63490e847ff7b53989d4` |
-| `softprops/action-gh-release` | `v2.5.0` | `a06a81a03ee405af7f2048a818ed3f03bbf83c7b` |
 | `actions/configure-pages` | `v6.0.0` | `45bfe0192ca1faeb007ade9deae92b16b8254a0d` |
 | `ruby/setup-ruby` | `v1.321.0` | `95ef2b042f9d7a56d8268cba8559e2842e2ad01b` |
 | `actions/upload-pages-artifact` | `v5.0.0` | `fc324d3547104276b827a68afc52ff2a11cc49c9` |
