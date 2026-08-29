@@ -1685,8 +1685,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(SecretError::UnsafePath { reason, .. })
-                if reason == "filename changed while it was being opened"
+            Err(SecretError::Corrupt { reason, .. }) if reason.starts_with("legacy JSON:")
         ));
         assert_eq!(std::fs::read(&legacy_path).unwrap(), invalid);
         assert_eq!(std::fs::metadata(&legacy_path).unwrap().mode() & 0o777, 0o600);
@@ -1729,7 +1728,11 @@ mod tests {
             &LegacySecret::new(legacy_path.clone()),
         );
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(SecretError::UnsafePath { reason, .. })
+                if reason == "filename changed while it was being opened"
+        ));
         assert_eq!(std::fs::read(&backup).unwrap(), original);
         assert_eq!(
             std::fs::read(legacy_migration_path(&legacy_path)).unwrap(),
