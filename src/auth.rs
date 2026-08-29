@@ -9,7 +9,7 @@
 //!   throttled on the Web API, which is why this is a separate identity.
 //! - The **playback grant** uses Spotify's desktop client identity, the one
 //!   librespot streams with. Its access token is exchanged once for a
-//!   reusable credential that librespot caches itself.
+//!   reusable credential that Fastpotify stores separately.
 //!
 //! The browser does the password entry; this process only ever sees the
 //! one-time authorization code that Spotify sends back to a loopback
@@ -118,12 +118,59 @@ impl Grant {
     }
 }
 
-/// A started sign-in: the URL to open and the secrets needed to finish it.
-#[derive(Clone)]
-pub struct Flow {
+/// The one-time browser material held behind an already-bound listener.
+struct Flow {
+    verifier: String,
+    state: String,
+    url: String,
+}
+
+/// A browser authorization that cannot be exposed until its callback socket
+/// is listening. The standard listener keeps accepting in the kernel while
+/// the asynchronous task is scheduled.
+pub struct PreparedAuthorization {
+    listener: std::net::TcpListener,
+    flow: Flow,
+    port: u16,
+}
+
+pub struct AuthorizationCode {
+    pub code: String,
     pub verifier: String,
-    pub state: String,
-    pub url: String,
+}
+
+impl PreparedAuthorization {
+    pub fn prepare(grant: &Grant) -> Result<Self> {
+        let listener = bind_callback_listener(grant.redirect_port)?;
+        let port = listener
+            .local_addr()
+            .context("unable to inspect the prepared Spotify redirect listener")?
+            .port();
+        let mut bound_grant = grant.clone();
+        bound_grant.redirect_port = port;
+        Ok(Self {
+            listener,
+            flow: begin(&bound_grant),
+            port,
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.flow.url
+    }
+
+    pub async fn wait(self, cancel: watch::Receiver<bool>) -> Result<AuthorizationCode> {
+        let Self {
+            listener,
+            flow,
+            port,
+        } = self;
+        let code = wait_for_code(listener, port, &flow.state, cancel).await?;
+        Ok(AuthorizationCode {
+            code,
+            verifier: flow.verifier,
+        })
+    }
 }
 
 fn random_token(bytes: usize) -> String {
@@ -132,7 +179,7 @@ fn random_token(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(buffer)
 }
 
-pub fn begin(grant: Grant) -> Flow {
+fn begin(grant: &Grant) -> Flow {
     let verifier = random_token(48);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token(18);
@@ -147,6 +194,16 @@ pub fn begin(grant: Grant) -> Flow {
         state,
         url,
     }
+}
+
+fn bind_callback_listener(port: u16) -> Result<std::net::TcpListener> {
+    let address: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = std::net::TcpListener::bind(address)
+        .with_context(|| format!("unable to listen on {address} for the Spotify redirect"))?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("unable to prepare the listener on {address}"))?;
+    Ok(listener)
 }
 
 #[derive(Clone, Deserialize)]
@@ -201,23 +258,21 @@ fn validate_scope(scope: &str) -> Result<()> {
     Ok(())
 }
 
-/// Listens for Spotify's redirect and returns the authorization code.
-///
-/// Ends early when `cancel` flips to true (the user gave up) or after ten
-/// minutes.
-pub async fn wait_for_code(
+/// Waits on an already-bound listener. Malformed, unrelated, and stale local
+/// traffic is retryable; a valid-state provider result is terminal.
+async fn wait_for_code(
+    listener: std::net::TcpListener,
     port: u16,
     expected_state: &str,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<String> {
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = TcpListener::bind(address)
-        .await
-        .with_context(|| format!("unable to listen on {address} for the Spotify redirect"))?;
+    let listener = TcpListener::from_std(listener)
+        .with_context(|| format!("unable to attach the listener on {address} to the runtime"))?;
     let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
 
     loop {
-        let (mut stream, peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted.context("redirect listener failed")?,
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() { bail!("sign-in cancelled"); }
@@ -228,42 +283,116 @@ pub async fn wait_for_code(
         if !peer.ip().is_loopback() {
             continue;
         }
-        let connection_deadline =
-            deadline.min(tokio::time::Instant::now() + CONNECTION_TIMEOUT);
-        let outcome = tokio::select! {
-            handled = tokio::time::timeout_at(
-                connection_deadline,
-                serve_callback(&mut stream, expected_state, port),
-            ) => handled.ok().and_then(|result| result.ok()),
+        let connection_deadline = deadline.min(tokio::time::Instant::now() + CONNECTION_TIMEOUT);
+        let disposition = tokio::select! {
+            biased;
+            handled = serve_callback(stream, expected_state, port, connection_deadline) => handled,
             changed = cancel.changed() => {
                 if changed.is_err() || *cancel.borrow() { bail!("sign-in cancelled"); }
-                None
+                continue;
             }
             _ = tokio::time::sleep_until(deadline) => bail!("sign-in timed out; try again"),
         };
-        if let Some(code) = outcome {
-            return Ok(code);
+        match disposition {
+            CallbackDisposition::Finish(result) => return result,
+            CallbackDisposition::Retry(error) => {
+                log::debug!("ignored request on the OAuth callback listener: {error}");
+            }
         }
-        // A malformed request, stale tab, favicon, or slow local peer is not
-        // the redirect. Keep the one global deadline and accept another.
-        log::debug!("ignored an invalid request on the OAuth callback listener");
     }
 }
 
+#[derive(Debug)]
+enum ProviderCallback {
+    Accepted(String),
+    Denied,
+    Invalid(&'static str),
+}
+
+impl ProviderCallback {
+    fn response(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Accepted(_) => ("200 OK", success_page()),
+            Self::Denied | Self::Invalid(_) => ("400 Bad Request", failure_page()),
+        }
+    }
+
+    fn into_result(self) -> Result<String> {
+        match self {
+            Self::Accepted(code) => Ok(code),
+            Self::Denied => bail!("Spotify declined the sign-in"),
+            Self::Invalid(message) => bail!("{message}"),
+        }
+    }
+}
+
+enum CallbackDisposition {
+    Retry(anyhow::Error),
+    Finish(Result<String>),
+}
+
 async fn serve_callback(
-    stream: &mut TcpStream,
+    mut stream: TcpStream,
     expected_state: &str,
     port: u16,
-) -> Result<String> {
-    let request = read_request_head(stream).await?;
-    let outcome = parse_callback_request(&request, expected_state, port);
-    let (status, body) = if outcome.is_ok() {
-        ("200 OK", success_page())
-    } else {
-        ("400 Bad Request", failure_page())
+    deadline: tokio::time::Instant,
+) -> CallbackDisposition {
+    let request = match tokio::time::timeout_at(deadline, read_request_head(&mut stream)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return CallbackDisposition::Retry(error),
+        Err(_) => {
+            return CallbackDisposition::Retry(anyhow!(
+                "callback connection timed out before a complete request"
+            ));
+        }
     };
-    write_callback_response(stream, status, body).await?;
-    outcome
+    let parsed = parse_callback_request(&request, expected_state, port);
+    respond_and_classify(parsed, |status, body| {
+        spawn_callback_response(stream, status, body, deadline);
+        Ok(())
+    })
+}
+
+/// Browser delivery is deliberately outside the terminal-result decision.
+/// Once state authenticates a code or denial, no write or disconnect may turn
+/// it back into retryable traffic.
+fn respond_and_classify(
+    parsed: Result<ProviderCallback>,
+    respond: impl FnOnce(&'static str, &'static str) -> Result<()>,
+) -> CallbackDisposition {
+    let (status, body) = match &parsed {
+        Ok(provider) => provider.response(),
+        Err(_) => ("400 Bad Request", failure_page()),
+    };
+    if let Err(error) = respond(status, body) {
+        log::debug!("OAuth callback response could not be scheduled: {error}");
+    }
+    match parsed {
+        Ok(provider) => CallbackDisposition::Finish(provider.into_result()),
+        Err(error) => CallbackDisposition::Retry(error),
+    }
+}
+
+fn spawn_callback_response(
+    mut stream: TcpStream,
+    status: &'static str,
+    body: &'static str,
+    deadline: tokio::time::Instant,
+) {
+    tokio::spawn(async move {
+        match tokio::time::timeout_at(
+            deadline,
+            write_callback_response(&mut stream, status, body),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::debug!("OAuth callback response delivery failed: {error}")
+            }
+            Err(_) => log::debug!("OAuth callback response delivery timed out"),
+        }
+    });
 }
 
 async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -297,7 +426,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn parse_callback_request(request: &[u8], expected_state: &str, port: u16) -> Result<String> {
+fn parse_callback_request(
+    request: &[u8],
+    expected_state: &str,
+    port: u16,
+) -> Result<ProviderCallback> {
     if request.len() > MAX_REQUEST_HEAD_BYTES {
         bail!("callback request headers are too large");
     }
@@ -419,14 +552,22 @@ fn parse_callback_request(request: &[u8], expected_state: &str, port: u16) -> Re
     {
         bail!("callback state mismatch");
     }
-    if error.is_some() {
-        bail!("Spotify declined the sign-in");
+    match (code, error) {
+        (Some(code), None)
+            if !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_graphic()) => {
+            Ok(ProviderCallback::Accepted(code))
+        }
+        (Some(_), None) => Ok(ProviderCallback::Invalid(
+            "Spotify returned an invalid authorization code",
+        )),
+        (None, Some(_)) => Ok(ProviderCallback::Denied),
+        (Some(_), Some(_)) => Ok(ProviderCallback::Invalid(
+            "Spotify returned conflicting sign-in results",
+        )),
+        (None, None) => Ok(ProviderCallback::Invalid(
+            "Spotify did not return an authorization result",
+        )),
     }
-    let code = code.ok_or_else(|| anyhow!("Spotify did not return an authorization code"))?;
-    if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_graphic()) {
-        bail!("Spotify returned an invalid authorization code");
-    }
-    Ok(code)
 }
 
 fn valid_percent_encoding(value: &[u8]) -> bool {
@@ -679,7 +820,7 @@ mod tests {
 
     #[test]
     fn begin_produces_valid_pkce_material() {
-        let flow = begin(Grant::web_api(None));
+        let flow = begin(&Grant::web_api(None));
         assert!(flow.verifier.len() >= 43);
         assert!(flow.url.contains("code_challenge_method=S256"));
         assert!(flow.url.contains(&format!("state={}", flow.state)));
@@ -688,7 +829,7 @@ mod tests {
                 .contains(&format!("client_id={DEFAULT_WEB_CLIENT_ID}"))
         );
         assert!(flow.url.contains("8989"));
-        let playback = begin(Grant::playback());
+        let playback = begin(&Grant::playback());
         assert!(
             playback
                 .url
@@ -703,6 +844,16 @@ mod tests {
         assert_eq!(Grant::web_api(Some("  ")).client_id, DEFAULT_WEB_CLIENT_ID);
     }
 
+    #[test]
+    fn prepared_authorization_owns_the_listener_before_exposing_its_url() {
+        let mut grant = Grant::web_api(None);
+        grant.redirect_port = 0;
+        let session = PreparedAuthorization::prepare(&grant).unwrap();
+        let address = session.listener.local_addr().unwrap();
+        assert!(session.url().starts_with(AUTHORIZE_URL));
+        assert!(std::net::TcpListener::bind(address).is_err());
+    }
+
     fn callback(target: &str) -> Vec<u8> {
         format!(
             "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{WEB_REDIRECT_PORT}\r\nConnection: close\r\n\r\n"
@@ -713,7 +864,10 @@ mod tests {
     #[test]
     fn callback_accepts_only_the_exact_get_and_loopback_host() {
         let request = callback("/login?code=abc%2Dd&state=s1");
-        let code = parse_callback_request(&request, "s1", WEB_REDIRECT_PORT).unwrap();
+        let parsed = parse_callback_request(&request, "s1", WEB_REDIRECT_PORT).unwrap();
+        let ProviderCallback::Accepted(code) = parsed else {
+            panic!("a valid callback must accept its code");
+        };
         assert_eq!(code, "abc-d");
 
         for invalid in [
@@ -730,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_validates_state_before_provider_errors_and_never_reflects_input() {
+    fn callback_validates_state_before_terminal_provider_results() {
         let wrong_state = callback("/login?error=%3Cscript%3E&state=wrong");
         let error = parse_callback_request(&wrong_state, "s1", WEB_REDIRECT_PORT)
             .unwrap_err()
@@ -738,12 +892,43 @@ mod tests {
         assert_eq!(error, "callback state mismatch");
 
         let denied = callback("/login?error=%3Cscript%3E&state=s1");
-        let error = parse_callback_request(&denied, "s1", WEB_REDIRECT_PORT)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(error, "Spotify declined the sign-in");
+        assert!(matches!(
+            parse_callback_request(&denied, "s1", WEB_REDIRECT_PORT),
+            Ok(ProviderCallback::Denied)
+        ));
         assert!(!failure_page().contains("script"));
         assert!(!failure_page().contains("wrong"));
+    }
+
+    #[test]
+    fn authenticated_results_are_terminal_even_if_the_browser_response_fails() {
+        let accepted = parse_callback_request(
+            &callback("/login?code=accepted&state=s1"),
+            "s1",
+            WEB_REDIRECT_PORT,
+        );
+        match respond_and_classify(accepted, |status, _| {
+            assert_eq!(status, "200 OK");
+            Err(anyhow!("simulated browser disconnect"))
+        }) {
+            CallbackDisposition::Finish(result) => assert_eq!(result.unwrap(), "accepted"),
+            CallbackDisposition::Retry(_) => panic!("an accepted code must be terminal"),
+        }
+
+        let denied = parse_callback_request(
+            &callback("/login?error=access_denied&state=s1"),
+            "s1",
+            WEB_REDIRECT_PORT,
+        );
+        match respond_and_classify(denied, |status, _| {
+            assert_eq!(status, "400 Bad Request");
+            Err(anyhow!("simulated browser disconnect"))
+        }) {
+            CallbackDisposition::Finish(result) => {
+                assert_eq!(result.unwrap_err().to_string(), "Spotify declined the sign-in")
+            }
+            CallbackDisposition::Retry(_) => panic!("an authenticated denial must be terminal"),
+        }
     }
 
     #[test]

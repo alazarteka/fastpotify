@@ -627,6 +627,10 @@ struct Worker {
     /// The plan, once the Web API has answered.
     premium: Option<bool>,
     cancel_signin: Option<watch::Sender<bool>>,
+    /// A Web flow requested while another authorization still owns its fixed
+    /// callback port. It starts only after that task reports completion and
+    /// has dropped the prepared listener.
+    pending_web_signin: bool,
     reconnects: Vec<Instant>,
     /// Invalidates browser flows that finish after cancellation by sign-out
     /// or application switching.
@@ -667,6 +671,7 @@ impl Worker {
             signed_in: false,
             premium: None,
             cancel_signin: None,
+            pending_web_signin: false,
             reconnects: Vec::new(),
             auth_epoch: 0,
             credential_epoch: 0,
@@ -685,6 +690,7 @@ impl Worker {
                 Command::Shutdown => break,
                 Command::SignIn => self.sign_in(),
                 Command::CancelSignIn => {
+                    self.pending_web_signin = false;
                     if let Some(cancel) = self.cancel_signin.take() {
                         let _ = cancel.send(true);
                     }
@@ -717,7 +723,7 @@ impl Worker {
                     access_token,
                     epoch,
                 } => {
-                    if epoch == self.auth_epoch {
+                    if !self.discard_stale_authorization(epoch) {
                         self.connect_engine(Credentials::with_access_token(access_token));
                     }
                 }
@@ -812,7 +818,7 @@ impl Worker {
     }
 
     fn on_web_signed_in(&mut self, token: crate::auth::StoredToken, epoch: u64) {
-        if epoch != self.auth_epoch {
+        if self.discard_stale_authorization(epoch) {
             return;
         }
         self.cancel_signin = None;
@@ -836,7 +842,7 @@ impl Worker {
     }
 
     fn on_web_sign_in_failed(&mut self, message: Option<String>, epoch: u64) {
-        if epoch != self.auth_epoch {
+        if self.discard_stale_authorization(epoch) {
             return;
         }
         self.cancel_signin = None;
@@ -850,14 +856,24 @@ impl Worker {
         if self.cancel_signin.is_some() {
             return;
         }
+        self.pending_web_signin = false;
         let grant = crate::auth::Grant::web_api(self.web_client_id.as_deref());
-        let flow = crate::auth::begin(grant.clone());
+        let session = match crate::auth::PreparedAuthorization::prepare(&grant) {
+            Ok(session) => session,
+            Err(error) => {
+                self.emit(Event::Auth(AuthStatus::Failed(format!(
+                    "Spotify sign-in could not start: {error}"
+                ))));
+                return;
+            }
+        };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel_signin = Some(cancel_tx);
+        let url = session.url().to_string();
         self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
-            url: flow.url.clone(),
+            url: url.clone(),
         }));
-        if let Err(error) = open::that_detached(&flow.url) {
+        if let Err(error) = open::that_detached(&url) {
             log::warn!("unable to open a browser: {error}");
         }
         let http = self.http.clone();
@@ -865,10 +881,14 @@ impl Worker {
         let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
-                let code =
-                    crate::auth::wait_for_code(grant.redirect_port, &flow.state, cancel_rx).await?;
-                let response =
-                    crate::auth::exchange_code(&http, &grant, &code, &flow.verifier).await?;
+                let authorized = session.wait(cancel_rx).await?;
+                let response = crate::auth::exchange_code(
+                    &http,
+                    &grant,
+                    &authorized.code,
+                    &authorized.verifier,
+                )
+                .await?;
                 crate::auth::StoredToken::from_response(&grant.client_id, response, None)
             }
             .await;
@@ -894,9 +914,11 @@ impl Worker {
     /// Only the Web API grant changes hands: the browser opens once for the
     /// new application, and local playback keeps its own credential.
     fn switch_web_app(&mut self, client_id: Option<String>) {
-        if let Some(cancel) = self.cancel_signin.take() {
-            let _ = cancel.send(true);
-        }
+        let waiting_for_previous = if let Some(cancel) = self.cancel_signin.take() {
+            cancel.send(true).is_ok()
+        } else {
+            false
+        };
         self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.web_client_id = client_id;
         self.deactivate_web_token();
@@ -912,7 +934,23 @@ impl Worker {
             )));
             return;
         }
-        self.sign_in();
+        if waiting_for_previous {
+            self.pending_web_signin = true;
+        } else {
+            self.sign_in();
+        }
+    }
+
+    /// A replaced flow reports only after dropping its listener. Use that
+    /// boundary to start the pending Web flow without a fixed-port bind race.
+    fn discard_stale_authorization(&mut self, epoch: u64) -> bool {
+        if epoch == self.auth_epoch {
+            return false;
+        }
+        if std::mem::take(&mut self.pending_web_signin) {
+            self.sign_in();
+        }
+        true
     }
 
     fn sign_out(&mut self) {
@@ -925,6 +963,7 @@ impl Worker {
             &playback_legacy,
             || {
                 self.signed_in = false;
+                self.pending_web_signin = false;
                 self.auth_epoch = self.auth_epoch.wrapping_add(1);
                 self.credential_epoch = self.credential_epoch.wrapping_add(1);
                 self.engine_busy = false;
@@ -1045,11 +1084,19 @@ impl Worker {
             return;
         }
         let grant = crate::auth::Grant::playback();
-        let flow = crate::auth::begin(grant.clone());
+        let session = match crate::auth::PreparedAuthorization::prepare(&grant) {
+            Ok(session) => session,
+            Err(error) => {
+                self.emit(Event::Playback(LocalPlayback::Failed(format!(
+                    "Spotify playback approval could not start: {error}"
+                ))));
+                return;
+            }
+        };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel_signin = Some(cancel_tx);
         self.emit(Event::Playback(LocalPlayback::Authorizing));
-        if let Err(error) = open::that_detached(&flow.url) {
+        if let Err(error) = open::that_detached(session.url()) {
             log::warn!("unable to open a browser: {error}");
         }
         let http = self.http.clone();
@@ -1057,9 +1104,14 @@ impl Worker {
         let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
-                let code =
-                    crate::auth::wait_for_code(grant.redirect_port, &flow.state, cancel_rx).await?;
-                crate::auth::exchange_code(&http, &grant, &code, &flow.verifier).await
+                let authorized = session.wait(cancel_rx).await?;
+                crate::auth::exchange_code(
+                    &http,
+                    &grant,
+                    &authorized.code,
+                    &authorized.verifier,
+                )
+                .await
             }
             .await;
             match result {
@@ -1081,7 +1133,7 @@ impl Worker {
     }
 
     fn on_playback_authorization_failed(&mut self, message: Option<String>, epoch: u64) {
-        if epoch != self.auth_epoch {
+        if self.discard_stale_authorization(epoch) {
             return;
         }
         self.cancel_signin = None;
