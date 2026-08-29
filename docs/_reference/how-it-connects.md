@@ -58,22 +58,29 @@ default:
   local playback is not signed in), sends the track's artist, title, album,
   and duration to the fixed `https://lrclib.net` API.
   LRCLIB also receives the connection's IP address, time, and Fastpotify
-  User-Agent. Responses are not redirected and are capped at 2 MiB.
+  User-Agent. Responses are not redirected and are capped at 2 MiB. Decoded
+  lyrics also have per-input-line timestamp, total-line, and cumulative-text
+  limits so compact LRC input cannot multiply into an unbounded result.
 - **Release checks:** contacts the fixed GitHub API endpoint at most once a
   day. GitHub receives the connection's IP address, time, and Fastpotify
   version in the User-Agent. The response is capped at 64 KiB, must name a
   strict `major.minor.patch` version, cannot redirect, and cannot choose the
   release page Fastpotify opens.
 
-Artwork is accepted only over HTTPS on port 443 from `scdn.co` or
-`spotifycdn.com` and their subdomains. Every redirect is rechecked against the
-same policy, downloads are capped at 8 MiB, and the JPEG/PNG signature, MIME
-type, dimensions, and pixel budget must agree before decoding. No real-account
-authentication was used while establishing this policy. A gated live check
-still needs to confirm the complete set of hosts currently returned by
-Spotify; a future legitimate host will be rejected until it is evaluated and
-explicitly added. A rejection log records only the host and policy reason,
-never the URL path, query, fragment, or user information.
+Every artwork request made and decoded by Fastpotify goes through one loader.
+It accepts only HTTPS on port 443 from `scdn.co` or `spotifycdn.com` and their
+subdomains. Every redirect is rechecked against the same policy, downloads are
+capped at 8 MiB, and the JPEG/PNG signature, MIME type, dimensions, and pixel
+budget must agree before decoding. macOS Now Playing receives no artwork
+because Souvlaki 0.8 accepts only a URL, which would create a second fetch
+outside that policy. Windows keeps its established system-media URL behavior;
+Linux exposes the provider URL as MPRIS metadata, so those operating-system
+surfaces may fetch independently of Fastpotify. No real-account authentication
+was used while establishing the in-app policy. A gated live check still needs
+to confirm the complete set of hosts currently returned by Spotify; a future
+legitimate host will be rejected until it is evaluated and explicitly added.
+A rejection log records only the host and policy reason, never the URL path,
+query, fragment, or user information.
 
 ## When Spotify pushes back
 

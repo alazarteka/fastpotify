@@ -5,7 +5,7 @@
 //! survives closing the last window to the status item. Registration is
 //! deferred until `App::attach`, after eframe has created `NSApplication`.
 //!
-//! Souvlaki remains the metadata/artwork publisher. The maintained
+//! Souvlaki remains the text-metadata publisher. The maintained
 //! `objc2-media-player` bindings own the command handlers and playback
 //! timeline because souvlaki 0.8 does not publish the playback-rate field
 //! macOS needs to advance Now Playing's elapsed time.
@@ -378,7 +378,9 @@ impl Bridge {
                 title: Some(track.title.as_str()),
                 album: Some(track.album.as_str()),
                 artist: Some(artist.as_str()),
-                cover_url: track.art_url.as_deref(),
+                // Souvlaki 0.8 accepts only a URL and fetches it outside the
+                // validated ArtLoader path; omitting it is the safe boundary.
+                cover_url: None,
                 duration: Some(Duration::from_millis(u64::from(track.duration_ms))),
             },
             None => MediaMetadata::default(),
@@ -390,8 +392,8 @@ impl Bridge {
 
     fn publish_timeline(&self, playback: Playback, position_ms: u32) {
         let timeline = timeline(playback, position_ms);
-        // Preserve souvlaki's title/album/artwork dictionary and change only
-        // the fields this bridge owns.
+        // Preserve souvlaki's title/album dictionary and change only the
+        // fields this bridge owns.
         let info: Retained<NSMutableDictionary<NSString, AnyObject>> =
             match unsafe { self.now_playing.nowPlayingInfo() } {
                 Some(info) => NSMutableDictionary::dictionaryWithDictionary(&info),

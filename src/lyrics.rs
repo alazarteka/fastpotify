@@ -25,6 +25,9 @@ const GET_URL: &str = "https://lrclib.net/api/get";
 const SEARCH_URL: &str = "https://lrclib.net/api/search";
 const MAX_LRCLIB_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUERY_FIELD_BYTES: usize = 512;
+const MAX_LRC_TIMESTAMPS_PER_LINE: usize = 32;
+const MAX_LYRICS_LINES: usize = 10_000;
+const MAX_DECODED_LYRICS_BYTES: usize = 1024 * 1024;
 /// Lyrics do not change; a cached answer is good for this long.
 const CACHE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// A candidate this far from the playing track's length is another
@@ -265,8 +268,9 @@ impl Record {
             });
         }
         if let Some(synced) = self.synced() {
-            let lines = parse_lrc(synced);
-            if !lines.is_empty() {
+            if let Ok(lines) = parse_lrc(synced)
+                && !lines.is_empty()
+            {
                 return Some(Lyrics {
                     lines,
                     synced: true,
@@ -275,14 +279,9 @@ impl Record {
             }
         }
         let plain = self.plain()?;
+        let lines = parse_plain_lyrics(plain).ok()?;
         Some(Lyrics {
-            lines: plain
-                .lines()
-                .map(|line| Line {
-                    at_ms: None,
-                    text: line.trim_end().to_string(),
-                })
-                .collect(),
+            lines,
             synced: false,
             instrumental: false,
         })
@@ -544,12 +543,18 @@ fn loose_match(left: &str, right: &str) -> bool {
 /// Parses `[mm:ss.xx]` lines. A line may open with several stamps when the
 /// same words repeat; tags such as `[ar:...]` carry no digits and are
 /// skipped. The result is sorted by time.
-pub fn parse_lrc(text: &str) -> Vec<Line> {
+pub fn parse_lrc(text: &str) -> Result<Vec<Line>> {
     let mut lines = Vec::new();
+    let mut decoded_bytes = 0usize;
     for raw in text.lines() {
         let mut rest = raw.trim_start();
-        let mut times = Vec::new();
+        let mut times = Vec::with_capacity(2);
         while let Some(stamp) = leading_stamp(rest) {
+            if times.len() == MAX_LRC_TIMESTAMPS_PER_LINE {
+                anyhow::bail!(
+                    "LRC line exceeds the {MAX_LRC_TIMESTAMPS_PER_LINE}-timestamp limit"
+                );
+            }
             times.push(stamp.0);
             rest = &rest[stamp.1..];
         }
@@ -557,6 +562,21 @@ pub fn parse_lrc(text: &str) -> Vec<Line> {
             continue;
         }
         let body = rest.trim();
+        if times.len() > MAX_LYRICS_LINES.saturating_sub(lines.len()) {
+            anyhow::bail!("decoded lyrics exceed the {MAX_LYRICS_LINES}-line limit");
+        }
+        let added_bytes = body
+            .len()
+            .checked_mul(times.len())
+            .ok_or_else(|| anyhow::anyhow!("decoded lyrics text size overflow"))?;
+        decoded_bytes = decoded_bytes
+            .checked_add(added_bytes)
+            .filter(|total| *total <= MAX_DECODED_LYRICS_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decoded lyrics exceed the {MAX_DECODED_LYRICS_BYTES}-byte text limit"
+                )
+            })?;
         for at_ms in times {
             lines.push(Line {
                 at_ms: Some(at_ms),
@@ -565,7 +585,31 @@ pub fn parse_lrc(text: &str) -> Vec<Line> {
         }
     }
     lines.sort_by_key(|line| line.at_ms);
-    lines
+    Ok(lines)
+}
+
+fn parse_plain_lyrics(text: &str) -> Result<Vec<Line>> {
+    let mut lines = Vec::new();
+    let mut decoded_bytes = 0usize;
+    for raw in text.lines() {
+        if lines.len() == MAX_LYRICS_LINES {
+            anyhow::bail!("decoded lyrics exceed the {MAX_LYRICS_LINES}-line limit");
+        }
+        let body = raw.trim_end();
+        decoded_bytes = decoded_bytes
+            .checked_add(body.len())
+            .filter(|total| *total <= MAX_DECODED_LYRICS_BYTES)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "decoded lyrics exceed the {MAX_DECODED_LYRICS_BYTES}-byte text limit"
+                )
+            })?;
+        lines.push(Line {
+            at_ms: None,
+            text: body.to_string(),
+        });
+    }
+    Ok(lines)
 }
 
 /// A timestamp at the head of `text`: its milliseconds and its length.
@@ -580,15 +624,23 @@ fn leading_stamp(text: &str) -> Option<(u32, usize)> {
     };
     let minutes: u32 = minutes.parse().ok()?;
     let seconds: u32 = seconds.parse().ok()?;
+    if seconds >= 60 {
+        return None;
+    }
     let fraction_ms = match fraction {
         Some(digits) if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) => {
-            let value: u32 = digits.chars().take(3).collect::<String>().parse().ok()?;
-            value * 10u32.pow(3u32.saturating_sub(digits.len().min(3) as u32))
+            let precision = digits.len().min(3);
+            let value: u32 = digits[..precision].parse().ok()?;
+            value.checked_mul(10u32.pow(3 - precision as u32))?
         }
         Some(_) => return None,
         None => 0,
     };
-    Some((minutes * 60_000 + seconds * 1_000 + fraction_ms, close + 2))
+    let at_ms = minutes
+        .checked_mul(60_000)?
+        .checked_add(seconds.checked_mul(1_000)?)?
+        .checked_add(fraction_ms)?;
+    Some((at_ms, close.checked_add(2)?))
 }
 
 // ---- cache ------------------------------------------------------------------
@@ -717,7 +769,8 @@ mod tests {
     fn lrc_lines_parse_and_sort() {
         let lines = parse_lrc(
             "[ar:Someone]\n[00:12.50]First\n[00:05]Early\n[01:00.1][02:00.123]Twice\n\nNo stamp\n",
-        );
+        )
+        .unwrap();
         let times: Vec<u32> = lines.iter().filter_map(|line| line.at_ms).collect();
         assert_eq!(times, vec![5_000, 12_500, 60_100, 120_123]);
         assert_eq!(lines[0].text, "Early");
@@ -726,9 +779,57 @@ mod tests {
     }
 
     #[test]
+    fn lrc_rejects_compact_timestamp_amplification() {
+        let too_many_stamps = format!(
+            "{}words",
+            "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE + 1)
+        );
+        assert!(parse_lrc(&too_many_stamps).is_err());
+
+        let repeated_body = "x".repeat(
+            MAX_DECODED_LYRICS_BYTES / MAX_LRC_TIMESTAMPS_PER_LINE + 1,
+        );
+        let too_much_text = format!(
+            "{}{}",
+            "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE),
+            repeated_body
+        );
+        assert!(parse_lrc(&too_much_text).is_err());
+
+        let expanded_line = format!(
+            "{}x\n",
+            "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE)
+        );
+        let too_many_lines = expanded_line.repeat(
+            MAX_LYRICS_LINES / MAX_LRC_TIMESTAMPS_PER_LINE + 1,
+        );
+        assert!(parse_lrc(&too_many_lines).is_err());
+    }
+
+    #[test]
+    fn lrc_timestamp_arithmetic_is_checked() {
+        assert_eq!(leading_stamp("[71582:47.295]x"), Some((u32::MAX, 14)));
+        assert!(leading_stamp("[71582:47.296]x").is_none());
+        assert!(leading_stamp("[71583:00]x").is_none());
+        assert!(leading_stamp("[42949672960:00]x").is_none());
+        assert!(leading_stamp("[00:60]x").is_none());
+    }
+
+    #[test]
+    fn plain_lyrics_are_useful_but_bounded() {
+        let lines = parse_plain_lyrics("first  \nsecond\n").unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "first");
+        assert_eq!(lines[1].text, "second");
+
+        assert!(parse_plain_lyrics(&"x\n".repeat(MAX_LYRICS_LINES + 1)).is_err());
+        assert!(parse_plain_lyrics(&"x".repeat(MAX_DECODED_LYRICS_BYTES + 1)).is_err());
+    }
+
+    #[test]
     fn the_active_line_is_the_last_one_started() {
         let lyrics = Lyrics {
-            lines: parse_lrc("[00:05]a\n[00:10]b\n[00:15]c"),
+            lines: parse_lrc("[00:05]a\n[00:10]b\n[00:15]c").unwrap(),
             synced: true,
             instrumental: false,
         };

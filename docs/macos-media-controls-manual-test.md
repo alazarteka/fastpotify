@@ -23,8 +23,9 @@ remote Spotify speaker: this checklist is for the Mac's local player.
 ## 1. Control Center state and commands
 
 1. Open Control Center → Now Playing.
-2. Confirm the title, artist, album, artwork, duration, and play state match
-   Fastpotify.
+2. Confirm the title, artist, album, duration, and play state match Fastpotify.
+   Now Playing should use its generic artwork placeholder; Fastpotify does not
+   give macOS a remote artwork URL to fetch outside its validated loader.
 3. Let the track play for 10 seconds. Confirm the Control Center position
    advances by roughly 10 seconds.
 4. Press Pause in Control Center. Confirm audio and both UIs pause, then wait
