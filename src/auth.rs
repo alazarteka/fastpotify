@@ -207,7 +207,6 @@ fn bind_callback_listener(port: u16) -> Result<std::net::TcpListener> {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: String,
@@ -1008,12 +1007,11 @@ mod tests {
         let mut invalid = token_response();
         invalid.refresh_token = Some("r".repeat(MAX_REFRESH_TOKEN_BYTES + 1));
         assert!(invalid.validate().is_err());
-        assert!(
-            serde_json::from_str::<TokenResponse>(
-                r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"extra":1}"#
-            )
-            .is_err()
-        );
+        let extended = serde_json::from_str::<TokenResponse>(
+            r#"{"access_token":"a","token_type":"Bearer","expires_in":3600,"provider_metadata":1}"#,
+        )
+        .unwrap();
+        assert!(extended.validate().is_ok());
     }
 
     #[test]
