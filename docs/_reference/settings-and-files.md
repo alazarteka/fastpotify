@@ -30,7 +30,11 @@ the final reparse point, reject handles with multiple links, lock the name
 against replacement while it is open, and use the validated handle for atomic
 replacement. A legacy credential is deleted only after its parent and file
 have been made private and the new item was written, read back, and compared
-successfully.
+successfully. Migration retains the validated legacy handle through that
+transaction. Unix captures the legacy pathname entry before unlinking it;
+Windows marks the retained handle itself for deletion. A concurrent legacy
+writer's replacement is therefore preserved rather than mistaken for the
+value that was migrated.
 Signing out clears the live providers and playback engine first, attempts to
 delete both new and legacy locations, and reports any partial failure.
 

@@ -9,8 +9,9 @@
 //! credential store can implement [`SecretStore`] without changing the Web or
 //! playback credential lifecycles.
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -320,13 +321,17 @@ impl LegacySecret {
     }
 }
 
+trait PreparedLegacy {
+    fn bytes(&self) -> &[u8];
+    fn delete(self: Box<Self>, id: SecretId) -> Result<()>;
+}
+
 trait LegacyIo {
-    fn load(&self, id: SecretId) -> Result<Option<Vec<u8>>>;
-    fn delete(&self, id: SecretId) -> Result<()>;
+    fn prepare(&self, id: SecretId) -> Result<Option<Box<dyn PreparedLegacy + '_>>>;
 }
 
 impl LegacyIo for LegacySecret {
-    fn load(&self, id: SecretId) -> Result<Option<Vec<u8>>> {
+    fn prepare(&self, id: SecretId) -> Result<Option<Box<dyn PreparedLegacy + '_>>> {
         for path in &self.stale {
             if destination_exists(path)? {
                 return Err(SecretError::StaleLegacy {
@@ -335,17 +340,29 @@ impl LegacyIo for LegacySecret {
                 });
             }
         }
-        read_legacy_private_file(&self.primary, MAX_SECRET_BYTES)
-    }
-
-    fn delete(&self, _id: SecretId) -> Result<()> {
-        delete_private_file(&self.primary, false)
+        let migration = legacy_migration_path(&self.primary);
+        if destination_exists(&migration)? {
+            return Err(SecretError::StaleLegacy {
+                kind: id.label(),
+                path: migration,
+            });
+        }
+        prepare_legacy_private_file(&self.primary, migration, MAX_SECRET_BYTES).map(|prepared| {
+            prepared.map(|prepared| Box::new(prepared) as Box<dyn PreparedLegacy + '_>)
+        })
     }
 }
 
-/// Moves a legacy JSON credential transactionally. The legacy file survives
-/// every write, read-back, comparison, and deletion failure. If deletion alone
-/// fails, the next call sees matching old and new values and safely retries it.
+fn legacy_migration_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".migrating");
+    path.with_file_name(name)
+}
+
+/// Moves a legacy JSON credential transactionally. The validated legacy handle
+/// remains live through write and read-back; a deletion failure leaves either
+/// the original name or a captured copy at the reported migration path.
 pub fn load_json_migrating<T: Serialize + DeserializeOwned>(
     store: &dyn SecretStore,
     id: SecretId,
@@ -375,17 +392,16 @@ fn load_json_migrating_with<T: Serialize + DeserializeOwned>(
     if let Some(value) = &current {
         validate(value)?;
     }
-    let old_bytes = legacy.load(id)?;
-    let old = match old_bytes {
-        Some(bytes) => {
-            let value = serde_json::from_slice::<T>(&bytes).map_err(|error| {
+    let old = match legacy.prepare(id)? {
+        Some(prepared) => {
+            let value = serde_json::from_slice::<T>(prepared.bytes()).map_err(|error| {
                 SecretError::Corrupt {
                     kind: id.label(),
                     reason: format!("legacy JSON: {error}"),
                 }
             })?;
             validate(&value)?;
-            Some(value)
+            Some((value, prepared))
         }
         None => None,
     };
@@ -393,21 +409,21 @@ fn load_json_migrating_with<T: Serialize + DeserializeOwned>(
     match (current, old) {
         (None, None) => Ok(None),
         (Some(value), None) => Ok(Some(value)),
-        (Some(value), Some(old)) => {
+        (Some(value), Some((old, prepared))) => {
             if canonical_json(id, &value)? != canonical_json(id, &old)? {
                 return Err(SecretError::MigrationConflict { kind: id.label() });
             }
-            legacy.delete(id)?;
+            prepared.delete(id)?;
             Ok(Some(value))
         }
-        (None, Some(old)) => {
+        (None, Some((old, prepared))) => {
             store_json(store, id, &old)?;
             let verified = load_json::<T>(store, id)?
                 .ok_or(SecretError::Verification { kind: id.label() })?;
             if canonical_json(id, &verified)? != canonical_json(id, &old)? {
                 return Err(SecretError::Verification { kind: id.label() });
             }
-            legacy.delete(id)?;
+            prepared.delete(id)?;
             Ok(Some(verified))
         }
     }
@@ -445,6 +461,11 @@ fn clear_legacy_files(legacy: &LegacySecret, failures: &mut Vec<String>) {
             failures,
         );
     }
+    record_clear(
+        delete_private_file(&legacy_migration_path(&legacy.primary), false),
+        "interrupted legacy migration",
+        failures,
+    );
 }
 
 /// Clears one grant after its in-memory provider has already been dropped.
@@ -805,9 +826,39 @@ fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Opt
     read_open_bounded(path, &mut file, limit).map(Some)
 }
 
+struct PreparedLegacyFile {
+    path: PathBuf,
+    migration: PathBuf,
+    file: File,
+    bytes: Vec<u8>,
+    limit: usize,
+    _parent_guard: Option<File>,
+}
+
+impl PreparedLegacy for PreparedLegacyFile {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn delete(mut self: Box<Self>, _id: SecretId) -> Result<()> {
+        platform_file::delete_prepared_legacy(
+            &mut self.file,
+            &self.path,
+            &self.migration,
+            &self.bytes,
+            self.limit,
+        )
+    }
+}
+
 /// Historical librespot files were created with the process umask. Secure the
-/// directory and the already-validated file handle before any bytes are read.
-fn read_legacy_private_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+/// directory and file, then retain their validated handles until the migration
+/// either fails or consumes that exact file.
+fn prepare_legacy_private_file(
+    path: &Path,
+    migration: PathBuf,
+    limit: usize,
+) -> Result<Option<PreparedLegacyFile>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -818,19 +869,27 @@ fn read_legacy_private_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>
         reason: "legacy credential has no parent directory".into(),
     })?;
     ensure_private_dir(parent)?;
-    let _parent_guard = platform_file::lock_directory(parent)?;
+    let parent_guard = platform_file::lock_directory(parent)?;
     validate_file_metadata(path, &metadata, false)?;
 
     let mut options = OpenOptions::new();
     options.read(true);
-    platform_file::configure_regular(&mut options);
+    platform_file::configure_legacy(&mut options);
     let mut file = options
         .open(path)
         .map_err(|error| io("open a legacy credential file", path, error))?;
     validate_open_file(path, &file, false)?;
     platform_file::harden(&file, path)?;
     validate_open_file(path, &file, true)?;
-    read_open_bounded(path, &mut file, limit).map(Some)
+    let bytes = read_open_bounded(path, &mut file, limit)?;
+    Ok(Some(PreparedLegacyFile {
+        path: path.to_path_buf(),
+        migration,
+        file,
+        bytes,
+        limit,
+        _parent_guard: parent_guard,
+    }))
 }
 
 fn read_open_bounded(path: &Path, file: &mut File, limit: usize) -> Result<Vec<u8>> {
@@ -846,6 +905,24 @@ fn read_open_bounded(path: &Path, file: &mut File, limit: usize) -> Result<Vec<u
         });
     }
     Ok(bytes)
+}
+
+fn verify_open_contents(
+    path: &Path,
+    file: &mut File,
+    expected: &[u8],
+    limit: usize,
+) -> Result<()> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io("rewind a legacy credential file", path, error))?;
+    let actual = read_open_bounded(path, file, limit)?;
+    if actual != expected {
+        return Err(SecretError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "legacy credential changed during migration".into(),
+        });
+    }
+    Ok(())
 }
 
 fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
@@ -868,6 +945,8 @@ mod platform_file {
     use super::*;
 
     pub fn configure_regular(_options: &mut OpenOptions) {}
+
+    pub fn configure_legacy(_options: &mut OpenOptions) {}
 
     pub fn configure_temporary(_options: &mut OpenOptions) {}
 
@@ -908,6 +987,44 @@ mod platform_file {
         std::fs::rename(source, destination)
             .map_err(|error| io("atomically replace a credential file at", destination, error))
     }
+
+    pub fn delete_prepared_legacy(
+        file: &mut File,
+        path: &Path,
+        migration: &Path,
+        expected: &[u8],
+        limit: usize,
+    ) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+        let marker = options.open(migration).map_err(|error| {
+            io(
+                "reserve a legacy credential migration path",
+                migration,
+                error,
+            )
+        })?;
+        validate_open_file(migration, &marker, true)?;
+        if let Err(error) = std::fs::rename(path, migration) {
+            drop(marker);
+            return Err(io(
+                "capture a legacy credential before deletion",
+                path,
+                error,
+            ));
+        }
+        drop(marker);
+
+        // The rename captures one pathname entry without deleting it. If a
+        // concurrent writer substituted that entry, leave it quarantined and
+        // fail instead of consuming data that was not migrated.
+        validate_open_file(migration, file, true)?;
+        verify_open_contents(migration, file, expected, limit)?;
+        std::fs::remove_file(migration)
+            .map_err(|error| io("delete a migrated legacy credential", migration, error))
+    }
 }
 
 #[cfg(windows)]
@@ -916,12 +1033,13 @@ mod platform_file {
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
-        GetFileInformationByHandle, SetFileInformationByHandle,
+        FILE_DISPOSITION_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileDispositionInfo, FileRenameInfo, GetFileInformationByHandle,
+        SetFileInformationByHandle,
     };
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -938,6 +1056,13 @@ mod platform_file {
 
     pub fn configure_regular(options: &mut OpenOptions) {
         options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    pub fn configure_legacy(options: &mut OpenOptions) {
+        options
+            .access_mode(GENERIC_READ | DELETE)
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -1138,6 +1263,38 @@ mod platform_file {
             Ok(())
         }
     }
+
+    pub fn delete_prepared_legacy(
+        file: &mut File,
+        path: &Path,
+        _migration: &Path,
+        expected: &[u8],
+        limit: usize,
+    ) -> Result<()> {
+        validate_open_file(path, file, true)?;
+        verify_open_contents(path, file, expected, limit)?;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the prepared handle has DELETE access and denies concurrent
+        // writes or renames; `disposition` is a complete input structure.
+        let succeeded = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>())
+                    .expect("FILE_DISPOSITION_INFO size fits in u32"),
+            )
+        };
+        if succeeded == 0 {
+            Err(io(
+                "delete a migrated legacy credential by handle at",
+                path,
+                std::io::Error::last_os_error(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1145,6 +1302,7 @@ mod platform_file {
     use super::*;
 
     pub fn configure_regular(_options: &mut OpenOptions) {}
+    pub fn configure_legacy(_options: &mut OpenOptions) {}
     pub fn configure_temporary(_options: &mut OpenOptions) {}
     pub fn lock_directory(_path: &Path) -> Result<Option<File>> {
         Ok(None)
@@ -1166,6 +1324,18 @@ mod platform_file {
     pub fn atomic_replace(_file: &File, source: &Path, destination: &Path) -> Result<()> {
         std::fs::rename(source, destination)
             .map_err(|error| io("atomically replace a credential file at", destination, error))
+    }
+    pub fn delete_prepared_legacy(
+        file: &mut File,
+        path: &Path,
+        _migration: &Path,
+        expected: &[u8],
+        limit: usize,
+    ) -> Result<()> {
+        validate_open_file(path, file, true)?;
+        verify_open_contents(path, file, expected, limit)?;
+        std::fs::remove_file(path)
+            .map_err(|error| io("delete a migrated legacy credential", path, error))
     }
 }
 
@@ -1260,23 +1430,91 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    struct LegacySwappingStore {
+        inner: PrivateFileStore,
+        legacy: PathBuf,
+        backup: PathBuf,
+        replacement: Vec<u8>,
+        swapped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl SecretStore for LegacySwappingStore {
+        fn load(&self, id: SecretId) -> Result<Option<Vec<u8>>> {
+            self.inner.load(id)
+        }
+
+        fn store(&self, id: SecretId, secret: &[u8]) -> Result<()> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            if !self.swapped.swap(true, Ordering::SeqCst) {
+                std::fs::rename(&self.legacy, &self.backup).map_err(|error| {
+                    io("substitute the test legacy credential", &self.legacy, error)
+                })?;
+                std::fs::write(&self.legacy, &self.replacement).map_err(|error| {
+                    io("write the test replacement credential", &self.legacy, error)
+                })?;
+                std::fs::set_permissions(
+                    &self.legacy,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .map_err(|error| {
+                    io(
+                        "secure the test replacement credential",
+                        &self.legacy,
+                        error,
+                    )
+                })?;
+            }
+            self.inner.store(id, secret)
+        }
+
+        fn delete(&self, id: SecretId) -> Result<()> {
+            self.inner.delete(id)
+        }
+    }
+
     #[derive(Default)]
     struct MockLegacy {
         value: Mutex<Option<Vec<u8>>>,
         fail_delete: bool,
     }
 
-    impl LegacyIo for MockLegacy {
-        fn load(&self, _id: SecretId) -> Result<Option<Vec<u8>>> {
-            Ok(self.value.lock().unwrap().clone())
+    struct MockPreparedLegacy<'a> {
+        legacy: &'a MockLegacy,
+        bytes: Vec<u8>,
+    }
+
+    impl PreparedLegacy for MockPreparedLegacy<'_> {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
         }
 
-        fn delete(&self, id: SecretId) -> Result<()> {
-            if self.fail_delete {
+        fn delete(self: Box<Self>, id: SecretId) -> Result<()> {
+            if self.legacy.fail_delete {
                 return Err(SecretError::Verification { kind: id.label() });
             }
-            *self.value.lock().unwrap() = None;
+            let mut current = self.legacy.value.lock().unwrap();
+            if current.as_deref() != Some(self.bytes.as_slice()) {
+                return Err(SecretError::UnsafePath {
+                    path: PathBuf::from("mock legacy credential"),
+                    reason: "legacy credential changed during migration".into(),
+                });
+            }
+            *current = None;
             Ok(())
+        }
+    }
+
+    impl LegacyIo for MockLegacy {
+        fn prepare(&self, _id: SecretId) -> Result<Option<Box<dyn PreparedLegacy + '_>>> {
+            Ok(self.value.lock().unwrap().clone().map(|bytes| {
+                Box::new(MockPreparedLegacy {
+                    legacy: self,
+                    bytes,
+                }) as Box<dyn PreparedLegacy + '_>
+            }))
         }
     }
 
@@ -1445,9 +1683,62 @@ mod tests {
             &LegacySecret::new(legacy_path.clone()),
         );
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(SecretError::UnsafePath { reason, .. })
+                if reason == "filename changed while it was being opened"
+        ));
         assert_eq!(std::fs::read(&legacy_path).unwrap(), invalid);
         assert_eq!(std::fs::metadata(&legacy_path).unwrap().mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_never_deletes_a_substituted_legacy_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-legacy-swap-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy_dir = root.join("credentials");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("credentials.json");
+        let original = encoded_example();
+        std::fs::write(&legacy_path, &original).unwrap();
+        std::fs::set_permissions(&legacy_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let replacement = serde_json::to_vec(&ExampleSecret {
+            value: "newer".into(),
+        })
+        .unwrap();
+        let backup = legacy_dir.join("original.backup");
+        let store = LegacySwappingStore {
+            inner: PrivateFileStore::new(root.join("secrets-v1")),
+            legacy: legacy_path.clone(),
+            backup: backup.clone(),
+            replacement: replacement.clone(),
+            swapped: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let result = load_json_migrating::<ExampleSecret>(
+            &store,
+            SecretId::Playback,
+            &LegacySecret::new(legacy_path.clone()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(
+            std::fs::read(legacy_migration_path(&legacy_path)).unwrap(),
+            replacement
+        );
+        assert_eq!(
+            store.load(SecretId::Playback).unwrap(),
+            Some(encoded_example())
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

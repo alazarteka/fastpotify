@@ -607,6 +607,134 @@ impl Backend {
     }
 }
 
+struct ActiveAuthorization {
+    epoch: u64,
+    cancel: watch::Sender<bool>,
+    cancelled: bool,
+}
+
+#[derive(Default)]
+struct AuthorizationLifecycle {
+    active: Option<ActiveAuthorization>,
+    pending_web: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuthorizationCompletion {
+    Current,
+    Ignore,
+    StartPendingWeb,
+}
+
+impl AuthorizationLifecycle {
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn begin(&mut self, cancel: watch::Sender<bool>, epoch: u64) {
+        debug_assert!(self.active.is_none());
+        self.pending_web = false;
+        self.active = Some(ActiveAuthorization {
+            epoch,
+            cancel,
+            cancelled: false,
+        });
+    }
+
+    /// A request matching a live flow is a duplicate. A request made after
+    /// cancellation, or from a newer epoch, must wait until that task drops
+    /// its prepared listener.
+    fn defer_web_request(&mut self, current_epoch: u64) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        if active.epoch != current_epoch || active.cancelled {
+            self.pending_web = true;
+        }
+        true
+    }
+
+    fn cancel(&mut self) {
+        self.pending_web = false;
+        if let Some(active) = &mut self.active {
+            active.cancelled = true;
+            let _ = active.cancel.send(true);
+        }
+    }
+
+    fn finish(&mut self, epoch: u64, current_epoch: u64) -> AuthorizationCompletion {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.epoch == epoch)
+        {
+            return AuthorizationCompletion::Ignore;
+        }
+        let active = self.active.take().expect("matching authorization exists");
+        if std::mem::take(&mut self.pending_web) {
+            AuthorizationCompletion::StartPendingWeb
+        } else if epoch == current_epoch && !active.cancelled {
+            AuthorizationCompletion::Current
+        } else {
+            AuthorizationCompletion::Ignore
+        }
+    }
+}
+
+#[cfg(test)]
+mod authorization_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_web_replacements_wait_for_the_listener_owner() {
+        let mut lifecycle = AuthorizationLifecycle::default();
+        let (cancel, cancel_rx) = watch::channel(false);
+        lifecycle.begin(cancel, 4);
+
+        lifecycle.cancel();
+        assert!(lifecycle.defer_web_request(5));
+        lifecycle.cancel();
+        assert!(lifecycle.defer_web_request(6));
+
+        assert!(*cancel_rx.borrow());
+        assert_eq!(
+            lifecycle.finish(4, 6),
+            AuthorizationCompletion::StartPendingWeb
+        );
+        assert!(!lifecycle.is_active());
+        assert!(!lifecycle.defer_web_request(6));
+    }
+
+    #[test]
+    fn sign_in_requested_after_cancel_is_not_lost() {
+        let mut lifecycle = AuthorizationLifecycle::default();
+        let (cancel, cancel_rx) = watch::channel(false);
+        lifecycle.begin(cancel, 9);
+
+        lifecycle.cancel();
+        assert!(lifecycle.defer_web_request(9));
+
+        assert!(*cancel_rx.borrow());
+        assert_eq!(
+            lifecycle.finish(9, 9),
+            AuthorizationCompletion::StartPendingWeb
+        );
+    }
+
+    #[test]
+    fn cancelled_completion_cannot_become_current() {
+        let mut lifecycle = AuthorizationLifecycle::default();
+        let (cancel, _cancel_rx) = watch::channel(false);
+        lifecycle.begin(cancel, 12);
+        lifecycle.cancel();
+
+        assert_eq!(
+            lifecycle.finish(12, 12),
+            AuthorizationCompletion::Ignore
+        );
+    }
+}
+
 struct Worker {
     dirs: AppDirs,
     engine_config: EngineConfig,
@@ -626,11 +754,7 @@ struct Worker {
     signed_in: bool,
     /// The plan, once the Web API has answered.
     premium: Option<bool>,
-    cancel_signin: Option<watch::Sender<bool>>,
-    /// A Web flow requested while another authorization still owns its fixed
-    /// callback port. It starts only after that task reports completion and
-    /// has dropped the prepared listener.
-    pending_web_signin: bool,
+    authorization: AuthorizationLifecycle,
     reconnects: Vec<Instant>,
     /// Invalidates browser flows that finish after cancellation by sign-out
     /// or application switching.
@@ -670,8 +794,7 @@ impl Worker {
             engine_busy: false,
             signed_in: false,
             premium: None,
-            cancel_signin: None,
-            pending_web_signin: false,
+            authorization: AuthorizationLifecycle::default(),
             reconnects: Vec::new(),
             auth_epoch: 0,
             credential_epoch: 0,
@@ -689,12 +812,7 @@ impl Worker {
             match command {
                 Command::Shutdown => break,
                 Command::SignIn => self.sign_in(),
-                Command::CancelSignIn => {
-                    self.pending_web_signin = false;
-                    if let Some(cancel) = self.cancel_signin.take() {
-                        let _ = cancel.send(true);
-                    }
-                }
+                Command::CancelSignIn => self.authorization.cancel(),
                 Command::SignOut => self.sign_out(),
                 Command::AuthorizePlayback => self.authorize_playback(),
                 Command::RestartEngine(config) => {
@@ -821,7 +939,6 @@ impl Worker {
         if self.discard_stale_authorization(epoch) {
             return;
         }
-        self.cancel_signin = None;
         if let Err(error) =
             crate::secrets::store_json(self.secrets.as_ref(), SecretId::WebApi, &token)
         {
@@ -845,7 +962,6 @@ impl Worker {
         if self.discard_stale_authorization(epoch) {
             return;
         }
-        self.cancel_signin = None;
         self.emit(Event::Auth(AuthStatus::SignedOut));
         if let Some(message) = message {
             self.emit(Event::Error(format!("Sign-in failed: {message}")));
@@ -853,10 +969,9 @@ impl Worker {
     }
 
     fn sign_in(&mut self) {
-        if self.cancel_signin.is_some() {
+        if self.authorization.defer_web_request(self.auth_epoch) {
             return;
         }
-        self.pending_web_signin = false;
         let grant = crate::auth::Grant::web_api(self.web_client_id.as_deref());
         let session = match crate::auth::PreparedAuthorization::prepare(&grant) {
             Ok(session) => session,
@@ -868,7 +983,8 @@ impl Worker {
             }
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.cancel_signin = Some(cancel_tx);
+        let epoch = self.auth_epoch;
+        self.authorization.begin(cancel_tx, epoch);
         let url = session.url().to_string();
         self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
             url: url.clone(),
@@ -878,7 +994,6 @@ impl Worker {
         }
         let http = self.http.clone();
         let commands = self.commands.clone();
-        let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
                 let authorized = session.wait(cancel_rx).await?;
@@ -914,11 +1029,7 @@ impl Worker {
     /// Only the Web API grant changes hands: the browser opens once for the
     /// new application, and local playback keeps its own credential.
     fn switch_web_app(&mut self, client_id: Option<String>) {
-        let waiting_for_previous = if let Some(cancel) = self.cancel_signin.take() {
-            cancel.send(true).is_ok()
-        } else {
-            false
-        };
+        self.authorization.cancel();
         self.auth_epoch = self.auth_epoch.wrapping_add(1);
         self.web_client_id = client_id;
         self.deactivate_web_token();
@@ -934,23 +1045,20 @@ impl Worker {
             )));
             return;
         }
-        if waiting_for_previous {
-            self.pending_web_signin = true;
-        } else {
-            self.sign_in();
-        }
+        self.sign_in();
     }
 
     /// A replaced flow reports only after dropping its listener. Use that
     /// boundary to start the pending Web flow without a fixed-port bind race.
     fn discard_stale_authorization(&mut self, epoch: u64) -> bool {
-        if epoch == self.auth_epoch {
-            return false;
+        match self.authorization.finish(epoch, self.auth_epoch) {
+            AuthorizationCompletion::Current => false,
+            AuthorizationCompletion::Ignore => true,
+            AuthorizationCompletion::StartPendingWeb => {
+                self.sign_in();
+                true
+            }
         }
-        if std::mem::take(&mut self.pending_web_signin) {
-            self.sign_in();
-        }
-        true
     }
 
     fn sign_out(&mut self) {
@@ -963,16 +1071,13 @@ impl Worker {
             &playback_legacy,
             || {
                 self.signed_in = false;
-                self.pending_web_signin = false;
                 self.auth_epoch = self.auth_epoch.wrapping_add(1);
                 self.credential_epoch = self.credential_epoch.wrapping_add(1);
                 self.engine_busy = false;
                 if let Some(engine) = self.engine.take() {
                     engine.shutdown();
                 }
-                if let Some(cancel) = self.cancel_signin.take() {
-                    let _ = cancel.send(true);
-                }
+                self.authorization.cancel();
                 self.deactivate_web_token();
             },
         );
@@ -1074,7 +1179,7 @@ impl Worker {
     /// a distinct grant from the Web API sign-in: it uses Spotify's streaming
     /// client identity, the one librespot can play with.
     fn authorize_playback(&mut self) {
-        if self.engine_busy || self.cancel_signin.is_some() {
+        if self.engine_busy || self.authorization.is_active() {
             return;
         }
         if self.premium == Some(false) {
@@ -1094,14 +1199,14 @@ impl Worker {
             }
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.cancel_signin = Some(cancel_tx);
+        let epoch = self.auth_epoch;
+        self.authorization.begin(cancel_tx, epoch);
         self.emit(Event::Playback(LocalPlayback::Authorizing));
         if let Err(error) = open::that_detached(session.url()) {
             log::warn!("unable to open a browser: {error}");
         }
         let http = self.http.clone();
         let commands = self.commands.clone();
-        let epoch = self.auth_epoch;
         tokio::spawn(async move {
             let result = async {
                 let authorized = session.wait(cancel_rx).await?;
@@ -1136,7 +1241,6 @@ impl Worker {
         if self.discard_stale_authorization(epoch) {
             return;
         }
-        self.cancel_signin = None;
         match message {
             Some(message) => self.emit(Event::Playback(LocalPlayback::Failed(message))),
             None => self.emit(Event::Playback(LocalPlayback::Unavailable)),
@@ -1157,7 +1261,6 @@ impl Worker {
             )));
             return;
         }
-        self.cancel_signin = None;
         self.engine_busy = true;
         self.emit(Event::Playback(LocalPlayback::Connecting));
         let config = self.engine_config.clone();
