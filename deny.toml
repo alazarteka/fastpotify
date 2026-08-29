@@ -10,12 +10,20 @@ targets = [
 all-features = true
 
 [advisories]
-# Vulnerabilities remain deny-by-default. Do not add a repository-wide ignore
-# for the legacy rustls-webpki copy: any exception must name the advisory and
-# document why the affected API is unreachable.
+# Vulnerabilities remain deny-by-default. These exceptions name APIs that are
+# unreachable in Fastpotify's dependency use; cargo-deny will surface them as
+# notes and will fail if a different advisory appears.
 unmaintained = "workspace"
 unsound = "all"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "librespot-core reads element names and text with quick_xml::Reader; it never iterates attributes, the affected operation" },
+  { id = "RUSTSEC-2026-0195", reason = "librespot-core uses quick_xml::Reader, not the affected NsReader or NamespaceResolver APIs" },
+  { id = "RUSTSEC-2023-0071", reason = "librespot-core constructs an RsaPublicKey solely to verify Spotify's handshake signature; it has no RSA private key for the timing attack to recover" },
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 is reachable only through hyper-proxy2's TLS client, while Fastpotify leaves SessionConfig.proxy unset" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 is reachable only through hyper-proxy2's TLS client, while Fastpotify leaves SessionConfig.proxy unset" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 is reachable only through hyper-proxy2's TLS client, while Fastpotify leaves SessionConfig.proxy unset" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 is reachable only through hyper-proxy2's TLS client, while Fastpotify leaves SessionConfig.proxy unset" },
+]
 
 [bans]
 # A large desktop graph legitimately contains some duplicate foundational
@@ -32,7 +40,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = [
   "https://github.com/rust-lang/crates.io-index",
-  "sparse+https://index.crates.io/",
 ]
 
 [licenses]
@@ -44,16 +51,24 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
-  "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
   "MPL-2.0",
-  "NCSA",
-  "OpenSSL",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "Unlicense",
   "Zlib",
 ]
-exceptions = []
+exceptions = [
+  { crate = "epaint_default_fonts@0.36.1", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+# webpki 0.22.4 predates crates.io's SPDX metadata convention. Its published
+# LICENSE file is ISC; the content hash makes this clarification fail closed if
+# a future source archive differs.
+[[licenses.clarify]]
+crate = "webpki@0.22.4"
+expression = "ISC"
+license-files = [
+  { path = "LICENSE", hash = 0x001c7e6c },
+]
