@@ -192,7 +192,7 @@ impl RemoteTarget {
         // never waited on, from this Apple callback.
         let handler: RcBlock<
             dyn Fn(NonNull<MPRemoteCommandEvent>) -> MPRemoteCommandHandlerStatus + 'static,
-        > = RcBlock::new(move |event| {
+        > = RcBlock::new(move |event: NonNull<MPRemoteCommandEvent>| {
             // Safety: MediaPlayer invokes this block with a valid retained
             // MPRemoteCommandEvent for the duration of the call.
             let event = unsafe { event.as_ref() };

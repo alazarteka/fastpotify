@@ -222,8 +222,8 @@ async fn get<T: DeserializeOwned>(
 
 fn endpoint(path: &str) -> Result<&'static str> {
     match path {
-        "/get" => GET_URL,
-        "/search" => SEARCH_URL,
+        "/get" => Ok(GET_URL),
+        "/search" => Ok(SEARCH_URL),
         _ => anyhow::bail!("invalid LRCLIB endpoint"),
     }
 }
@@ -267,16 +267,15 @@ impl Record {
                 ..Lyrics::default()
             });
         }
-        if let Some(synced) = self.synced() {
-            if let Ok(lines) = parse_lrc(synced)
-                && !lines.is_empty()
-            {
-                return Some(Lyrics {
-                    lines,
-                    synced: true,
-                    instrumental: false,
-                });
-            }
+        if let Some(synced) = self.synced()
+            && let Ok(lines) = parse_lrc(synced)
+            && !lines.is_empty()
+        {
+            return Some(Lyrics {
+                lines,
+                synced: true,
+                instrumental: false,
+            });
         }
         let plain = self.plain()?;
         let lines = parse_plain_lyrics(plain).ok()?;

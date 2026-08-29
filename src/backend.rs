@@ -1115,7 +1115,7 @@ impl Worker {
     }
 
     fn saved_playback_credentials(&self) -> crate::secrets::Result<Option<Credentials>> {
-        crate::secrets::load_json_migrating_validated(
+        crate::secrets::load_json_migrating_validated::<Credentials>(
             self.secrets.as_ref(),
             SecretId::Playback,
             &self.dirs.legacy_playback_secret(),
