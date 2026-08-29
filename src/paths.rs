@@ -79,9 +79,7 @@ impl AppDirs {
     }
 
     pub fn legacy_playback_secret(&self) -> crate::secrets::LegacySecret {
-        crate::secrets::LegacySecret::new(
-            self.legacy_credentials_dir().join("credentials.json"),
-        )
+        crate::secrets::LegacySecret::new(self.legacy_credentials_dir().join("credentials.json"))
     }
 
     pub fn volume_dir(&self) -> PathBuf {

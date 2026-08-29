@@ -238,9 +238,7 @@ impl TokenResponse {
 }
 
 fn validate_token_value(label: &str, value: &str, limit: usize) -> Result<()> {
-    if value.is_empty()
-        || value.len() > limit
-        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    if value.is_empty() || value.len() > limit || !value.bytes().all(|byte| byte.is_ascii_graphic())
     {
         bail!("Spotify returned an invalid {label}");
     }
@@ -380,11 +378,8 @@ fn spawn_callback_response(
     deadline: tokio::time::Instant,
 ) {
     tokio::spawn(async move {
-        match tokio::time::timeout_at(
-            deadline,
-            write_callback_response(&mut stream, status, body),
-        )
-        .await
+        match tokio::time::timeout_at(deadline, write_callback_response(&mut stream, status, body))
+            .await
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -399,7 +394,10 @@ async fn read_request_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
-        let count = stream.read(&mut chunk).await.context("callback read failed")?;
+        let count = stream
+            .read(&mut chunk)
+            .await
+            .context("callback read failed")?;
         if count == 0 {
             bail!("callback connection closed before its headers");
         }
@@ -439,11 +437,12 @@ fn parse_callback_request(
     if request.len() - end - 4 > MAX_CALLBACK_BODY_BYTES {
         bail!("callback request bodies are not accepted");
     }
-    let head = std::str::from_utf8(&request[..end])
-        .context("callback request headers are not UTF-8")?;
-    if head.bytes().any(|byte| {
-        byte == 0 || (byte < 0x20 && byte != b'\r' && byte != b'\n' && byte != b'\t')
-    }) {
+    let head =
+        std::str::from_utf8(&request[..end]).context("callback request headers are not UTF-8")?;
+    if head
+        .bytes()
+        .any(|byte| byte == 0 || (byte < 0x20 && byte != b'\r' && byte != b'\n' && byte != b'\t'))
+    {
         bail!("callback request contains control characters");
     }
     let mut lines = head.split("\r\n");
@@ -554,7 +553,8 @@ fn parse_callback_request(
     }
     match (code, error) {
         (Some(code), None)
-            if !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_graphic()) => {
+            if !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_graphic()) =>
+        {
             Ok(ProviderCallback::Accepted(code))
         }
         (Some(_), None) => Ok(ProviderCallback::Invalid(
@@ -607,11 +607,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-async fn write_callback_response(
-    stream: &mut TcpStream,
-    status: &str,
-    body: &str,
-) -> Result<()> {
+async fn write_callback_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
     let response = callback_response(status, body);
     stream
         .write_all(response.as_bytes())
@@ -708,7 +704,8 @@ async fn token_request(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<
             .unwrap_or_else(|| "request was rejected".into());
         bail!("Spotify rejected the token request ({status}): {detail}");
     }
-    let token: TokenResponse = serde_json::from_slice(&body).context("unexpected token response")?;
+    let token: TokenResponse =
+        serde_json::from_slice(&body).context("unexpected token response")?;
     token.validate()?;
     Ok(token)
 }
@@ -774,7 +771,11 @@ impl StoredToken {
         {
             bail!("stored Spotify client id is invalid");
         }
-        validate_token_value("stored access token", &self.access_token, MAX_ACCESS_TOKEN_BYTES)?;
+        validate_token_value(
+            "stored access token",
+            &self.access_token,
+            MAX_ACCESS_TOKEN_BYTES,
+        )?;
         validate_token_value(
             "stored refresh token",
             &self.refresh_token,
@@ -877,9 +878,7 @@ mod tests {
             "GET /favicon.ico?code=abc&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
             "GET /login?code=abc&state=s1 HTTP/1.1\r\nHost: localhost:8989\r\n\r\n",
         ] {
-            assert!(
-                parse_callback_request(invalid.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err()
-            );
+            assert!(parse_callback_request(invalid.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err());
         }
     }
 
@@ -925,7 +924,10 @@ mod tests {
             Err(anyhow!("simulated browser disconnect"))
         }) {
             CallbackDisposition::Finish(result) => {
-                assert_eq!(result.unwrap_err().to_string(), "Spotify declined the sign-in")
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "Spotify declined the sign-in"
+                )
             }
             CallbackDisposition::Retry(_) => panic!("an authenticated denial must be terminal"),
         }
@@ -939,9 +941,7 @@ mod tests {
             "/login?code=a&state=s1&error=denied&error=again",
             "/login?code=%GG&state=s1",
         ] {
-            assert!(
-                parse_callback_request(&callback(target), "s1", WEB_REDIRECT_PORT).is_err()
-            );
+            assert!(parse_callback_request(&callback(target), "s1", WEB_REDIRECT_PORT).is_err());
         }
 
         let length = b"GET /login?code=a&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\nContent-Length: 1\r\n\r\n";
@@ -955,9 +955,7 @@ mod tests {
             "GET /login?code={}&state=s1 HTTP/1.1\r\nHost: 127.0.0.1:8989\r\n\r\n",
             "a".repeat(MAX_REQUEST_LINE_BYTES)
         );
-        assert!(
-            parse_callback_request(oversized.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err()
-        );
+        assert!(parse_callback_request(oversized.as_bytes(), "s1", WEB_REDIRECT_PORT).is_err());
     }
 
     #[test]

@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use block2::RcBlock;
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::MainThreadMarker;
 use objc2_foundation::{NSMutableDictionary, NSNumber, NSString};
 use objc2_media_player::{
     MPChangePlaybackPositionCommandEvent, MPNowPlayingInfoCenter,
@@ -82,11 +82,7 @@ fn position_millis(seconds: f64) -> Option<u32> {
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
-    Some(
-        (seconds * 1000.0)
-            .round()
-            .min(f64::from(u32::MAX)) as u32,
-    )
+    Some((seconds * 1000.0).round().min(f64::from(u32::MAX)) as u32)
 }
 
 fn position_event(seconds: f64, track_uri: Option<Arc<str>>) -> Option<NativeEvent> {
@@ -410,7 +406,8 @@ impl Bridge {
             info.insert(MPNowPlayingInfoPropertyPlaybackRate, &rate);
             info.insert(MPNowPlayingInfoPropertyDefaultPlaybackRate, &default_rate);
             self.now_playing.setNowPlayingInfo(Some(&info));
-            self.now_playing.setPlaybackState(now_playing_state(playback));
+            self.now_playing
+                .setPlaybackState(now_playing_state(playback));
         }
     }
 }
@@ -474,10 +471,7 @@ enum Deferred<P> {
 impl<P> Deferred<P> {
     /// Initializes at most once. Failure is terminal so reopening a window
     /// cannot build up duplicate platform handlers.
-    fn initialize<E>(
-        &mut self,
-        initialize: impl FnOnce(P) -> Result<(), E>,
-    ) -> Result<bool, E> {
+    fn initialize<E>(&mut self, initialize: impl FnOnce(P) -> Result<(), E>) -> Result<bool, E> {
         match std::mem::replace(self, Self::Unavailable) {
             Self::Pending(pending) => {
                 initialize(pending)?;

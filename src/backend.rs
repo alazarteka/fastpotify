@@ -728,10 +728,7 @@ mod authorization_lifecycle_tests {
         lifecycle.begin(cancel, 12);
         lifecycle.cancel();
 
-        assert_eq!(
-            lifecycle.finish(12, 12),
-            AuthorizationCompletion::Ignore
-        );
+        assert_eq!(lifecycle.finish(12, 12), AuthorizationCompletion::Ignore);
     }
 }
 
@@ -776,8 +773,7 @@ impl Worker {
         commands: mpsc::UnboundedSender<Command>,
         waker: Waker,
     ) -> Self {
-        let secrets: Arc<dyn SecretStore> =
-            Arc::new(PrivateFileStore::new(dirs.secrets_dir()));
+        let secrets: Arc<dyn SecretStore> = Arc::new(PrivateFileStore::new(dirs.secrets_dir()));
         Self {
             dirs,
             engine_config,
@@ -831,9 +827,7 @@ impl Worker {
                 },
                 Command::Api(request) => self.dispatch(request),
                 Command::Accent { url } => self.accent(url),
-                Command::WebSignedIn { token, epoch } => {
-                    self.on_web_signed_in(*token, epoch)
-                }
+                Command::WebSignedIn { token, epoch } => self.on_web_signed_in(*token, epoch),
                 Command::WebSignInFailed { message, epoch } => {
                     self.on_web_sign_in_failed(message, epoch)
                 }
@@ -853,9 +847,7 @@ impl Worker {
                     credential,
                     epoch,
                     error,
-                } => {
-                    self.on_engine_connected(*engine, credential, epoch, error)
-                }
+                } => self.on_engine_connected(*engine, credential, epoch, error),
                 Command::AccountChecked { premium } => self.on_account_checked(premium),
                 Command::Reconnect => self.reconnect_engine(),
                 Command::CheckForUpdates => self.check_for_updates(),
@@ -1131,9 +1123,7 @@ impl Worker {
                 let username_valid = credentials
                     .username
                     .as_deref()
-                    .is_some_and(|username| {
-                        !username.trim().is_empty() && username.len() <= 512
-                    });
+                    .is_some_and(|username| !username.trim().is_empty() && username.len() <= 512);
                 if !username_valid
                     || credentials.auth_data.is_empty()
                     || credentials.auth_data.len() > 512 * 1024
@@ -1146,7 +1136,7 @@ impl Worker {
                     });
                 }
                 Ok(())
-            }
+            },
         )
     }
 
@@ -1210,13 +1200,8 @@ impl Worker {
         tokio::spawn(async move {
             let result = async {
                 let authorized = session.wait(cancel_rx).await?;
-                crate::auth::exchange_code(
-                    &http,
-                    &grant,
-                    &authorized.code,
-                    &authorized.verifier,
-                )
-                .await
+                crate::auth::exchange_code(&http, &grant, &authorized.code, &authorized.verifier)
+                    .await
             }
             .await;
             match result {

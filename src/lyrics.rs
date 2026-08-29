@@ -551,9 +551,7 @@ pub fn parse_lrc(text: &str) -> Result<Vec<Line>> {
         let mut times = Vec::with_capacity(2);
         while let Some(stamp) = leading_stamp(rest) {
             if times.len() == MAX_LRC_TIMESTAMPS_PER_LINE {
-                anyhow::bail!(
-                    "LRC line exceeds the {MAX_LRC_TIMESTAMPS_PER_LINE}-timestamp limit"
-                );
+                anyhow::bail!("LRC line exceeds the {MAX_LRC_TIMESTAMPS_PER_LINE}-timestamp limit");
             }
             times.push(stamp.0);
             rest = &rest[stamp.1..];
@@ -780,15 +778,10 @@ mod tests {
 
     #[test]
     fn lrc_rejects_compact_timestamp_amplification() {
-        let too_many_stamps = format!(
-            "{}words",
-            "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE + 1)
-        );
+        let too_many_stamps = format!("{}words", "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE + 1));
         assert!(parse_lrc(&too_many_stamps).is_err());
 
-        let repeated_body = "x".repeat(
-            MAX_DECODED_LYRICS_BYTES / MAX_LRC_TIMESTAMPS_PER_LINE + 1,
-        );
+        let repeated_body = "x".repeat(MAX_DECODED_LYRICS_BYTES / MAX_LRC_TIMESTAMPS_PER_LINE + 1);
         let too_much_text = format!(
             "{}{}",
             "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE),
@@ -796,13 +789,9 @@ mod tests {
         );
         assert!(parse_lrc(&too_much_text).is_err());
 
-        let expanded_line = format!(
-            "{}x\n",
-            "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE)
-        );
-        let too_many_lines = expanded_line.repeat(
-            MAX_LYRICS_LINES / MAX_LRC_TIMESTAMPS_PER_LINE + 1,
-        );
+        let expanded_line = format!("{}x\n", "[00:01]".repeat(MAX_LRC_TIMESTAMPS_PER_LINE));
+        let too_many_lines =
+            expanded_line.repeat(MAX_LYRICS_LINES / MAX_LRC_TIMESTAMPS_PER_LINE + 1);
         assert!(parse_lrc(&too_many_lines).is_err());
     }
 

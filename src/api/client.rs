@@ -120,7 +120,10 @@ impl WebTokens {
     /// the network must acquire `token` again before persisting, so sign-out
     /// can clear and then delete without a late task recreating the file.
     pub fn deactivate(&self) {
-        *self.token.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
+        *self
+            .token
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
     }
 
     fn current(&self) -> Result<crate::auth::StoredToken> {
@@ -149,12 +152,9 @@ impl WebTokens {
         let response = crate::auth::refresh(&self.http, &client_id, &refresh_token)
             .await
             .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
-        let updated = crate::auth::StoredToken::from_response(
-            &client_id,
-            response,
-            Some(&refresh_token),
-        )
-        .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
+        let updated =
+            crate::auth::StoredToken::from_response(&client_id, response, Some(&refresh_token))
+                .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
 
         let mut guard = self
             .token

@@ -114,7 +114,10 @@ impl Settings {
             },
             Ok(None) => Self::default(),
             Err(error) => {
-                log::warn!("settings at {} could not be read safely: {error}", path.display());
+                log::warn!(
+                    "settings at {} could not be read safely: {error}",
+                    path.display()
+                );
                 Self::default()
             }
         }

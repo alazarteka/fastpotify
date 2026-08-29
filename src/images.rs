@@ -108,10 +108,7 @@ impl Inner {
 
     async fn fetch(self: &Arc<Self>, url: &str) -> Result<Arc<[u8]>, String> {
         let requested = validate_art_url(url).map_err(|error| {
-            log::warn!(
-                "blocked artwork from host {}: {error}",
-                safe_art_host(url)
-            );
+            log::warn!("blocked artwork from host {}: {error}", safe_art_host(url));
             error
         })?;
         if let Some(Entry::Ready { bytes, .. }) = self
@@ -390,8 +387,8 @@ fn validate_art_bytes(bytes: &[u8], mime: Option<&str>) -> Result<(), String> {
     if bytes.is_empty() || bytes.len() > MAX_ART_BYTES {
         return Err("artwork is empty or too large".into());
     }
-    let format = art_format(bytes)
-        .ok_or_else(|| "artwork signature is not JPEG or PNG".to_string())?;
+    let format =
+        art_format(bytes).ok_or_else(|| "artwork signature is not JPEG or PNG".to_string())?;
     if let Some(mime) = mime {
         let matches = (mime == "image/jpeg" && format == ArtFormat::Jpeg)
             || (mime == "image/png" && format == ArtFormat::Png);
@@ -520,10 +517,7 @@ mod tests {
         }
         let mut png = Vec::new();
         image
-            .write_to(
-                &mut std::io::Cursor::new(&mut png),
-                image::ImageFormat::Png,
-            )
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         assert!(validate_art_bytes(&png, Some("image/png")).is_ok());
         assert!(validate_art_bytes(&png, Some("image/jpeg")).is_err());

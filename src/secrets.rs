@@ -40,24 +40,15 @@ pub enum SecretError {
     #[error("refusing unsafe credential path {path}: {reason}")]
     UnsafePath { path: PathBuf, reason: String },
     #[error("stored {kind} credential is corrupt: {reason}")]
-    Corrupt {
-        kind: &'static str,
-        reason: String,
-    },
+    Corrupt { kind: &'static str, reason: String },
     #[error("unable to encode the {kind} credential: {reason}")]
-    Encode {
-        kind: &'static str,
-        reason: String,
-    },
+    Encode { kind: &'static str, reason: String },
     #[error("the {kind} credential did not pass durable read-back verification")]
     Verification { kind: &'static str },
     #[error("legacy {kind} credentials conflict with the versioned store; neither was deleted")]
     MigrationConflict { kind: &'static str },
     #[error("a partial legacy {kind} credential remains at {path}; refusing to ignore it")]
-    StaleLegacy {
-        kind: &'static str,
-        path: PathBuf,
-    },
+    StaleLegacy { kind: &'static str, path: PathBuf },
 }
 
 fn io(action: &'static str, path: &Path, source: std::io::Error) -> SecretError {
@@ -184,12 +175,11 @@ impl SecretStore for PrivateFileStore {
         let Some(bytes) = read_private_file(&path, MAX_ENVELOPE_BYTES, true)? else {
             return Ok(None);
         };
-        let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
-            SecretError::Corrupt {
+        let envelope: Envelope =
+            serde_json::from_slice(&bytes).map_err(|error| SecretError::Corrupt {
                 kind: id.label(),
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         if envelope.version != STORE_VERSION {
             return Err(SecretError::Corrupt {
                 kind: id.label(),
@@ -268,10 +258,7 @@ impl SecretStore for PrivateFileStore {
     }
 }
 
-pub fn load_json<T: DeserializeOwned>(
-    store: &dyn SecretStore,
-    id: SecretId,
-) -> Result<Option<T>> {
+pub fn load_json<T: DeserializeOwned>(store: &dyn SecretStore, id: SecretId) -> Result<Option<T>> {
     let Some(bytes) = store.load(id)? else {
         return Ok(None);
     };
@@ -283,11 +270,7 @@ pub fn load_json<T: DeserializeOwned>(
         })
 }
 
-pub fn store_json<T: Serialize>(
-    store: &dyn SecretStore,
-    id: SecretId,
-    value: &T,
-) -> Result<()> {
+pub fn store_json<T: Serialize>(store: &dyn SecretStore, id: SecretId, value: &T) -> Result<()> {
     let bytes = canonical_json(id, value)?;
     store.store(id, &bytes)
 }
@@ -418,8 +401,8 @@ fn load_json_migrating_with<T: Serialize + DeserializeOwned>(
         }
         (None, Some((old, prepared))) => {
             store_json(store, id, &old)?;
-            let verified = load_json::<T>(store, id)?
-                .ok_or(SecretError::Verification { kind: id.label() })?;
+            let verified =
+                load_json::<T>(store, id)?.ok_or(SecretError::Verification { kind: id.label() })?;
             if canonical_json(id, &verified)? != canonical_json(id, &old)? {
                 return Err(SecretError::Verification { kind: id.label() });
             }
@@ -546,10 +529,7 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let mut created = None;
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{stem}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
+        let temporary = parent.join(format!(".{stem}.tmp-{}-{sequence}", std::process::id()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -655,10 +635,7 @@ fn validate_or_harden_directory(path: &Path, metadata: &std::fs::Metadata) -> Re
         let opened = directory
             .metadata()
             .map_err(|error| io("inspect an opened private directory", path, error))?;
-        if !opened.is_dir()
-            || opened.dev() != metadata.dev()
-            || opened.ino() != metadata.ino()
-        {
+        if !opened.is_dir() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
             return Err(SecretError::UnsafePath {
                 path: path.to_path_buf(),
                 reason: "directory changed while it was being opened".into(),
@@ -735,10 +712,7 @@ fn validate_file_metadata(
         if strict_mode && metadata.mode() & 0o777 != 0o600 {
             return Err(SecretError::UnsafePath {
                 path: path.to_path_buf(),
-                reason: format!(
-                    "expected mode 0600, found {:04o}",
-                    metadata.mode() & 0o777
-                ),
+                reason: format!("expected mode 0600, found {:04o}", metadata.mode() & 0o777),
             });
         }
         if metadata.nlink() != 1 {
@@ -907,12 +881,7 @@ fn read_open_bounded(path: &Path, file: &mut File, limit: usize) -> Result<Vec<u
     Ok(bytes)
 }
 
-fn verify_open_contents(
-    path: &Path,
-    file: &mut File,
-    expected: &[u8],
-    limit: usize,
-) -> Result<()> {
+fn verify_open_contents(path: &Path, file: &mut File, expected: &[u8], limit: usize) -> Result<()> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| io("rewind a legacy credential file", path, error))?;
     let actual = read_open_bounded(path, file, limit)?;
@@ -984,8 +953,13 @@ mod platform_file {
     }
 
     pub fn atomic_replace(_file: &File, source: &Path, destination: &Path) -> Result<()> {
-        std::fs::rename(source, destination)
-            .map_err(|error| io("atomically replace a credential file at", destination, error))
+        std::fs::rename(source, destination).map_err(|error| {
+            io(
+                "atomically replace a credential file at",
+                destination,
+                error,
+            )
+        })
     }
 
     pub fn delete_prepared_legacy(
@@ -1035,10 +1009,10 @@ mod platform_file {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_DISPOSITION_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, FileRenameInfo, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, FileRenameInfo, GetFileInformationByHandle,
         SetFileInformationByHandle,
     };
 
@@ -1134,9 +1108,8 @@ mod platform_file {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: `file` owns a live OS handle and `info` is valid writable
         // storage for the duration of the call.
-        let succeeded = unsafe {
-            GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info)
-        };
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
         if succeeded == 0 {
             return Err(io(
                 "inspect a private Windows file handle for",
@@ -1164,7 +1137,10 @@ mod platform_file {
         if facts.links != 1 {
             return Err(SecretError::UnsafePath {
                 path: path.to_path_buf(),
-                reason: format!("Windows handle has {} hard links, expected one", facts.links),
+                reason: format!(
+                    "Windows handle has {} hard links, expected one",
+                    facts.links
+                ),
             });
         }
         Ok(())
@@ -1206,19 +1182,21 @@ mod platform_file {
             });
         }
         let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
-        let name_bytes = destination_wide.len().checked_mul(2).ok_or_else(|| {
-            SecretError::UnsafePath {
-                path: destination.to_path_buf(),
-                reason: "destination path is too long".into(),
-            }
-        })?;
+        let name_bytes =
+            destination_wide
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| SecretError::UnsafePath {
+                    path: destination.to_path_buf(),
+                    reason: "destination path is too long".into(),
+                })?;
         let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let buffer_len = header.checked_add(name_bytes).ok_or_else(|| {
-            SecretError::UnsafePath {
+        let buffer_len = header
+            .checked_add(name_bytes)
+            .ok_or_else(|| SecretError::UnsafePath {
                 path: destination.to_path_buf(),
                 reason: "destination path is too long".into(),
-            }
-        })?;
+            })?;
         let word = std::mem::size_of::<usize>();
         let mut buffer = vec![0usize; buffer_len.div_ceil(word)];
         let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -1227,12 +1205,11 @@ mod platform_file {
         unsafe {
             (*info).Anonymous.ReplaceIfExists = true;
             (*info).RootDirectory = std::ptr::null_mut();
-            (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
-                SecretError::UnsafePath {
+            (*info).FileNameLength =
+                u32::try_from(name_bytes).map_err(|_| SecretError::UnsafePath {
                     path: destination.to_path_buf(),
                     reason: "destination path is too long".into(),
-                }
-            })?;
+                })?;
             std::ptr::copy_nonoverlapping(
                 destination_wide.as_ptr(),
                 std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
@@ -1322,8 +1299,13 @@ mod platform_file {
         Ok(())
     }
     pub fn atomic_replace(_file: &File, source: &Path, destination: &Path) -> Result<()> {
-        std::fs::rename(source, destination)
-            .map_err(|error| io("atomically replace a credential file at", destination, error))
+        std::fs::rename(source, destination).map_err(|error| {
+            io(
+                "atomically replace a credential file at",
+                destination,
+                error,
+            )
+        })
     }
     pub fn delete_prepared_legacy(
         file: &mut File,
@@ -1455,17 +1437,14 @@ mod tests {
                 std::fs::write(&self.legacy, &self.replacement).map_err(|error| {
                     io("write the test replacement credential", &self.legacy, error)
                 })?;
-                std::fs::set_permissions(
-                    &self.legacy,
-                    std::fs::Permissions::from_mode(0o600),
-                )
-                .map_err(|error| {
-                    io(
-                        "secure the test replacement credential",
-                        &self.legacy,
-                        error,
-                    )
-                })?;
+                std::fs::set_permissions(&self.legacy, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| {
+                        io(
+                            "secure the test replacement credential",
+                            &self.legacy,
+                            error,
+                        )
+                    })?;
             }
             self.inner.store(id, secret)
         }
@@ -1534,12 +1513,9 @@ mod tests {
             fail_delete: false,
         };
         assert!(
-            load_json_migrating_with::<ExampleSecret>(
-                &store,
-                SecretId::WebApi,
-                &legacy,
-                &|_| Ok(())
-            )
+            load_json_migrating_with::<ExampleSecret>(&store, SecretId::WebApi, &legacy, &|_| Ok(
+                ()
+            ))
             .is_err()
         );
         assert!(legacy.value.lock().unwrap().is_some());
@@ -1552,15 +1528,13 @@ mod tests {
             value: Mutex::new(Some(encoded_example())),
             fail_delete: false,
         };
-        let result = load_json_migrating_with::<ExampleSecret>(
-            &store,
-            SecretId::WebApi,
-            &legacy,
-            &|_| Err(SecretError::Corrupt {
-                kind: SecretId::WebApi.label(),
-                reason: "injected validation failure".into(),
-            }),
-        );
+        let result =
+            load_json_migrating_with::<ExampleSecret>(&store, SecretId::WebApi, &legacy, &|_| {
+                Err(SecretError::Corrupt {
+                    kind: SecretId::WebApi.label(),
+                    reason: "injected validation failure".into(),
+                })
+            });
         assert!(result.is_err());
         assert_eq!(store.0.lock().unwrap().stores, 0);
         assert!(legacy.value.lock().unwrap().is_some());
@@ -1610,14 +1584,12 @@ mod tests {
         );
         assert!(legacy.value.lock().unwrap().is_some());
         legacy.fail_delete = false;
-        let migrated = load_json_migrating_with::<ExampleSecret>(
-            &store,
-            SecretId::Playback,
-            &legacy,
-            &|_| Ok(()),
-        )
-        .unwrap()
-        .unwrap();
+        let migrated =
+            load_json_migrating_with::<ExampleSecret>(&store, SecretId::Playback, &legacy, &|_| {
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(migrated.value, "test-only");
         assert!(legacy.value.lock().unwrap().is_none());
     }
@@ -1651,9 +1623,15 @@ mod tests {
 
         assert_eq!(migrated.value, "test-only");
         assert!(!legacy_path.exists());
-        assert_eq!(std::fs::metadata(&legacy_dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&legacy_dir).unwrap().mode() & 0o777,
+            0o700
+        );
         let stored = store.path(SecretId::Playback);
-        assert_eq!(std::fs::metadata(store.root()).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(store.root()).unwrap().mode() & 0o777,
+            0o700
+        );
         assert_eq!(std::fs::metadata(stored).unwrap().mode() & 0o777, 0o600);
 
         let _ = std::fs::remove_dir_all(root);
@@ -1688,7 +1666,10 @@ mod tests {
             Err(SecretError::Corrupt { reason, .. }) if reason.starts_with("legacy JSON:")
         ));
         assert_eq!(std::fs::read(&legacy_path).unwrap(), invalid);
-        assert_eq!(std::fs::metadata(&legacy_path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&legacy_path).unwrap().mode() & 0o777,
+            0o600
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1786,7 +1767,12 @@ mod tests {
         store.delete(SecretId::WebApi).unwrap();
         std::os::unix::fs::symlink("elsewhere", &file).unwrap();
         assert!(store.load(SecretId::WebApi).is_err());
-        assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let _ = std::fs::remove_file(file);
         let _ = std::fs::remove_dir(root);
     }
