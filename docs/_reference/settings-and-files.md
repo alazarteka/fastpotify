@@ -25,10 +25,20 @@ Clearing caches never signs you out; credentials live in *state*, not
 credentials are separate versioned items. On Unix, Fastpotify makes their
 directories mode 0700 and files mode 0600, validates ownership and modes on
 read, and replaces files atomically. Windows uses the account ACL inherited
-from the local application-data directory. A legacy credential is deleted
-only after the new item was written, read back, and compared successfully.
+from the local application-data directory; private-file opens do not follow
+the final reparse point, reject handles with multiple links, lock the name
+against replacement while it is open, and use the validated handle for atomic
+replacement. A legacy credential is deleted only after its parent and file
+have been made private and the new item was written, read back, and compared
+successfully.
 Signing out clears the live providers and playback engine first, attempts to
 delete both new and legacy locations, and reports any partial failure.
+
+The Windows test suite exercises hard-link rejection, filename locking before
+truncation, and handle-based replacement. The remaining platform validation is
+a manual NTFS stress test that repeatedly substitutes a symlink or junction at
+the log path while it opens and confirms that neither the link target nor a
+different file is ever truncated or replaced.
 
 This backend is deliberately prompt-free local storage, not a Keychain and
 not application-level encryption. A key beside an encrypted file would not

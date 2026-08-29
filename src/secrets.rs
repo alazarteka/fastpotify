@@ -4,9 +4,10 @@
 //! pretend that local encryption with a colocated key protects against code
 //! already running as the user. On Unix, every parent Fastpotify owns is mode
 //! 0700 and every secret file is mode 0600. Windows inherits the account-only
-//! ACL of the user's local application-data directory; it has no Unix mode to
-//! validate. A future platform credential store can implement [`SecretStore`]
-//! without changing the Web or playback credential lifecycles.
+//! ACL of the user's local application-data directory and rejects reparse or
+//! multiply-linked files using opened-handle metadata. A future platform
+//! credential store can implement [`SecretStore`] without changing the Web or
+//! playback credential lifecycles.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -158,6 +159,7 @@ impl PrivateFileStore {
                 use std::os::unix::fs::OpenOptionsExt as _;
                 options.mode(0o600);
             }
+            platform_file::configure_temporary(&mut options);
             match options.open(&path) {
                 Ok(file) => {
                     validate_open_file(&path, &file, true)?;
@@ -222,6 +224,7 @@ impl SecretStore for PrivateFileStore {
             });
         }
         self.prepare()?;
+        let _root_guard = platform_file::lock_directory(&self.root)?;
         let destination = self.path(id);
         if destination_exists(&destination)? {
             validate_path_as_private_file(&destination, true)?;
@@ -242,8 +245,8 @@ impl SecretStore for PrivateFileStore {
             file.sync_all()
                 .map_err(|error| io("sync a temporary credential file", &temporary, error))?;
             validate_open_file(&temporary, &file, true)?;
+            atomic_replace(&file, &temporary, &destination)?;
             drop(file);
-            atomic_replace(&temporary, &destination)?;
             sync_parent(&self.root)?;
             match self.load(id)? {
                 Some(read_back) if read_back == secret => Ok(()),
@@ -332,7 +335,7 @@ impl LegacyIo for LegacySecret {
                 });
             }
         }
-        read_private_file(&self.primary, MAX_SECRET_BYTES, true)
+        read_legacy_private_file(&self.primary, MAX_SECRET_BYTES)
     }
 
     fn delete(&self, _id: SecretId) -> Result<()> {
@@ -507,6 +510,7 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         reason: "private file has no parent directory".into(),
     })?;
     ensure_private_dir(parent)?;
+    let _parent_guard = platform_file::lock_directory(parent)?;
     if destination_exists(path)? {
         // Older non-secret application files may predate the private writer
         // and have the process umask rather than 0600. They still have to be
@@ -532,6 +536,7 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
+        platform_file::configure_temporary(&mut options);
         match options.open(&temporary) {
             Ok(file) => {
                 created = Some((temporary, file));
@@ -551,8 +556,8 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
             .map_err(|error| io("write a temporary private file", &temporary, error))?;
         file.sync_all()
             .map_err(|error| io("sync a temporary private file", &temporary, error))?;
+        atomic_replace(&file, &temporary, path)?;
         drop(file);
-        atomic_replace(&temporary, path)?;
         sync_parent(parent)?;
         match read_private_file(path, contents.len(), true)? {
             Some(read_back) if read_back == contents => Ok(()),
@@ -575,6 +580,7 @@ pub fn open_private_truncate(path: &Path) -> Result<File> {
         reason: "private file has no parent directory".into(),
     })?;
     ensure_private_dir(parent)?;
+    let _parent_guard = platform_file::lock_directory(parent)?;
     if destination_exists(path)? {
         validate_path_as_private_file(path, false)?;
     }
@@ -588,16 +594,12 @@ pub fn open_private_truncate(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
+    platform_file::configure_regular(&mut options);
     let file = options
         .open(path)
         .map_err(|error| io("open a private file", path, error))?;
     validate_open_file(path, &file, false)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| io("set owner-only file permissions on", path, error))?;
-    }
+    platform_file::harden(&file, path)?;
     validate_open_file(path, &file, true)?;
     file.set_len(0)
         .map_err(|error| io("truncate a private file", path, error))?;
@@ -627,29 +629,50 @@ fn validate_or_harden_directory(path: &Path, metadata: &std::fs::Metadata) -> Re
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        if metadata.uid() != effective_uid() {
+        let directory = File::open(path)
+            .map_err(|error| io("open a private directory for validation", path, error))?;
+        let opened = directory
+            .metadata()
+            .map_err(|error| io("inspect an opened private directory", path, error))?;
+        if !opened.is_dir()
+            || opened.dev() != metadata.dev()
+            || opened.ino() != metadata.ino()
+        {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "directory changed while it was being opened".into(),
+            });
+        }
+        if opened.uid() != effective_uid() {
             return Err(SecretError::UnsafePath {
                 path: path.to_path_buf(),
                 reason: "directory is not owned by the current user".into(),
             });
         }
-        if metadata.mode() & 0o777 != 0o700 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        if opened.mode() & 0o777 != 0o700 {
+            directory
+                .set_permissions(std::fs::Permissions::from_mode(0o700))
                 .map_err(|error| io("set owner-only directory permissions on", path, error))?;
-            let hardened = std::fs::symlink_metadata(path)
-                .map_err(|error| io("verify a private directory", path, error))?;
-            if is_link_or_reparse(&hardened)
-                || !hardened.is_dir()
-                || hardened.uid() != effective_uid()
-                || hardened.mode() & 0o777 != 0o700
-            {
-                return Err(SecretError::UnsafePath {
-                    path: path.to_path_buf(),
-                    reason: "could not enforce mode 0700".into(),
-                });
-            }
+        }
+        let hardened = directory
+            .metadata()
+            .map_err(|error| io("verify an opened private directory", path, error))?;
+        let named = std::fs::symlink_metadata(path)
+            .map_err(|error| io("reinspect a private directory", path, error))?;
+        if is_link_or_reparse(&named)
+            || !named.is_dir()
+            || hardened.uid() != effective_uid()
+            || hardened.mode() & 0o777 != 0o700
+            || hardened.dev() != named.dev()
+            || hardened.ino() != named.ino()
+        {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "could not enforce mode 0700 on the same directory".into(),
+            });
         }
     }
+    let _validated = platform_file::lock_directory(path)?;
     Ok(())
 }
 
@@ -664,7 +687,8 @@ fn destination_exists(path: &Path) -> Result<bool> {
 fn validate_path_as_private_file(path: &Path, strict_mode: bool) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| io("inspect a credential file", path, error))?;
-    validate_file_metadata(path, &metadata, strict_mode)
+    validate_file_metadata(path, &metadata, strict_mode)?;
+    platform_file::validate_path(path)
 }
 
 fn validate_file_metadata(
@@ -757,17 +781,7 @@ fn validate_open_file(path: &Path, file: &File, strict_mode: bool) -> Result<()>
     let named = std::fs::symlink_metadata(path)
         .map_err(|error| io("reinspect a credential filename", path, error))?;
     validate_file_metadata(path, &named, strict_mode)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if opened.dev() != named.dev() || opened.ino() != named.ino() {
-            return Err(SecretError::UnsafePath {
-                path: path.to_path_buf(),
-                reason: "filename changed while it was being opened".into(),
-            });
-        }
-    }
-    Ok(())
+    platform_file::validate_named_identity(path, file, &opened, &named)
 }
 
 fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Option<Vec<u8>>> {
@@ -779,13 +793,49 @@ fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Opt
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io("inspect a credential file", path, error)),
     }
-    let mut file = OpenOptions::new()
-        .read(true)
+    let parent = path.parent().expect("validated credential parent");
+    let _parent_guard = platform_file::lock_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    platform_file::configure_regular(&mut options);
+    let mut file = options
         .open(path)
         .map_err(|error| io("open a credential file", path, error))?;
     validate_open_file(path, &file, strict_mode)?;
+    read_open_bounded(path, &mut file, limit).map(Some)
+}
+
+/// Historical librespot files were created with the process umask. Secure the
+/// directory and the already-validated file handle before any bytes are read.
+fn read_legacy_private_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io("inspect a legacy credential file", path, error)),
+    };
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "legacy credential has no parent directory".into(),
+    })?;
+    ensure_private_dir(parent)?;
+    let _parent_guard = platform_file::lock_directory(parent)?;
+    validate_file_metadata(path, &metadata, false)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    platform_file::configure_regular(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|error| io("open a legacy credential file", path, error))?;
+    validate_open_file(path, &file, false)?;
+    platform_file::harden(&file, path)?;
+    validate_open_file(path, &file, true)?;
+    read_open_bounded(path, &mut file, limit).map(Some)
+}
+
+fn read_open_bounded(path: &Path, file: &mut File, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
+    Read::by_ref(file)
         .take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| io("read a credential file", path, error))?;
@@ -795,7 +845,7 @@ fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Opt
             reason: format!("file exceeds the {limit}-byte limit"),
         });
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
@@ -807,40 +857,320 @@ fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io("inspect a credential before deletion", path, error)),
     }
+    let parent = path.parent().expect("validated credential parent");
+    let _parent_guard = platform_file::lock_directory(parent)?;
+    validate_path_as_private_file(path, strict_mode)?;
     std::fs::remove_file(path).map_err(|error| io("delete a credential file", path, error))
 }
 
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
-    std::fs::rename(source, destination)
-        .map_err(|error| io("atomically replace a credential file at", destination, error))
+#[cfg(unix)]
+mod platform_file {
+    use super::*;
+
+    pub fn configure_regular(_options: &mut OpenOptions) {}
+
+    pub fn configure_temporary(_options: &mut OpenOptions) {}
+
+    pub fn lock_directory(_path: &Path) -> Result<Option<File>> {
+        Ok(None)
+    }
+
+    pub fn validate_path(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn harden(file: &File, path: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| io("set owner-only file permissions on", path, error))
+    }
+
+    pub fn validate_named_identity(
+        path: &Path,
+        _file: &File,
+        opened: &std::fs::Metadata,
+        named: &std::fs::Metadata,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if opened.dev() == named.dev() && opened.ino() == named.ino() {
+            Ok(())
+        } else {
+            Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "filename changed while it was being opened".into(),
+            })
+        }
+    }
+
+    pub fn atomic_replace(_file: &File, source: &Path, destination: &Path) -> Result<()> {
+        std::fs::rename(source, destination)
+            .map_err(|error| io("atomically replace a credential file at", destination, error))
+    }
 }
 
 #[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+mod platform_file {
+    use super::*;
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo,
+        GetFileInformationByHandle, SetFileInformationByHandle,
     };
 
-    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
-    let result = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if result == 0 {
-        Err(io(
-            "atomically replace a credential file at",
-            destination,
-            std::io::Error::last_os_error(),
-        ))
-    } else {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FileIdentity {
+        volume: u32,
+        index: u64,
+    }
+
+    struct HandleFacts {
+        identity: FileIdentity,
+        attributes: u32,
+        links: u32,
+    }
+
+    pub fn configure_regular(options: &mut OpenOptions) {
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    pub fn configure_temporary(options: &mut OpenOptions) {
+        options
+            .access_mode(GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    pub fn lock_directory(path: &Path) -> Result<Option<File>> {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let directory = options
+            .open(path)
+            .map_err(|error| io("open a private directory without traversal", path, error))?;
+        let opened = handle_facts(&directory, path)?;
+        if opened.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || opened.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "Windows parent handle is a reparse point or not a directory".into(),
+            });
+        }
+
+        let named_directory = options
+            .open(path)
+            .map_err(|error| io("reopen a private directory without traversal", path, error))?;
+        let named = handle_facts(&named_directory, path)?;
+        if named.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || named.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || opened.identity != named.identity
+        {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "private directory changed while it was being opened".into(),
+            });
+        }
+        Ok(Some(directory))
+    }
+
+    pub fn validate_path(path: &Path) -> Result<()> {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options
+            .open(path)
+            .map_err(|error| io("open a private filename without traversal", path, error))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| io("inspect an opened private file", path, error))?;
+        let named = std::fs::symlink_metadata(path)
+            .map_err(|error| io("reinspect a private filename", path, error))?;
+        validate_named_identity(path, &file, &opened, &named)
+    }
+
+    pub fn harden(_file: &File, _path: &Path) -> Result<()> {
         Ok(())
     }
+
+    fn handle_facts(file: &File, path: &Path) -> Result<HandleFacts> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live OS handle and `info` is valid writable
+        // storage for the duration of the call.
+        let succeeded = unsafe {
+            GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info)
+        };
+        if succeeded == 0 {
+            return Err(io(
+                "inspect a private Windows file handle for",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(HandleFacts {
+            identity: FileIdentity {
+                volume: info.dwVolumeSerialNumber,
+                index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            },
+            attributes: info.dwFileAttributes,
+            links: info.nNumberOfLinks,
+        })
+    }
+
+    fn validate_facts(path: &Path, facts: &HandleFacts) -> Result<()> {
+        if facts.attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "Windows handle is a reparse point or directory".into(),
+            });
+        }
+        if facts.links != 1 {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: format!("Windows handle has {} hard links, expected one", facts.links),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_named_identity(
+        path: &Path,
+        file: &File,
+        _opened: &std::fs::Metadata,
+        _named: &std::fs::Metadata,
+    ) -> Result<()> {
+        let opened = handle_facts(file, path)?;
+        validate_facts(path, &opened)?;
+
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let named_file = options
+            .open(path)
+            .map_err(|error| io("reopen a private filename without traversal", path, error))?;
+        let named = handle_facts(&named_file, path)?;
+        validate_facts(path, &named)?;
+        if opened.identity != named.identity {
+            return Err(SecretError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "filename changed while it was being opened".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn atomic_replace(file: &File, _source: &Path, destination: &Path) -> Result<()> {
+        if !destination.is_absolute() {
+            return Err(SecretError::UnsafePath {
+                path: destination.to_path_buf(),
+                reason: "Windows handle-based replacement requires an absolute path".into(),
+            });
+        }
+        let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
+        let name_bytes = destination_wide.len().checked_mul(2).ok_or_else(|| {
+            SecretError::UnsafePath {
+                path: destination.to_path_buf(),
+                reason: "destination path is too long".into(),
+            }
+        })?;
+        let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let buffer_len = header.checked_add(name_bytes).ok_or_else(|| {
+            SecretError::UnsafePath {
+                path: destination.to_path_buf(),
+                reason: "destination path is too long".into(),
+            }
+        })?;
+        let word = std::mem::size_of::<usize>();
+        let mut buffer = vec![0usize; buffer_len.div_ceil(word)];
+        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buffer` has pointer alignment, contains the complete fixed
+        // header plus `name_bytes`, and every write stays inside that buffer.
+        unsafe {
+            (*info).Anonymous.ReplaceIfExists = true;
+            (*info).RootDirectory = std::ptr::null_mut();
+            (*info).FileNameLength = u32::try_from(name_bytes).map_err(|_| {
+                SecretError::UnsafePath {
+                    path: destination.to_path_buf(),
+                    reason: "destination path is too long".into(),
+                }
+            })?;
+            std::ptr::copy_nonoverlapping(
+                destination_wide.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                destination_wide.len(),
+            );
+        }
+        let buffer_len = u32::try_from(buffer_len).map_err(|_| SecretError::UnsafePath {
+            path: destination.to_path_buf(),
+            reason: "destination path is too long".into(),
+        })?;
+        // SAFETY: the temporary file was opened with DELETE access, and `info`
+        // points to the initialized aligned buffer described above.
+        let succeeded = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FileRenameInfo,
+                info.cast(),
+                buffer_len,
+            )
+        };
+        if succeeded == 0 {
+            Err(io(
+                "atomically replace a private file at",
+                destination,
+                std::io::Error::last_os_error(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod platform_file {
+    use super::*;
+
+    pub fn configure_regular(_options: &mut OpenOptions) {}
+    pub fn configure_temporary(_options: &mut OpenOptions) {}
+    pub fn lock_directory(_path: &Path) -> Result<Option<File>> {
+        Ok(None)
+    }
+    pub fn validate_path(_path: &Path) -> Result<()> {
+        Ok(())
+    }
+    pub fn harden(_file: &File, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+    pub fn validate_named_identity(
+        _path: &Path,
+        _file: &File,
+        _opened: &std::fs::Metadata,
+        _named: &std::fs::Metadata,
+    ) -> Result<()> {
+        Ok(())
+    }
+    pub fn atomic_replace(_file: &File, source: &Path, destination: &Path) -> Result<()> {
+        std::fs::rename(source, destination)
+            .map_err(|error| io("atomically replace a credential file at", destination, error))
+    }
+}
+
+fn atomic_replace(file: &File, source: &Path, destination: &Path) -> Result<()> {
+    platform_file::atomic_replace(file, source, destination)
 }
 
 #[cfg(unix)]
@@ -1054,6 +1384,74 @@ mod tests {
         assert!(legacy.value.lock().unwrap().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_hardens_historical_librespot_file_before_reading_it() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-legacy-mode-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy_dir = root.join("credentials");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::set_permissions(&legacy_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let legacy_path = legacy_dir.join("credentials.json");
+        let encoded = encoded_example();
+        std::fs::write(&legacy_path, &encoded).unwrap();
+        std::fs::set_permissions(&legacy_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = PrivateFileStore::new(root.join("secrets-v1"));
+        let migrated = load_json_migrating::<ExampleSecret>(
+            &store,
+            SecretId::Playback,
+            &LegacySecret::new(legacy_path.clone()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(migrated.value, "test-only");
+        assert!(!legacy_path.exists());
+        assert_eq!(std::fs::metadata(&legacy_dir).unwrap().mode() & 0o777, 0o700);
+        let stored = store.path(SecretId::Playback);
+        assert_eq!(std::fs::metadata(store.root()).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(stored).unwrap().mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_legacy_decode_preserves_hardened_file_contents() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-legacy-failure-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let legacy_dir = root.join("credentials");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("credentials.json");
+        let invalid = b"not valid JSON";
+        std::fs::write(&legacy_path, invalid).unwrap();
+        std::fs::set_permissions(&legacy_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = PrivateFileStore::new(root.join("secrets-v1"));
+        let result = load_json_migrating::<ExampleSecret>(
+            &store,
+            SecretId::Playback,
+            &LegacySecret::new(legacy_path.clone()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), invalid);
+        assert_eq!(std::fs::metadata(&legacy_path).unwrap().mode() & 0o777, 0o600);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn sign_out_clears_memory_first_and_attempts_both_new_items() {
         let store = MockStore::default();
@@ -1128,5 +1526,40 @@ mod tests {
         let _ = std::fs::remove_file(victim);
         let _ = std::fs::remove_file(settings);
         let _ = std::fs::remove_dir(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_files_reject_links_lock_names_and_replace_by_handle() {
+        use std::io::Write as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-windows-private-file-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&root).unwrap();
+
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"do not truncate").unwrap();
+        let linked_log = root.join("linked.log");
+        std::fs::hard_link(&victim, &linked_log).unwrap();
+        assert!(open_private_truncate(&linked_log).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
+        std::fs::remove_file(&linked_log).unwrap();
+
+        let log = root.join("fastpotify.log");
+        let moved = root.join("swapped.log");
+        let mut held = open_private_truncate(&log).unwrap();
+        held.write_all(b"held").unwrap();
+        assert!(std::fs::rename(&log, &moved).is_err());
+        drop(held);
+
+        let settings = root.join("settings.json");
+        write_private_atomic(&settings, b"first").unwrap();
+        write_private_atomic(&settings, b"second").unwrap();
+        assert_eq!(std::fs::read(&settings).unwrap(), b"second");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
