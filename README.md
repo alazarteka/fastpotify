@@ -129,10 +129,11 @@ owner-only (0600) on Unix. They are not encrypted with a key stored beside
 them. FileVault or full-disk encryption protects a powered-off disk, but
 malware already running as your account can read the credentials.
 
-By default the Web API uses the shared public application also used by
-spotify-player, ncspot, and Omarchy Spotify. If you hit rate limits you can
-register your own (free) Spotify application and paste its Client ID in
-Settings → Account.
+The Web API always keeps a shared public application connected for complete
+catalog and playlist coverage. If you hit rate limits, you can also authorize
+your own free Spotify application in Settings → Account. Eligible playback,
+library, catalog, and owned-playlist requests then use its independent session;
+operations limited by Spotify's Development Mode stay on the shared session.
 
 ## Keyboard shortcuts
 
@@ -200,9 +201,10 @@ any time without signing you out.
 - `src/player.rs`: the librespot session, player, mixer, and Spirc (Spotify
   Connect) wrapped into one engine that folds player events into a state
   snapshot for the interface.
-- `src/api/`: a small Web API client with bounded concurrency,
-  `Retry-After` handling, and automatic fallback between the 2026 endpoint
-  shapes (`/me/library`, `/playlists/{id}/items`) and the classic ones.
+- `src/api/`: a gateway over independent shared and personal Web API sessions,
+  each with bounded concurrency, refresh and `Retry-After` state, plus
+  automatic fallback between the 2026 endpoint shapes (`/me/library`,
+  `/playlists/{id}/items`) and the classic ones.
 - `src/backend.rs`: a tokio runtime on its own thread; the interface talks to
   it through channels and is woken with `request_repaint`, so the app is idle
   when nothing happens.

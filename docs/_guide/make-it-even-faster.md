@@ -15,17 +15,17 @@ to fill.
 
 An app of your own has that limit to itself. Fastpotify cannot ship one
 for everyone (Spotify allows a new app only a handful of users), but
-making yours is free and takes five minutes.
+making yours is free and takes five minutes. Fastpotify adds it alongside the
+shared app rather than replacing the shared connection.
 
 ## What a personal app cannot do
 
 Spotify keeps a personal app in Development Mode, and since February 2026
-that mode reads only the playlists you own or collaborate on. Anyone
-else's public playlist, and Spotify's own editorial ones, show their name
-and cover but not their songs; artist top tracks and browsing are gone
-too. The shared app has none of these limits, so this is reach traded for
-speed. Switching back is one click: clear the field and press **Switch
-now**.
+that mode reads only the playlists you own or collaborate on and limits some
+catalog endpoints and page sizes. Fastpotify therefore sends only eligible
+playback, library, catalog, and owned-playlist work through your app. Complete
+playlist search and library coverage, external playlists, artist top tracks,
+related artists, and canonical account checks stay on the shared app.
 
 ## Make a Spotify app
 
@@ -49,9 +49,8 @@ now**.
 
 1. Open **Settings**, find **Make it even faster**, and paste the
    Client ID.
-2. Click **Switch now**. Your browser opens Spotify's sign-in for your
-   app; approve it and you are back in Fastpotify, which now says
-   **Your app is in use**.
+2. Click **Authorize**. Your browser opens Spotify's sign-in for your app;
+   approve it and Fastpotify now says **Your app is authorized**.
 
-That is all. Playing music on this computer is unaffected. To go back to
-the shared app, clear the field and click **Switch now** again.
+That is all. The shared API session and playback on this computer are
+unaffected. Click **Remove** to delete only the personal authorization.

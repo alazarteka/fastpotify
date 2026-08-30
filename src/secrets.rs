@@ -59,19 +59,23 @@ fn io(action: &'static str, path: &Path, source: std::io::Error) -> SecretError 
     }
 }
 
-/// The two grants are intentionally isolated from one another.
+/// The shared Web API, optional personal Web API, and playback grants are
+/// intentionally isolated from one another.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SecretId {
+    /// Kept at the existing filename so a shared token needs no migration.
     WebApi,
+    PersonalWebApi,
     Playback,
 }
 
 impl SecretId {
-    pub const ALL: [Self; 2] = [Self::WebApi, Self::Playback];
+    pub const ALL: [Self; 3] = [Self::WebApi, Self::PersonalWebApi, Self::Playback];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WebApi => "Web API",
+            Self::WebApi => "shared Web API",
+            Self::PersonalWebApi => "personal Web API",
             Self::Playback => "playback",
         }
     }
@@ -79,6 +83,7 @@ impl SecretId {
     fn envelope_name(self) -> &'static str {
         match self {
             Self::WebApi => "web-api",
+            Self::PersonalWebApi => "personal-web-api",
             Self::Playback => "playback",
         }
     }
@@ -86,6 +91,7 @@ impl SecretId {
     fn file_name(self) -> &'static str {
         match self {
             Self::WebApi => "web-api.secret",
+            Self::PersonalWebApi => "personal-web-api.secret",
             Self::Playback => "playback.secret",
         }
     }
@@ -1728,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_out_clears_memory_first_and_attempts_both_new_items() {
+    fn sign_out_clears_memory_first_and_attempts_every_new_item() {
         let store = MockStore::default();
         let cleared = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
@@ -1744,8 +1750,9 @@ mod tests {
         });
         assert!(result.is_err());
         let state = store.0.lock().unwrap();
-        assert_eq!(state.deletes.len(), 2);
+        assert_eq!(state.deletes.len(), 3);
         assert!(state.deletes.contains(&SecretId::WebApi));
+        assert!(state.deletes.contains(&SecretId::PersonalWebApi));
         assert!(state.deletes.contains(&SecretId::Playback));
     }
 

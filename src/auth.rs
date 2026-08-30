@@ -1,12 +1,9 @@
 //! Spotify sign-in with the Authorization Code + PKCE flow.
 //!
-//! Two grants exist because Spotify treats them differently:
+//! Three grants may exist because Spotify treats them differently:
 //!
-//! - The **Web API grant** uses a registered application identity. Its
-//!   access token is what every `api.spotify.com` call carries, and its
-//!   refresh token is kept in the state directory so the browser is needed
-//!   once per machine. Tokens minted for Spotify's own desktop client are
-//!   throttled on the Web API, which is why this is a separate identity.
+//! - The shared and optional personal **Web API grants** use independent
+//!   registered application identities, refresh tokens, and request sessions.
 //! - The **playback grant** uses Spotify's desktop client identity, the one
 //!   librespot streams with. Its access token is exchanged once for a
 //!   reusable credential that Fastpotify stores separately.
@@ -33,7 +30,7 @@ pub const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 pub const PLAYBACK_REDIRECT_PORT: u16 = 8898;
 
 /// The public Web API application shared by spotify-player, ncspot, and
-/// Omarchy Spotify. A personal application id can replace it in Settings.
+/// Omarchy Spotify.
 pub const DEFAULT_WEB_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
 pub const WEB_REDIRECT_PORT: u16 = 8989;
 
@@ -101,16 +98,27 @@ impl Grant {
         }
     }
 
-    pub fn web_api(client_id: Option<&str>) -> Self {
+    pub fn shared_web_api() -> Self {
         Self {
-            client_id: client_id
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .unwrap_or(DEFAULT_WEB_CLIENT_ID)
-                .to_string(),
+            client_id: DEFAULT_WEB_CLIENT_ID.to_string(),
             redirect_port: WEB_REDIRECT_PORT,
             scopes: WEB_SCOPES,
         }
+    }
+
+    pub fn personal_web_api(client_id: &str) -> Result<Self> {
+        let client_id = client_id.trim();
+        if client_id.len() != 32 || !client_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("a Spotify Client ID must be 32 hexadecimal characters");
+        }
+        if client_id.eq_ignore_ascii_case(DEFAULT_WEB_CLIENT_ID) {
+            bail!("the shared Spotify Client ID cannot be added as a personal app");
+        }
+        Ok(Self {
+            client_id: client_id.to_string(),
+            redirect_port: WEB_REDIRECT_PORT,
+            scopes: WEB_SCOPES,
+        })
     }
 
     pub fn redirect_uri(&self) -> String {
@@ -185,7 +193,7 @@ fn begin(grant: &Grant) -> Flow {
     let state = random_token(18);
     let url = format!(
         "{AUTHORIZE_URL}?client_id={}&response_type=code&redirect_uri={}&code_challenge_method=S256&code_challenge={challenge}&state={state}&scope={}",
-        grant.client_id,
+        urlencoding::encode(&grant.client_id),
         urlencoding::encode(&grant.redirect_uri()),
         urlencoding::encode(&grant.scopes.join(" "))
     );
@@ -651,13 +659,14 @@ pub async fn exchange_code(
         ],
     )
     .await
+    .map_err(anyhow::Error::new)
 }
 
 pub async fn refresh(
     http: &reqwest::Client,
     client_id: &str,
     refresh_token: &str,
-) -> Result<TokenResponse> {
+) -> std::result::Result<TokenResponse, TokenEndpointError> {
     token_request(
         http,
         &[
@@ -669,27 +678,43 @@ pub async fn refresh(
     .await
 }
 
-async fn token_request(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<TokenResponse> {
+#[derive(Debug, thiserror::Error)]
+pub enum TokenEndpointError {
+    /// Spotify refused the grant itself; only a browser flow can replace it.
+    #[error("Spotify rejected the token request ({status}): {detail}")]
+    Rejected { status: u16, detail: String },
+    /// The endpoint or response failed without proving that the grant is bad.
+    #[error("token request failed: {0}")]
+    Unreachable(String),
+}
+
+async fn token_request(
+    http: &reqwest::Client,
+    form: &[(&str, &str)],
+) -> std::result::Result<TokenResponse, TokenEndpointError> {
     let mut response = http
         .post(TOKEN_URL)
         .form(form)
         .send()
         .await
-        .context("token request failed")?;
+        .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?;
     let status = response.status();
     if response
         .content_length()
         .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
     {
-        bail!("Spotify token response is too large");
+        return Err(TokenEndpointError::Unreachable(
+            "Spotify token response is too large".into(),
+        ));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .context("token response body failed")?
+        .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?
     {
-        append_bounded(&mut body, &chunk, MAX_TOKEN_RESPONSE_BYTES)?;
+        append_bounded(&mut body, &chunk, MAX_TOKEN_RESPONSE_BYTES)
+            .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?;
     }
     if !status.is_success() {
         let detail = serde_json::from_slice::<serde_json::Value>(&body)
@@ -701,11 +726,22 @@ async fn token_request(http: &reqwest::Client, form: &[(&str, &str)]) -> Result<
                     .and_then(safe_provider_detail)
             })
             .unwrap_or_else(|| "request was rejected".into());
-        bail!("Spotify rejected the token request ({status}): {detail}");
+        if matches!(status.as_u16(), 400 | 401 | 403) {
+            return Err(TokenEndpointError::Rejected {
+                status: status.as_u16(),
+                detail,
+            });
+        }
+        return Err(TokenEndpointError::Unreachable(format!(
+            "Spotify answered {status}: {detail}"
+        )));
     }
-    let token: TokenResponse =
-        serde_json::from_slice(&body).context("unexpected token response")?;
-    token.validate()?;
+    let token: TokenResponse = serde_json::from_slice(&body).map_err(|error| {
+        TokenEndpointError::Unreachable(format!("unexpected token response: {error}"))
+    })?;
+    token
+        .validate()
+        .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?;
     Ok(token)
 }
 
@@ -761,6 +797,10 @@ impl StoredToken {
 
     pub fn needs_refresh(&self) -> bool {
         now_secs() + REFRESH_MARGIN.as_secs() >= self.expires_at
+    }
+
+    pub fn expired(&self) -> bool {
+        now_secs() >= self.expires_at
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -820,7 +860,7 @@ mod tests {
 
     #[test]
     fn begin_produces_valid_pkce_material() {
-        let flow = begin(&Grant::web_api(None));
+        let flow = begin(&Grant::shared_web_api());
         assert!(flow.verifier.len() >= 43);
         assert!(flow.url.contains("code_challenge_method=S256"));
         assert!(flow.url.contains(&format!("state={}", flow.state)));
@@ -839,14 +879,22 @@ mod tests {
     }
 
     #[test]
-    fn custom_web_client_id_wins_when_present() {
-        assert_eq!(Grant::web_api(Some("  abc ")).client_id, "abc");
-        assert_eq!(Grant::web_api(Some("  ")).client_id, DEFAULT_WEB_CLIENT_ID);
+    fn personal_client_id_is_validated_at_the_boundary() {
+        let client_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            Grant::personal_web_api(&format!("  {client_id} "))
+                .unwrap()
+                .client_id,
+            client_id
+        );
+        assert!(Grant::personal_web_api("  ").is_err());
+        assert!(Grant::personal_web_api("not&a=spotify-client-id-value!!").is_err());
+        assert!(Grant::personal_web_api(DEFAULT_WEB_CLIENT_ID).is_err());
     }
 
     #[test]
     fn prepared_authorization_owns_the_listener_before_exposing_its_url() {
-        let mut grant = Grant::web_api(None);
+        let mut grant = Grant::shared_web_api();
         grant.redirect_port = 0;
         let session = PreparedAuthorization::prepare(&grant).unwrap();
         let address = session.listener.local_addr().unwrap();

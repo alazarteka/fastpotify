@@ -1,18 +1,18 @@
 ---
 title: How It Connects
-description: The two Spotify grants, why they are separate, what is stored, and what the client does when Spotify pushes back.
+description: Fastpotify's Spotify grants, why they are separate, what is stored, and what the client does when Spotify pushes back.
 nav_order: 1
 ---
 
-## Two grants, once each
+## Two kinds of grant
 
 Fastpotify talks to Spotify in two distinct ways, and Spotify issues
 credentials for them separately:
 
-1. **The Web API** covers your library, search, playlists, and devices. Fastpotify
-   uses the standard Authorization Code + PKCE flow in your browser, as a
-   registered Spotify application. The refresh token is stored locally and
-   renewed automatically; your password never touches the app.
+1. **The Web API** covers your library, search, playlists, and devices.
+   Fastpotify always has a shared application grant and can also have an
+   optional personal application grant. They request the same visible-feature
+   scopes, but have independent refresh tokens, rate limits, and sessions.
 2. **Streaming** is actually playing audio on this computer, through
    [librespot](https://github.com/librespot-org/librespot). This runs the
    same browser flow once against Spotify's streaming client identity, after
@@ -20,10 +20,10 @@ credentials for them separately:
    Premium is required, because that is what Spotify's streaming protocol
    requires.
 
-Why not one grant? Because Spotify throttles Web API calls made with
-streaming-identity tokens. Measured during development, every endpoint
-answers `429` within the first request. Two narrow grants are what actually
-works, and each one happens exactly once per machine.
+Why not use the streaming grant for everything? Spotify throttles Web API
+calls made with streaming-identity tokens. Measured during development, every endpoint
+answers `429` within the first request. Separating Web access from streaming
+is what actually works.
 
 Before the browser opens, each flow binds a short-lived listener only to
 `127.0.0.1`. It accepts bounded HTTP GETs on the registered path and port,
@@ -35,16 +35,26 @@ are static, non-reflecting, non-cacheable, and carry a restrictive browser
 content policy. Token responses from Spotify are also read under a fixed size
 limit and validated before they can be stored or used.
 
-By default the Web API uses the shared public application also used by
-spotify-player, ncspot, and Omarchy Spotify, whose allowance Spotify
-divides among everyone running any of them. An application of your own
-gets one to itself; [Make It Even Faster](/make-it-even-faster/) shows
-how, in five minutes.
+The shared Web application is authoritative for account identity, the full
+playlist library, playlist-bearing search, external playlists, and endpoints
+Spotify withholds from Development Mode. An optional personal application
+accelerates playback and device commands, your library data, supported catalog
+lookups, playlist creation, and playlists that the shared response proves you
+own or collaborate on. Both grants must resolve to the same Spotify account.
+A request is routed once before dispatch and is never replayed through the
+other application after an error.
+
+Each Web session owns its token-refresh lock, six-request concurrency bound,
+rate-limit cooldown, and endpoint compatibility state. A small shared
+background-work bound prevents the two sessions from flooding the interface,
+while a `429` on one application does not stall the other. The shared public
+application is also used by spotify-player, ncspot, and Omarchy Spotify; [Make
+It Even Faster](/make-it-even-faster/) shows how to add a personal one.
 
 ## What the client stores
 
-- The Web API refresh token and librespot's reusable credential, as separate
-  owner-private files in the state directory
+- The shared Web API refresh token, optional personal Web API refresh token,
+  and librespot's reusable credential, as separate owner-private files
   ([where and threat model](/settings-and-files/)).
 - Downloaded audio and artwork, in the cache directory, within the budget
   you set.
@@ -84,9 +94,9 @@ query, fragment, or user information.
 
 ## When Spotify pushes back
 
-The Web API rate-limits bursts. Fastpotify bounds its concurrency, honours
-`Retry-After`, retries quietly, and shows a small spinner in the top bar
-when a conversation with Spotify takes longer than a moment. Spotify also
+The Web API rate-limits bursts. Each session bounds its own concurrency,
+honours `Retry-After`, retries safe reads quietly, and shows a small spinner in
+the top bar when a conversation with Spotify takes longer than a moment. Spotify also
 reshapes endpoints over time; the client detects several of these shapes at
 runtime and falls back to the older form where one still exists.
 

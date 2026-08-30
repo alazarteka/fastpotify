@@ -647,12 +647,9 @@ impl App {
         }
     }
 
-    /// Whether the Web API sign-in belongs to an app of the user's own
-    /// rather than the shared one.
+    /// Whether the optional personal Web API session is ready.
     pub fn own_web_app(&self) -> bool {
-        self.web_app
-            .as_deref()
-            .is_some_and(|id| id != crate::auth::DEFAULT_WEB_CLIENT_ID)
+        self.web_app.is_some()
     }
 
     /// The context playing as the interface should show it: the one just
@@ -936,7 +933,7 @@ impl App {
                 Event::UserName { id, name } => {
                     self.user_names.insert(id, name);
                 }
-                Event::WebApp { client_id } => self.web_app = Some(client_id),
+                Event::WebApp { client_id } => self.web_app = client_id,
                 Event::UpdateAvailable { version, url } => {
                     let notice = crate::updates::Release { version, url };
                     if self.update.as_ref() != Some(&notice) {
@@ -1869,7 +1866,6 @@ impl App {
     // ---- api responses -------------------------------------------------------
 
     fn handle_api(&mut self, response: ApiResponse) {
-        let own_app = self.own_web_app();
         match response {
             ApiResponse::Me(result) => match result {
                 Ok(user) => {
@@ -1880,16 +1876,7 @@ impl App {
                         self.request_contains(vec![now.uri]);
                     }
                 }
-                Err(error) => {
-                    if matches!(error, crate::api::ApiError::SignInExpired(_)) {
-                        self.auth = AuthStatus::Failed(
-                            "Your Spotify sign-in expired. Please sign in again.".into(),
-                        );
-                        self.backend.send(Command::SignOut);
-                    } else {
-                        self.toast_error(format!("Couldn't load your profile: {error}"));
-                    }
-                }
+                Err(error) => self.toast_error(format!("Couldn't load your profile: {error}")),
             },
             ApiResponse::Devices(result) => {
                 self.devices_loading = false;
@@ -2195,7 +2182,7 @@ impl App {
                                 }
                             }
                         }
-                        Err(error) => page.items.fail(friendly_page_error(&error, own_app)),
+                        Err(error) => page.items.fail(friendly_page_error(&error)),
                     }
                 }
                 self.request_contains(uris);
@@ -3661,12 +3648,14 @@ impl App {
                 self.sign_in_url = None;
                 self.auth = AuthStatus::SignedOut;
             }
-            Action::SwitchWebApp => {
+            Action::ConfigurePersonalWebApp => {
                 if let Err(error) = self.save_settings_at(Instant::now()) {
                     self.toast_error(format!("Couldn't save settings: {error}"));
+                    return;
                 }
-                self.backend
-                    .send(Command::SwitchWebApp(self.settings.web_client_id.clone()));
+                self.backend.send(Command::ConfigurePersonalWebApp(
+                    self.settings.web_client_id.clone(),
+                ));
             }
             Action::SignOut => {
                 self.backend.send(Command::SignOut);
@@ -4131,14 +4120,8 @@ fn remote_action_label(action: RemoteAction) -> &'static str {
     }
 }
 
-/// Since February 2026 a personal app (Development Mode) may read only the
-/// playlists its user owns or collaborates on; the shared app predates
-/// that and reads anything public.
-fn friendly_page_error(error: &crate::api::ApiError, own_app: bool) -> String {
+fn friendly_page_error(error: &crate::api::ApiError) -> String {
     match error.status() {
-        Some(403) | Some(404) if own_app => {
-            "Spotify lets a personal app open only the playlists you own or collaborate on. Switch back to the shared app in Settings to open this one.".to_string()
-        }
         Some(403) | Some(404) => {
             "Spotify doesn't make this playlist's songs available to third-party apps.".to_string()
         }

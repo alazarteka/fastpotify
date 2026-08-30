@@ -48,8 +48,8 @@ This is a young project, and it says so:
 - **Playing on this computer needs Spotify Premium**, as with every
   librespot-based client. Browsing, search, and remote control work on any
   account.
-- Sign-in happens twice in a lifetime, not once: the Web API and streaming
-  are separate grants at Spotify. [How it connects](/how-it-connects/)
+- Web API and streaming sign-ins are separate grants at Spotify. A personal
+  Web API app is an optional third authorization. [How it connects](/how-it-connects/)
   explains why.
 - No video podcasts or social features.
 - Playlist reordering is a menu action, not drag-and-drop.

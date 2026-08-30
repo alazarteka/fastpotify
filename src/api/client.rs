@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+use super::ApiSource;
 use super::models::*;
 
 const BASE_URL: &str = "https://api.spotify.com/v1";
@@ -25,18 +26,21 @@ const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ApiError {
     #[error("not signed in")]
     NotSignedIn,
     #[error("{message}")]
     Status { status: u16, message: String },
-    #[error(
-        "Spotify is rate limiting the shared app; try again in a moment, or use your own app (Settings)"
-    )]
+    #[error("Spotify is rate limiting requests; try again in a moment")]
     RateLimited,
-    #[error("your Spotify sign-in expired; please sign in again")]
-    SignInExpired(String),
+    #[error("Spotify's Development Mode quota is exhausted; try again after the quota resets")]
+    QuotaExhausted,
+    #[error("your {api_source} Spotify sign-in expired; please authorize it again")]
+    SignInExpired {
+        api_source: ApiSource,
+        session_generation: u64,
+    },
     #[error("Spotify refreshed the sign-in, but it could not be stored safely: {0}")]
     CredentialPersistence(String),
     #[error("network error: {0}")]
@@ -70,6 +74,13 @@ impl From<reqwest::Error> for ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+fn is_quota_exhausted(body: &str) -> bool {
+    serde_json::from_str::<ApiErrorBody>(body)
+        .ok()
+        .and_then(|body| body.error.reason)
+        .is_some_and(|reason| reason == "QUOTA_EXCEEDED")
+}
+
 /// Where bearer tokens come from.
 ///
 /// The Web API is driven by a registered application's PKCE grant, refreshed
@@ -92,6 +103,11 @@ impl TokenProvider {
         let Self::Web(tokens) = self;
         tokens.access_token(true).await.map(drop)
     }
+
+    fn deactivate(&self) {
+        let Self::Web(tokens) = self;
+        tokens.deactivate();
+    }
 }
 
 /// The Web API grant, refreshed and persisted as it ages.
@@ -100,6 +116,9 @@ pub struct WebTokens {
     token: Mutex<Option<crate::auth::StoredToken>>,
     refresh_lock: tokio::sync::Mutex<()>,
     store: Arc<dyn crate::secrets::SecretStore>,
+    secret_id: crate::secrets::SecretId,
+    source: ApiSource,
+    session_generation: AtomicU64,
 }
 
 impl WebTokens {
@@ -107,13 +126,29 @@ impl WebTokens {
         http: reqwest::Client,
         token: crate::auth::StoredToken,
         store: Arc<dyn crate::secrets::SecretStore>,
+        secret_id: crate::secrets::SecretId,
+        source: ApiSource,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             http,
             token: Mutex::new(Some(token)),
             refresh_lock: tokio::sync::Mutex::new(()),
             store,
+            secret_id,
+            source,
+            session_generation: AtomicU64::new(0),
         })
+    }
+
+    pub fn attach_session(&self, generation: u64) {
+        debug_assert_ne!(generation, 0);
+        let previous = self.session_generation.compare_exchange(
+            0,
+            generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        debug_assert!(previous.is_ok() || previous == Err(generation));
     }
 
     /// Revokes this in-process provider synchronously. A refresh already on
@@ -149,12 +184,44 @@ impl WebTokens {
         }
         let client_id = current.client_id.clone();
         let refresh_token = current.refresh_token.clone();
-        let response = crate::auth::refresh(&self.http, &client_id, &refresh_token)
-            .await
-            .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
-        let updated =
-            crate::auth::StoredToken::from_response(&client_id, response, Some(&refresh_token))
-                .map_err(|error| ApiError::SignInExpired(error.to_string()))?;
+        let response = match crate::auth::refresh(&self.http, &client_id, &refresh_token).await {
+            Ok(response) => response,
+            Err(crate::auth::TokenEndpointError::Rejected { .. }) => {
+                return Err(ApiError::SignInExpired {
+                    api_source: self.source,
+                    session_generation: self.session_generation.load(Ordering::Acquire),
+                });
+            }
+            Err(crate::auth::TokenEndpointError::Unreachable(detail)) => {
+                if force || current.expired() {
+                    return Err(ApiError::Network(detail));
+                }
+                log::warn!(
+                    "Spotify token refresh source={} failed; using the unexpired token: {detail}",
+                    self.source
+                );
+                return Ok(current.access_token);
+            }
+        };
+        let updated = match crate::auth::StoredToken::from_response(
+            &client_id,
+            response,
+            Some(&refresh_token),
+        ) {
+            Ok(updated) => updated,
+            Err(error) if force || current.expired() => {
+                return Err(ApiError::Decode(format!(
+                    "token refresh returned an unusable response: {error}"
+                )));
+            }
+            Err(error) => {
+                log::warn!(
+                    "Spotify token refresh source={} returned an unusable response; using the unexpired token: {error}",
+                    self.source
+                );
+                return Ok(current.access_token);
+            }
+        };
 
         let mut guard = self
             .token
@@ -166,12 +233,8 @@ impl WebTokens {
         if live.client_id != client_id || live.refresh_token != refresh_token {
             return Ok(live.access_token.clone());
         }
-        crate::secrets::store_json(
-            self.store.as_ref(),
-            crate::secrets::SecretId::WebApi,
-            &updated,
-        )
-        .map_err(|error| ApiError::CredentialPersistence(error.to_string()))?;
+        crate::secrets::store_json(self.store.as_ref(), self.secret_id, &updated)
+            .map_err(|error| ApiError::CredentialPersistence(error.to_string()))?;
         let access_token = updated.access_token.clone();
         *guard = Some(updated);
         Ok(access_token)
@@ -295,25 +358,43 @@ pub struct ApiClient {
     http: reqwest::Client,
     tokens: Mutex<Option<TokenProvider>>,
     limiter: Semaphore,
+    cooldown_until: tokio::sync::Mutex<Instant>,
     library_style: AtomicU8,
     search_limit: AtomicU32,
+    artist_albums_limit: u32,
+    source: ApiSource,
     activity: Arc<NetActivity>,
 }
 
 impl ApiClient {
-    pub fn new(http: reqwest::Client, activity: Arc<NetActivity>) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        activity: Arc<NetActivity>,
+        search_limit: u32,
+        artist_albums_limit: u32,
+        source: ApiSource,
+    ) -> Self {
         Self {
             http,
             tokens: Mutex::new(None),
             limiter: Semaphore::new(MAX_IN_FLIGHT),
+            cooldown_until: tokio::sync::Mutex::new(Instant::now()),
             library_style: AtomicU8::new(LibraryStyle::Modern as u8),
-            search_limit: AtomicU32::new(20),
+            search_limit: AtomicU32::new(search_limit),
+            artist_albums_limit,
+            source,
             activity,
         }
     }
 
     pub fn set_token_provider(&self, provider: Option<TokenProvider>) {
-        *self.tokens.lock().unwrap_or_else(|p| p.into_inner()) = provider;
+        let previous = std::mem::replace(
+            &mut *self.tokens.lock().unwrap_or_else(|p| p.into_inner()),
+            provider,
+        );
+        if let Some(previous) = previous {
+            previous.deactivate();
+        }
     }
 
     fn provider(&self) -> Result<TokenProvider> {
@@ -337,6 +418,21 @@ impl ApiClient {
         self.library_style.store(style as u8, Ordering::Relaxed);
     }
 
+    async fn wait_for_cooldown(&self) {
+        loop {
+            let until = *self.cooldown_until.lock().await;
+            let Some(wait) = until.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    async fn extend_cooldown(&self, wait: Duration) {
+        let mut until = self.cooldown_until.lock().await;
+        *until = (*until).max(Instant::now() + wait);
+    }
+
     // ---- transport -------------------------------------------------------
 
     async fn send(
@@ -352,17 +448,19 @@ impl ApiClient {
             format!("{BASE_URL}{path}")
         };
         let provider = self.provider()?;
-        self.activity.begin();
-        let _activity = ActivityGuard(&self.activity);
-        let _permit = self
-            .limiter
-            .acquire()
-            .await
-            .map_err(|_| ApiError::NotSignedIn)?;
+        let started = Instant::now();
 
         let mut attempt = 0;
         loop {
             attempt += 1;
+            self.wait_for_cooldown().await;
+            let permit = self
+                .limiter
+                .acquire()
+                .await
+                .map_err(|_| ApiError::NotSignedIn)?;
+            self.activity.begin();
+            let activity = ActivityGuard(&self.activity);
             let token = provider.access_token().await?;
             let mut request = self
                 .http
@@ -379,10 +477,12 @@ impl ApiClient {
 
             if status == StatusCode::UNAUTHORIZED && attempt == 1 {
                 // The access token was rejected; force a refresh and retry once.
+                drop(activity);
+                drop(permit);
                 provider.invalidate().await?;
                 continue;
             }
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt <= RATE_LIMIT_RETRIES {
+            if status == StatusCode::TOO_MANY_REQUESTS {
                 let wait = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
@@ -390,18 +490,33 @@ impl ApiClient {
                     .and_then(|value| value.parse::<u64>().ok())
                     .map_or(Duration::from_secs(1), Duration::from_secs)
                     .min(MAX_RETRY_AFTER);
-                log::warn!("rate limited on {path}; waiting {wait:?}");
-                tokio::time::sleep(wait).await;
+                let text = response.text().await.unwrap_or_default();
+                if is_quota_exhausted(&text) {
+                    return Err(ApiError::QuotaExhausted);
+                }
+                if attempt > RATE_LIMIT_RETRIES {
+                    return Err(ApiError::RateLimited);
+                }
+                log::warn!("Spotify rate limit source={} wait={wait:?}", self.source);
+                drop(activity);
+                drop(permit);
+                self.extend_cooldown(wait).await;
                 continue;
             }
-            if status.is_server_error() && attempt == 1 {
+            if status.is_server_error() && method == Method::GET && attempt == 1 {
+                drop(activity);
+                drop(permit);
                 tokio::time::sleep(Duration::from_millis(800)).await;
                 continue;
             }
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(ApiError::RateLimited);
-            }
             let text = response.text().await?;
+            log::debug!(
+                "Spotify request source={} method={} status={} duration_ms={}",
+                self.source,
+                method,
+                status.as_u16(),
+                started.elapsed().as_millis()
+            );
             if status.is_success() {
                 return Ok(text);
             }
@@ -465,7 +580,10 @@ impl ApiClient {
         match serde_json::from_str(&text) {
             Ok(value) => Ok(Some(value)),
             Err(error) => {
-                log::debug!("{path} succeeded with a body that is not JSON: {error}");
+                log::debug!(
+                    "Spotify write source={} returned a non-JSON success body: {error}",
+                    self.source
+                );
                 Ok(None)
             }
         }
@@ -1095,6 +1213,7 @@ impl ApiClient {
         offset: u32,
         limit: u32,
     ) -> Result<Page<Album>> {
+        let limit = limit.min(self.artist_albums_limit);
         match self
             .artist_albums_limited(id, include_groups, offset, limit)
             .await
@@ -1224,5 +1343,36 @@ mod tests {
             .is_gone()
         );
         assert!(!ApiError::RateLimited.is_gone());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldowns_are_owned_by_one_session() {
+        let activity = Arc::new(NetActivity::default());
+        let shared = ApiClient::new(
+            reqwest::Client::new(),
+            Arc::clone(&activity),
+            20,
+            50,
+            ApiSource::Shared,
+        );
+        let personal = ApiClient::new(
+            reqwest::Client::new(),
+            activity,
+            10,
+            10,
+            ApiSource::Personal,
+        );
+        shared.extend_cooldown(Duration::from_millis(250)).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), personal.wait_for_cooldown())
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), shared.wait_for_cooldown())
+                .await
+                .is_err()
+        );
     }
 }

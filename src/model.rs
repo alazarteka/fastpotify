@@ -535,8 +535,8 @@ pub enum Action {
     SignIn,
     CancelSignIn,
     SignOut,
-    /// Sign in again with the Web API application named in Settings.
-    SwitchWebApp,
+    /// Add, replace, or remove the optional personal Web API application.
+    ConfigurePersonalWebApp,
     ToggleSidebar,
     ToggleQueuePanel,
     ToggleLyricsPanel,

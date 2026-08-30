@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
 use librespot_protocol::authentication::AuthenticationType;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::api::models::*;
-use crate::api::{ApiClient, ApiError, NetActivity, PlayRequest, TokenProvider, WebTokens};
+use crate::api::{
+    AccountId, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest, PlaylistId,
+    SessionState, TokenProvider, WebTokens,
+};
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
 use crate::player::{Engine, EngineConfig, EngineEvent, LoadSpec, LocalState, PlayerCommand};
@@ -200,6 +203,23 @@ pub enum ApiRequest {
     },
 }
 
+impl ApiRequest {
+    fn background(&self) -> bool {
+        matches!(
+            self,
+            Self::PlaybackState { .. }
+                | Self::RecentlyPlayed
+                | Self::TopTracks { .. }
+                | Self::TopArtists
+                | Self::Recommendations { .. }
+                | Self::Discover { .. }
+                | Self::MyPlaylists { .. }
+                | Self::PlaylistSample { .. }
+                | Self::Contains { .. }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiResponse {
     Me(ApiResult<User>),
@@ -341,6 +361,111 @@ pub enum ApiResponse {
     },
 }
 
+impl ApiResponse {
+    fn error(&self) -> Option<&ApiError> {
+        match self {
+            Self::Me(Err(error))
+            | Self::Devices(Err(error))
+            | Self::Queue(Err(error))
+            | Self::RecentlyPlayed(Err(error))
+            | Self::TopArtists(Err(error))
+            | Self::Recommendations(Err(error))
+            | Self::PlaylistCreated(Err(error))
+            | Self::PlaybackState {
+                result: Err(error), ..
+            }
+            | Self::TopTracks {
+                result: Err(error), ..
+            }
+            | Self::Discover {
+                result: Err(error), ..
+            }
+            | Self::MyPlaylists {
+                result: Err(error), ..
+            }
+            | Self::Playlist {
+                result: Err(error), ..
+            }
+            | Self::PlaylistItems {
+                result: Err(error), ..
+            }
+            | Self::PlaylistSample {
+                result: Err(error), ..
+            }
+            | Self::PlaylistUpdated {
+                result: Err(error), ..
+            }
+            | Self::PlaylistItemsChanged {
+                result: Err(error), ..
+            }
+            | Self::PlaylistFollowChanged {
+                result: Err(error), ..
+            }
+            | Self::SavedTracks {
+                result: Err(error), ..
+            }
+            | Self::SavedAlbums {
+                result: Err(error), ..
+            }
+            | Self::FollowedArtists {
+                result: Err(error), ..
+            }
+            | Self::SavedShows {
+                result: Err(error), ..
+            }
+            | Self::SavedEpisodes {
+                result: Err(error), ..
+            }
+            | Self::SavedChanged {
+                result: Err(error), ..
+            }
+            | Self::Contains {
+                result: Err(error), ..
+            }
+            | Self::Search {
+                result: Err(error), ..
+            }
+            | Self::Artist {
+                result: Err(error), ..
+            }
+            | Self::ArtistTopTracks {
+                result: Err(error), ..
+            }
+            | Self::ArtistAlbums {
+                result: Err(error), ..
+            }
+            | Self::RelatedArtists {
+                result: Err(error), ..
+            }
+            | Self::Album {
+                result: Err(error), ..
+            }
+            | Self::AlbumTracks {
+                result: Err(error), ..
+            }
+            | Self::Show {
+                result: Err(error), ..
+            }
+            | Self::ShowEpisodes {
+                result: Err(error), ..
+            }
+            | Self::Track {
+                result: Err(error), ..
+            }
+            | Self::Remote {
+                result: Err(error), ..
+            }
+            | Self::Transferred {
+                result: Err(error), ..
+            }
+            | Self::QueueAdded {
+                result: Err(error), ..
+            } => Some(error),
+            _ => None,
+        }
+    }
+}
+
 pub enum Command {
     /// Start (or restart) the Web API sign-in in the browser.
     SignIn,
@@ -358,12 +483,31 @@ pub enum Command {
     Shutdown,
     /// Internal: the Web API browser flow produced a grant.
     WebSignedIn {
+        source: ApiSource,
         token: Box<crate::auth::StoredToken>,
         epoch: u64,
     },
     WebSignInFailed {
+        source: ApiSource,
         message: Option<String>,
         epoch: u64,
+        interactive: bool,
+        expired: bool,
+        generation: Option<u64>,
+    },
+    /// Internal: one Web API grant passed the canonical account check.
+    WebVerified {
+        source: ApiSource,
+        token: Box<crate::auth::StoredToken>,
+        user: Box<User>,
+        epoch: u64,
+        interactive: bool,
+        generation: u64,
+    },
+    /// Internal: only the session named here has expired.
+    WebSessionExpired {
+        source: ApiSource,
+        generation: u64,
     },
     /// Internal: the Web API said which plan the account is on (`None` when
     /// it could not tell).
@@ -397,9 +541,8 @@ pub enum Command {
     CheckForUpdates,
     /// The words of a track, from LRCLIB.
     Lyrics(Box<LyricsRequest>),
-    /// Sign in again with another Web API application (`None` for the
-    /// shared one). Local playback keeps its own grant.
-    SwitchWebApp(Option<String>),
+    /// Add, replace, or remove the optional personal Web API application.
+    ConfigurePersonalWebApp(Option<String>),
     /// Read a playlist's cached items from disk.
     LoadPlaylistCache {
         id: String,
@@ -453,9 +596,9 @@ pub enum Event {
         id: String,
         name: Option<String>,
     },
-    /// The Web API application the current sign-in belongs to.
+    /// The optional personal Web API application currently ready for routing.
     WebApp {
-        client_id: String,
+        client_id: Option<String>,
     },
 }
 
@@ -856,22 +999,29 @@ impl Backend {
 }
 
 struct ActiveAuthorization {
+    kind: AuthorizationKind,
     epoch: u64,
     cancel: watch::Sender<bool>,
     cancelled: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthorizationKind {
+    Web(ApiSource),
+    Playback,
+}
+
 #[derive(Default)]
 struct AuthorizationLifecycle {
     active: Option<ActiveAuthorization>,
-    pending_web: bool,
+    pending_web: Option<ApiSource>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum AuthorizationCompletion {
     Current,
     Ignore,
-    StartPendingWeb,
+    StartPendingWeb(ApiSource),
 }
 
 impl AuthorizationLifecycle {
@@ -879,10 +1029,11 @@ impl AuthorizationLifecycle {
         self.active.is_some()
     }
 
-    fn begin(&mut self, cancel: watch::Sender<bool>, epoch: u64) {
+    fn begin(&mut self, kind: AuthorizationKind, cancel: watch::Sender<bool>, epoch: u64) {
         debug_assert!(self.active.is_none());
-        self.pending_web = false;
+        self.pending_web = None;
         self.active = Some(ActiveAuthorization {
+            kind,
             epoch,
             cancel,
             cancelled: false,
@@ -892,35 +1043,43 @@ impl AuthorizationLifecycle {
     /// A request matching a live flow is a duplicate. A request made after
     /// cancellation, or from a newer epoch, must wait until that task drops
     /// its prepared listener.
-    fn defer_web_request(&mut self, current_epoch: u64) -> bool {
+    fn defer_web_request(&mut self, source: ApiSource, current_epoch: u64) -> bool {
         let Some(active) = &self.active else {
             return false;
         };
-        if active.epoch != current_epoch || active.cancelled {
-            self.pending_web = true;
+        if active.kind != AuthorizationKind::Web(source)
+            || active.epoch != current_epoch
+            || active.cancelled
+        {
+            self.pending_web = Some(source);
         }
         true
     }
 
     fn cancel(&mut self) {
-        self.pending_web = false;
+        self.pending_web = None;
         if let Some(active) = &mut self.active {
             active.cancelled = true;
             let _ = active.cancel.send(true);
         }
     }
 
-    fn finish(&mut self, epoch: u64, current_epoch: u64) -> AuthorizationCompletion {
+    fn finish(
+        &mut self,
+        kind: AuthorizationKind,
+        epoch: u64,
+        current_epoch: u64,
+    ) -> AuthorizationCompletion {
         if !self
             .active
             .as_ref()
-            .is_some_and(|active| active.epoch == epoch)
+            .is_some_and(|active| active.kind == kind && active.epoch == epoch)
         {
             return AuthorizationCompletion::Ignore;
         }
         let active = self.active.take().expect("matching authorization exists");
-        if std::mem::take(&mut self.pending_web) {
-            AuthorizationCompletion::StartPendingWeb
+        if let Some(source) = self.pending_web.take() {
+            AuthorizationCompletion::StartPendingWeb(source)
         } else if epoch == current_epoch && !active.cancelled {
             AuthorizationCompletion::Current
         } else {
@@ -937,35 +1096,35 @@ mod authorization_lifecycle_tests {
     fn repeated_web_replacements_wait_for_the_listener_owner() {
         let mut lifecycle = AuthorizationLifecycle::default();
         let (cancel, cancel_rx) = watch::channel(false);
-        lifecycle.begin(cancel, 4);
+        lifecycle.begin(AuthorizationKind::Web(ApiSource::Shared), cancel, 4);
 
         lifecycle.cancel();
-        assert!(lifecycle.defer_web_request(5));
+        assert!(lifecycle.defer_web_request(ApiSource::Personal, 5));
         lifecycle.cancel();
-        assert!(lifecycle.defer_web_request(6));
+        assert!(lifecycle.defer_web_request(ApiSource::Personal, 6));
 
         assert!(*cancel_rx.borrow());
         assert_eq!(
-            lifecycle.finish(4, 6),
-            AuthorizationCompletion::StartPendingWeb
+            lifecycle.finish(AuthorizationKind::Web(ApiSource::Shared), 4, 6),
+            AuthorizationCompletion::StartPendingWeb(ApiSource::Personal)
         );
         assert!(!lifecycle.is_active());
-        assert!(!lifecycle.defer_web_request(6));
+        assert!(!lifecycle.defer_web_request(ApiSource::Personal, 6));
     }
 
     #[test]
     fn sign_in_requested_after_cancel_is_not_lost() {
         let mut lifecycle = AuthorizationLifecycle::default();
         let (cancel, cancel_rx) = watch::channel(false);
-        lifecycle.begin(cancel, 9);
+        lifecycle.begin(AuthorizationKind::Web(ApiSource::Shared), cancel, 9);
 
         lifecycle.cancel();
-        assert!(lifecycle.defer_web_request(9));
+        assert!(lifecycle.defer_web_request(ApiSource::Shared, 9));
 
         assert!(*cancel_rx.borrow());
         assert_eq!(
-            lifecycle.finish(9, 9),
-            AuthorizationCompletion::StartPendingWeb
+            lifecycle.finish(AuthorizationKind::Web(ApiSource::Shared), 9, 9),
+            AuthorizationCompletion::StartPendingWeb(ApiSource::Shared)
         );
     }
 
@@ -973,10 +1132,165 @@ mod authorization_lifecycle_tests {
     fn cancelled_completion_cannot_become_current() {
         let mut lifecycle = AuthorizationLifecycle::default();
         let (cancel, _cancel_rx) = watch::channel(false);
-        lifecycle.begin(cancel, 12);
+        lifecycle.begin(AuthorizationKind::Playback, cancel, 12);
         lifecycle.cancel();
 
-        assert_eq!(lifecycle.finish(12, 12), AuthorizationCompletion::Ignore);
+        assert_eq!(
+            lifecycle.finish(AuthorizationKind::Playback, 12, 12),
+            AuthorizationCompletion::Ignore
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_routing_tests {
+    use super::*;
+
+    fn gateway() -> ApiGateway {
+        ApiGateway::new(reqwest::Client::new(), Arc::new(NetActivity::default()))
+    }
+
+    #[test]
+    fn requests_map_to_the_audited_capability_matrix() {
+        let api = gateway();
+        assert_eq!(
+            operation_for(&api, &ApiRequest::Me),
+            Operation::CanonicalAccount
+        );
+        assert_eq!(
+            operation_for(&api, &ApiRequest::Devices),
+            Operation::Playback
+        );
+        assert_eq!(
+            operation_for(
+                &api,
+                &ApiRequest::Contains {
+                    uris: vec!["spotify:track:t".into()],
+                    user_id: "me".into(),
+                },
+            ),
+            Operation::UserData
+        );
+        assert_eq!(
+            operation_for(
+                &api,
+                &ApiRequest::Contains {
+                    uris: vec!["spotify:playlist:p".into()],
+                    user_id: "me".into(),
+                },
+            ),
+            Operation::UnsupportedDevelopmentMode
+        );
+        assert_eq!(
+            operation_for(
+                &api,
+                &ApiRequest::PlaylistItems {
+                    id: "unknown".into(),
+                    offset: 0,
+                },
+            ),
+            Operation::PlaylistItems(crate::api::PlaylistAccess::Unknown)
+        );
+        assert_eq!(
+            operation_for(
+                &api,
+                &ApiRequest::Search {
+                    query: "music".into(),
+                    serial: 1,
+                },
+            ),
+            Operation::PlaylistSearch
+        );
+        assert_eq!(
+            operation_for(
+                &api,
+                &ApiRequest::ArtistTopTracks {
+                    id: "artist".into(),
+                    name: "Artist".into(),
+                },
+            ),
+            Operation::UnsupportedDevelopmentMode
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_token_migration_tests {
+    use super::*;
+
+    fn token(client_id: &str, access: &str) -> crate::auth::StoredToken {
+        crate::auth::StoredToken {
+            client_id: client_id.into(),
+            access_token: access.into(),
+            refresh_token: format!("refresh-{access}"),
+            expires_at: u64::MAX,
+            scope: crate::auth::WEB_SCOPES.join(" "),
+        }
+    }
+
+    fn paths(name: &str) -> (std::path::PathBuf, crate::secrets::LegacySecret) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-dual-api-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        let legacy = crate::secrets::LegacySecret::new(root.join("legacy.json"));
+        (root, legacy)
+    }
+
+    #[test]
+    fn previous_personal_grant_moves_only_after_verified_storage() {
+        let (root, legacy_path) = paths("move");
+        let store = PrivateFileStore::new(root.join("secrets"));
+        let previous = token("0123456789abcdef0123456789abcdef", "old");
+        crate::secrets::store_json(&store, SecretId::WebApi, &previous).unwrap();
+
+        let (shared, personal) = Worker::load_saved_web_tokens(&store, &legacy_path).unwrap();
+
+        assert!(shared.is_none());
+        assert!(personal.as_ref() == Some(&previous));
+        assert!(
+            crate::secrets::load_json::<crate::auth::StoredToken>(&store, SecretId::WebApi)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::secrets::load_json::<crate::auth::StoredToken>(&store, SecretId::PersonalWebApi)
+                .unwrap()
+                == Some(previous)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflicting_personal_grants_are_both_preserved() {
+        let (root, legacy_path) = paths("conflict");
+        let store = PrivateFileStore::new(root.join("secrets"));
+        let previous = token("0123456789abcdef0123456789abcdef", "old");
+        let current = token("fedcba9876543210fedcba9876543210", "new");
+        crate::secrets::store_json(&store, SecretId::WebApi, &previous).unwrap();
+        crate::secrets::store_json(&store, SecretId::PersonalWebApi, &current).unwrap();
+
+        let result = Worker::load_saved_web_tokens(&store, &legacy_path);
+
+        assert!(matches!(
+            result,
+            Err(crate::secrets::SecretError::MigrationConflict { .. })
+        ));
+        assert!(
+            crate::secrets::load_json::<crate::auth::StoredToken>(&store, SecretId::WebApi)
+                .unwrap()
+                == Some(previous)
+        );
+        assert!(
+            crate::secrets::load_json::<crate::auth::StoredToken>(&store, SecretId::PersonalWebApi)
+                .unwrap()
+                == Some(current)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -985,7 +1299,8 @@ struct Worker {
     engine_config: EngineConfig,
     web_client_id: Option<String>,
     http: reqwest::Client,
-    api: Arc<ApiClient>,
+    api: Arc<ApiGateway>,
+    background_api: Arc<Semaphore>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -993,8 +1308,8 @@ struct Worker {
     engine_notifications: EngineNotificationGuard,
     engine_connection: EngineConnectionLifecycle,
     engine: Option<Arc<Engine>>,
-    web_tokens: Option<Arc<WebTokens>>,
     secrets: Arc<dyn SecretStore>,
+    pending_personal_token: Option<crate::auth::StoredToken>,
     signed_in: bool,
     /// The plan, once the Web API has answered.
     premium: Option<bool>,
@@ -1026,7 +1341,8 @@ impl Worker {
             dirs,
             engine_config,
             web_client_id,
-            api: Arc::new(ApiClient::new(http.clone(), activity)),
+            api: Arc::new(ApiGateway::new(http.clone(), activity)),
+            background_api: Arc::new(Semaphore::new(4)),
             http,
             art,
             events,
@@ -1035,8 +1351,8 @@ impl Worker {
             engine_notifications: EngineNotificationGuard::default(),
             engine_connection: EngineConnectionLifecycle::default(),
             engine: None,
-            web_tokens: None,
             secrets,
+            pending_personal_token: None,
             signed_in: false,
             premium: None,
             authorization: AuthorizationLifecycle::default(),
@@ -1081,15 +1397,42 @@ impl Worker {
                 },
                 Command::Api(request) => self.dispatch(request),
                 Command::Accent { url } => self.accent(url),
-                Command::WebSignedIn { token, epoch } => self.on_web_signed_in(*token, epoch),
-                Command::WebSignInFailed { message, epoch } => {
-                    self.on_web_sign_in_failed(message, epoch)
+                Command::WebSignedIn {
+                    source,
+                    token,
+                    epoch,
+                } => self.on_web_signed_in(source, *token, epoch),
+                Command::WebSignInFailed {
+                    source,
+                    message,
+                    epoch,
+                    interactive,
+                    expired,
+                    generation,
+                } => self.on_web_sign_in_failed(
+                    source,
+                    message,
+                    epoch,
+                    interactive,
+                    expired,
+                    generation,
+                ),
+                Command::WebVerified {
+                    source,
+                    token,
+                    user,
+                    epoch,
+                    interactive,
+                    generation,
+                } => self.on_web_verified(source, *token, *user, epoch, interactive, generation),
+                Command::WebSessionExpired { source, generation } => {
+                    self.on_web_session_expired(source, generation)
                 }
                 Command::PlaybackAuthorized {
                     access_token,
                     epoch,
                 } => {
-                    if !self.discard_stale_authorization(epoch) {
+                    if !self.discard_stale_authorization(AuthorizationKind::Playback, epoch) {
                         self.connect_engine(Credentials::with_access_token(access_token));
                     }
                 }
@@ -1115,7 +1458,9 @@ impl Worker {
                     items,
                 } => self.store_playlist_cache(id, snapshot, items),
                 Command::UserNames(ids) => self.fetch_user_names(ids),
-                Command::SwitchWebApp(client_id) => self.switch_web_app(client_id),
+                Command::ConfigurePersonalWebApp(client_id) => {
+                    self.configure_personal_web_app(client_id)
+                }
             }
         }
         self.engine_connection.reset();
@@ -1127,118 +1472,449 @@ impl Worker {
 
     // ---- Web API sign-in --------------------------------------------------
 
-    /// On startup, resume a saved Web API grant. The local engine follows
-    /// once the plan is known (`on_account_checked`), never before.
-    fn restore_session(&mut self) {
-        let token = crate::secrets::load_json_migrating_validated::<crate::auth::StoredToken>(
-            self.secrets.as_ref(),
+    fn token_secret(source: ApiSource) -> SecretId {
+        match source {
+            ApiSource::Shared => SecretId::WebApi,
+            ApiSource::Personal => SecretId::PersonalWebApi,
+        }
+    }
+
+    fn validate_saved_token(
+        token: &crate::auth::StoredToken,
+        id: SecretId,
+    ) -> crate::secrets::Result<()> {
+        token
+            .validate()
+            .map_err(|error| crate::secrets::SecretError::Corrupt {
+                kind: id.label(),
+                reason: error.to_string(),
+            })
+    }
+
+    /// Split a pre-existing single Web grant by its application identity.
+    /// The personal copy is durably written and read back before the old item
+    /// is deleted, so an interrupted migration remains recoverable.
+    fn load_saved_web_tokens(
+        store: &dyn SecretStore,
+        legacy: &crate::secrets::LegacySecret,
+    ) -> crate::secrets::Result<(
+        Option<crate::auth::StoredToken>,
+        Option<crate::auth::StoredToken>,
+    )> {
+        let mut shared = crate::secrets::load_json_migrating_validated::<crate::auth::StoredToken>(
+            store,
             SecretId::WebApi,
+            legacy,
+            |token| Self::validate_saved_token(token, SecretId::WebApi),
+        )?;
+        let mut personal =
+            crate::secrets::load_json::<crate::auth::StoredToken>(store, SecretId::PersonalWebApi)?;
+        if let Some(token) = &personal {
+            Self::validate_saved_token(token, SecretId::PersonalWebApi)?;
+        }
+
+        if shared
+            .as_ref()
+            .is_some_and(|token| token.client_id != crate::auth::DEFAULT_WEB_CLIENT_ID)
+        {
+            let previous = shared.take().expect("non-shared grant exists");
+            match &personal {
+                Some(current) if current != &previous => {
+                    return Err(crate::secrets::SecretError::MigrationConflict {
+                        kind: SecretId::PersonalWebApi.label(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    crate::secrets::store_json(store, SecretId::PersonalWebApi, &previous)?;
+                    let verified = crate::secrets::load_json::<crate::auth::StoredToken>(
+                        store,
+                        SecretId::PersonalWebApi,
+                    )?
+                    .ok_or(crate::secrets::SecretError::Verification {
+                        kind: SecretId::PersonalWebApi.label(),
+                    })?;
+                    if verified != previous {
+                        return Err(crate::secrets::SecretError::Verification {
+                            kind: SecretId::PersonalWebApi.label(),
+                        });
+                    }
+                }
+            }
+            store.delete(SecretId::WebApi)?;
+            personal = Some(previous);
+        }
+        Ok((shared, personal))
+    }
+
+    /// On startup the shared grant is verified first because it establishes
+    /// the canonical account. A saved personal grant waits for that result.
+    fn restore_session(&mut self) {
+        let (shared, personal) = match Self::load_saved_web_tokens(
+            self.secrets.as_ref(),
             &self.dirs.legacy_web_secret(),
-            |token| {
-                token
-                    .validate()
-                    .map_err(|error| crate::secrets::SecretError::Corrupt {
-                        kind: SecretId::WebApi.label(),
-                        reason: error.to_string(),
-                    })
-            },
-        );
-        match token {
-            Ok(Some(token)) if !token.has_scopes(crate::auth::WEB_SCOPES) => {
-                // Granted before a scope this version relies on; only the
-                // browser can widen it.
-                self.emit(Event::Auth(AuthStatus::Failed(
-                    "Fastpotify needs one more Spotify permission. Please sign in again.".into(),
+        ) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                self.emit(Event::Auth(AuthStatus::Failed(format!(
+                    "Stored Spotify sign-in could not be read safely: {error}"
+                ))));
+                return;
+            }
+        };
+        self.pending_personal_token = personal.filter(|token| self.personal_token_matches(token));
+        match shared {
+            Some(token)
+                if token.client_id == crate::auth::DEFAULT_WEB_CLIENT_ID
+                    && token.has_scopes(crate::auth::WEB_SCOPES) =>
+            {
+                self.emit(Event::Auth(AuthStatus::Connecting));
+                self.activate_web_token(ApiSource::Shared, token, self.auth_epoch, false);
+            }
+            Some(_) => self.emit(Event::Auth(AuthStatus::Failed(
+                "Fastpotify needs one more Spotify permission. Please sign in again.".into(),
+            ))),
+            None => self.emit(Event::Auth(AuthStatus::SignedOut)),
+        }
+    }
+
+    fn personal_token_matches(&self, token: &crate::auth::StoredToken) -> bool {
+        self.web_client_id.as_deref() == Some(token.client_id.as_str())
+            && crate::auth::Grant::personal_web_api(&token.client_id).is_ok()
+            && token.has_scopes(crate::auth::WEB_SCOPES)
+    }
+
+    fn remember_saved_personal_token(&mut self) {
+        match crate::secrets::load_json::<crate::auth::StoredToken>(
+            self.secrets.as_ref(),
+            SecretId::PersonalWebApi,
+        ) {
+            Ok(Some(token)) => {
+                if let Err(error) = Self::validate_saved_token(&token, SecretId::PersonalWebApi) {
+                    self.pending_personal_token = None;
+                    self.emit(Event::Error(format!(
+                        "Stored personal Spotify sign-in could not be read safely: {error}"
+                    )));
+                } else {
+                    self.pending_personal_token =
+                        self.personal_token_matches(&token).then_some(token);
+                }
+            }
+            Ok(None) => self.pending_personal_token = None,
+            Err(error) => {
+                self.pending_personal_token = None;
+                self.emit(Event::Error(format!(
+                    "Stored personal Spotify sign-in could not be read safely: {error}"
                 )));
             }
-            Ok(Some(token)) => {
-                self.activate_web_token(token);
-                self.emit(Event::Auth(AuthStatus::Connecting));
-                self.dispatch(ApiRequest::Me);
-                self.signed_in = true;
-                self.emit(Event::Auth(AuthStatus::Connected {
-                    username: String::new(),
-                }));
-            }
-            Ok(None) => self.emit(Event::Auth(AuthStatus::SignedOut)),
-            Err(error) => self.emit(Event::Auth(AuthStatus::Failed(format!(
-                "Stored Spotify sign-in could not be read safely: {error}"
-            )))),
         }
     }
 
-    fn deactivate_web_token(&mut self) {
-        self.api.set_token_provider(None);
-        if let Some(tokens) = self.web_tokens.take() {
-            tokens.deactivate();
-        }
-    }
-
-    fn activate_web_token(&mut self, token: crate::auth::StoredToken) {
-        self.deactivate_web_token();
-        self.emit(Event::WebApp {
-            client_id: token.client_id.clone(),
+    fn activate_web_token(
+        &mut self,
+        source: ApiSource,
+        token: crate::auth::StoredToken,
+        epoch: u64,
+        interactive: bool,
+    ) {
+        let tokens = WebTokens::new(
+            self.http.clone(),
+            token.clone(),
+            Arc::clone(&self.secrets),
+            Self::token_secret(source),
+            source,
+        );
+        let generation = self.api.begin_verification(source, |generation| {
+            tokens.attach_session(generation);
+            TokenProvider::Web(Arc::clone(&tokens))
         });
-        let tokens = WebTokens::new(self.http.clone(), token, Arc::clone(&self.secrets));
-        self.api
-            .set_token_provider(Some(TokenProvider::Web(Arc::clone(&tokens))));
-        self.web_tokens = Some(tokens);
+        let client = self.api.verification_client(source);
+        let gateway = Arc::clone(&self.api);
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0;
+            let result = loop {
+                attempt += 1;
+                match client.me().await {
+                    Ok(user) => break Ok(user),
+                    Err(error)
+                        if attempt < 3
+                            && (matches!(error, ApiError::Network(_))
+                                || error.status().is_some_and(|status| status >= 500))
+                            && matches!(gateway.state(source), SessionState::Authorizing) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            match result {
+                Ok(user) => {
+                    let _ = commands.send(Command::WebVerified {
+                        source,
+                        token: Box::new(token),
+                        user: Box::new(user),
+                        epoch,
+                        interactive,
+                        generation,
+                    });
+                }
+                Err(error) => {
+                    let expired = matches!(error, ApiError::SignInExpired { .. });
+                    let _ = commands.send(Command::WebSignInFailed {
+                        source,
+                        message: Some(error.to_string()),
+                        epoch,
+                        interactive,
+                        expired,
+                        generation: Some(generation),
+                    });
+                }
+            }
+        });
     }
 
-    fn on_web_signed_in(&mut self, token: crate::auth::StoredToken, epoch: u64) {
-        if self.discard_stale_authorization(epoch) {
+    fn current_web_authorization(&self, source: ApiSource, epoch: u64) -> bool {
+        self.authorization.active.as_ref().is_some_and(|active| {
+            active.kind == AuthorizationKind::Web(source)
+                && active.epoch == epoch
+                && !active.cancelled
+                && epoch == self.auth_epoch
+        })
+    }
+
+    fn on_web_signed_in(&mut self, source: ApiSource, token: crate::auth::StoredToken, epoch: u64) {
+        if !self.current_web_authorization(source, epoch) {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            return;
+        }
+        let expected_client = match source {
+            ApiSource::Shared => Some(crate::auth::DEFAULT_WEB_CLIENT_ID),
+            ApiSource::Personal => self.web_client_id.as_deref(),
+        };
+        if expected_client != Some(token.client_id.as_str()) {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            self.emit(Event::Error(format!(
+                "Spotify returned credentials for the wrong {source} application"
+            )));
             return;
         }
         if let Err(error) =
-            crate::secrets::store_json(self.secrets.as_ref(), SecretId::WebApi, &token)
+            crate::secrets::store_json(self.secrets.as_ref(), Self::token_secret(source), &token)
         {
-            self.emit(Event::Auth(AuthStatus::Failed(
-                "Spotify approved the sign-in, but Fastpotify could not store it safely.".into(),
-            )));
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            if source == ApiSource::Shared {
+                self.emit(Event::Auth(AuthStatus::Failed(
+                    "Spotify approved the sign-in, but Fastpotify could not store it safely."
+                        .into(),
+                )));
+            }
             self.emit(Event::Error(format!(
-                "Sign-in was not activated because credential storage failed: {error}"
+                "{source} sign-in was not activated because credential storage failed: {error}"
             )));
             return;
         }
-        self.activate_web_token(token);
-        self.signed_in = true;
-        self.emit(Event::Auth(AuthStatus::Connected {
-            username: String::new(),
-        }));
-        self.dispatch(ApiRequest::Me);
+        self.activate_web_token(source, token, epoch, true);
     }
 
-    fn on_web_sign_in_failed(&mut self, message: Option<String>, epoch: u64) {
-        if self.discard_stale_authorization(epoch) {
+    fn on_web_verified(
+        &mut self,
+        source: ApiSource,
+        token: crate::auth::StoredToken,
+        user: User,
+        epoch: u64,
+        interactive: bool,
+        generation: u64,
+    ) {
+        if interactive && !self.current_web_authorization(source, epoch) {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
             return;
         }
-        self.emit(Event::Auth(AuthStatus::SignedOut));
+        if epoch != self.auth_epoch
+            || !self.api.is_current(source, generation)
+            || !matches!(self.api.state(source), SessionState::Authorizing)
+            || source == ApiSource::Personal
+                && self.web_client_id.as_deref() != Some(token.client_id.as_str())
+        {
+            return;
+        }
+        if let Err(error) = self
+            .api
+            .install(source, generation, AccountId::new(user.id.clone()))
+        {
+            self.api.clear_if_current(source, generation);
+            if source == ApiSource::Personal {
+                let _ = self.secrets.delete(SecretId::PersonalWebApi);
+                self.emit(Event::WebApp { client_id: None });
+            }
+            self.emit(Event::Error(format!(
+                "{source} Spotify authorization failed: {error}"
+            )));
+            if interactive {
+                let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            }
+            return;
+        }
+        match source {
+            ApiSource::Shared => {
+                self.signed_in = true;
+                self.emit(Event::Auth(AuthStatus::Connected {
+                    username: user.name().to_string(),
+                }));
+                self.emit(Event::Api(Box::new(ApiResponse::Me(Ok(user.clone())))));
+                let premium = user.product.as_deref().map(|product| product == "premium");
+                self.on_account_checked(premium);
+                if let Some(personal) = self.pending_personal_token.take() {
+                    self.activate_web_token(ApiSource::Personal, personal, self.auth_epoch, false);
+                }
+            }
+            ApiSource::Personal => self.emit(Event::WebApp {
+                client_id: Some(token.client_id),
+            }),
+        }
+        if interactive {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+        }
+    }
+
+    fn on_web_sign_in_failed(
+        &mut self,
+        source: ApiSource,
+        message: Option<String>,
+        epoch: u64,
+        interactive: bool,
+        expired: bool,
+        generation: Option<u64>,
+    ) {
+        if interactive && !self.current_web_authorization(source, epoch) {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            return;
+        }
+        if epoch != self.auth_epoch {
+            return;
+        }
+        if let Some(generation) = generation
+            && !self.api.clear_if_current(source, generation)
+        {
+            if interactive {
+                let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+            }
+            return;
+        }
+        if generation.is_none() {
+            self.api.clear(source);
+        }
+        if expired && let Err(error) = self.secrets.delete(Self::token_secret(source)) {
+            self.emit(Event::Error(format!(
+                "The expired {source} credential could not be deleted: {error}"
+            )));
+        }
+        if source == ApiSource::Shared {
+            self.remember_saved_personal_token();
+            self.signed_in = false;
+            self.premium = None;
+            self.emit(Event::WebApp { client_id: None });
+            self.emit(Event::Auth(match &message {
+                Some(message) => {
+                    AuthStatus::Failed(format!("Shared Spotify sign-in failed: {message}"))
+                }
+                None => AuthStatus::SignedOut,
+            }));
+        } else {
+            self.emit(Event::WebApp { client_id: None });
+        }
         if let Some(message) = message {
-            self.emit(Event::Error(format!("Sign-in failed: {message}")));
+            self.emit(Event::Error(format!(
+                "{source} Spotify sign-in failed: {message}"
+            )));
+        }
+        if interactive {
+            let _ = self.discard_stale_authorization(AuthorizationKind::Web(source), epoch);
+        }
+    }
+
+    fn on_web_session_expired(&mut self, source: ApiSource, generation: u64) {
+        if !self.api.clear_if_current(source, generation) {
+            return;
+        }
+        if let Err(error) = self.secrets.delete(Self::token_secret(source)) {
+            self.emit(Event::Error(format!(
+                "The expired {source} sign-in was cleared from memory, but its stored credential remains: {error}"
+            )));
+        }
+        match source {
+            ApiSource::Shared => {
+                self.remember_saved_personal_token();
+                self.signed_in = false;
+                self.premium = None;
+                self.emit(Event::WebApp { client_id: None });
+                self.emit(Event::Auth(AuthStatus::Failed(
+                    "Your shared Spotify sign-in expired. Please sign in again.".into(),
+                )));
+            }
+            ApiSource::Personal => self.emit(Event::WebApp { client_id: None }),
         }
     }
 
     fn sign_in(&mut self) {
-        if self.authorization.defer_web_request(self.auth_epoch) {
+        self.sign_in_source(ApiSource::Shared);
+    }
+
+    fn sign_in_source(&mut self, source: ApiSource) {
+        if matches!(self.api.state(source), SessionState::Ready { .. }) {
             return;
         }
-        let grant = crate::auth::Grant::web_api(self.web_client_id.as_deref());
+        if self
+            .authorization
+            .defer_web_request(source, self.auth_epoch)
+        {
+            return;
+        }
+        if source == ApiSource::Personal
+            && !matches!(
+                self.api.state(ApiSource::Shared),
+                SessionState::Ready { .. }
+            )
+        {
+            return;
+        }
+        let grant = match source {
+            ApiSource::Shared => crate::auth::Grant::shared_web_api(),
+            ApiSource::Personal => {
+                let Some(client_id) = self.web_client_id.as_deref() else {
+                    return;
+                };
+                match crate::auth::Grant::personal_web_api(client_id) {
+                    Ok(grant) => grant,
+                    Err(error) => {
+                        self.emit(Event::Error(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        };
         let session = match crate::auth::PreparedAuthorization::prepare(&grant) {
             Ok(session) => session,
             Err(error) => {
-                self.emit(Event::Auth(AuthStatus::Failed(format!(
-                    "Spotify sign-in could not start: {error}"
-                ))));
+                let message = format!("Spotify sign-in could not start: {error}");
+                if source == ApiSource::Shared {
+                    self.emit(Event::Auth(AuthStatus::Failed(message)));
+                } else {
+                    self.emit(Event::Error(message));
+                }
                 return;
             }
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let epoch = self.auth_epoch;
-        self.authorization.begin(cancel_tx, epoch);
+        self.authorization
+            .begin(AuthorizationKind::Web(source), cancel_tx, epoch);
         let url = session.url().to_string();
-        self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
-            url: url.clone(),
-        }));
+        if source == ApiSource::Shared {
+            self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
+                url: url.clone(),
+            }));
+        }
         if let Err(error) = open::that_detached(&url) {
             log::warn!("unable to open a browser: {error}");
         }
@@ -1260,6 +1936,7 @@ impl Worker {
             match result {
                 Ok(token) => {
                     let _ = commands.send(Command::WebSignedIn {
+                        source,
                         token: Box::new(token),
                         epoch,
                     });
@@ -1267,45 +1944,55 @@ impl Worker {
                 Err(error) => {
                     let message = error.to_string();
                     let _ = commands.send(Command::WebSignInFailed {
+                        source,
                         message: (!message.contains("cancelled")).then_some(message),
                         epoch,
+                        interactive: true,
+                        expired: false,
+                        generation: None,
                     });
                 }
             }
         });
     }
 
-    /// Signs in again with another Web API application, without a restart.
-    /// Only the Web API grant changes hands: the browser opens once for the
-    /// new application, and local playback keeps its own credential.
-    fn switch_web_app(&mut self, client_id: Option<String>) {
-        self.authorization.cancel();
-        self.auth_epoch = self.auth_epoch.wrapping_add(1);
-        self.web_client_id = client_id;
-        self.deactivate_web_token();
-        self.signed_in = false;
-        self.emit(Event::Auth(AuthStatus::SignedOut));
-        if let Err(error) = crate::secrets::clear_secret_copies(
-            self.secrets.as_ref(),
-            SecretId::WebApi,
-            &self.dirs.legacy_web_secret(),
-        ) {
-            self.emit(Event::Error(format!(
-                "The Web sign-in was cleared from memory, but stored credentials remain: {error}"
-            )));
-            return;
+    fn configure_personal_web_app(&mut self, client_id: Option<String>) {
+        let replacing_personal_flow = self
+            .authorization
+            .active
+            .as_ref()
+            .is_some_and(|active| active.kind == AuthorizationKind::Web(ApiSource::Personal));
+        if replacing_personal_flow {
+            self.authorization.cancel();
+            self.auth_epoch = self.auth_epoch.wrapping_add(1);
         }
-        self.sign_in();
+        self.web_client_id = client_id.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+        self.pending_personal_token = None;
+        self.api.clear(ApiSource::Personal);
+        self.emit(Event::WebApp { client_id: None });
+        if let Err(error) = self.secrets.delete(SecretId::PersonalWebApi) {
+            self.emit(Event::Error(format!(
+                "The personal Web sign-in was cleared from memory, but its stored credential remains: {error}"
+            )));
+        }
+        if self.web_client_id.is_some() {
+            self.sign_in_source(ApiSource::Personal);
+        } else {
+            self.authorization.pending_web = None;
+        }
     }
 
     /// A replaced flow reports only after dropping its listener. Use that
     /// boundary to start the pending Web flow without a fixed-port bind race.
-    fn discard_stale_authorization(&mut self, epoch: u64) -> bool {
-        match self.authorization.finish(epoch, self.auth_epoch) {
+    fn discard_stale_authorization(&mut self, kind: AuthorizationKind, epoch: u64) -> bool {
+        match self.authorization.finish(kind, epoch, self.auth_epoch) {
             AuthorizationCompletion::Current => false,
             AuthorizationCompletion::Ignore => true,
-            AuthorizationCompletion::StartPendingWeb => {
-                self.sign_in();
+            AuthorizationCompletion::StartPendingWeb(source) => {
+                self.sign_in_source(source);
                 true
             }
         }
@@ -1330,7 +2017,8 @@ impl Worker {
                     engine.shutdown();
                 }
                 self.authorization.cancel();
-                self.deactivate_web_token();
+                self.pending_personal_token = None;
+                self.api.clear_all();
             },
         );
         self.emit(Event::Playback(LocalPlayback::Unavailable));
@@ -1475,7 +2163,8 @@ impl Worker {
         };
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let epoch = self.auth_epoch;
-        self.authorization.begin(cancel_tx, epoch);
+        self.authorization
+            .begin(AuthorizationKind::Playback, cancel_tx, epoch);
         self.emit(Event::Playback(LocalPlayback::Authorizing));
         if let Err(error) = open::that_detached(session.url()) {
             log::warn!("unable to open a browser: {error}");
@@ -1508,7 +2197,7 @@ impl Worker {
     }
 
     fn on_playback_authorization_failed(&mut self, message: Option<String>, epoch: u64) {
-        if self.discard_stale_authorization(epoch) {
+        if self.discard_stale_authorization(AuthorizationKind::Playback, epoch) {
             return;
         }
         match message {
@@ -1797,11 +2486,31 @@ impl Worker {
 
     fn dispatch(&self, request: ApiRequest) {
         let api = Arc::clone(&self.api);
+        let background_api = Arc::clone(&self.background_api);
+        let background = request.background();
         let events = self.events.clone();
         let waker = self.waker.clone();
         let commands = self.commands.clone();
         tokio::spawn(async move {
+            let _background_permit = if background {
+                background_api.acquire_owned().await.ok()
+            } else {
+                None
+            };
             let response = handle(&api, request).await;
+            if let Some(ApiError::SignInExpired {
+                api_source,
+                session_generation,
+            }) = response.error()
+            {
+                if !api.is_current(*api_source, *session_generation) {
+                    return;
+                }
+                let _ = commands.send(Command::WebSessionExpired {
+                    source: *api_source,
+                    generation: *session_generation,
+                });
+            }
             if let ApiResponse::Me(result) = &response {
                 let premium = result
                     .as_ref()
@@ -1848,58 +2557,170 @@ fn friendly_connect_error(error: &anyhow::Error) -> String {
     }
 }
 
-async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
+fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
     match request {
-        ApiRequest::Me => ApiResponse::Me(api.me().await),
-        ApiRequest::Devices => ApiResponse::Devices(api.devices().await),
+        ApiRequest::Me => Operation::CanonicalAccount,
+        ApiRequest::Devices
+        | ApiRequest::PlaybackState { .. }
+        | ApiRequest::Queue
+        | ApiRequest::Remote { .. }
+        | ApiRequest::Transfer { .. }
+        | ApiRequest::PlayWithShuffle { .. }
+        | ApiRequest::AddToQueue { .. } => Operation::Playback,
+        ApiRequest::RecentlyPlayed
+        | ApiRequest::TopTracks { .. }
+        | ApiRequest::TopArtists
+        | ApiRequest::SavedTracks { .. }
+        | ApiRequest::SavedAlbums { .. }
+        | ApiRequest::FollowedArtists { .. }
+        | ApiRequest::SavedShows { .. }
+        | ApiRequest::SavedEpisodes { .. }
+        | ApiRequest::SetSaved { .. } => Operation::UserData,
+        ApiRequest::Contains { uris, .. }
+            if uris.iter().any(|uri| uri.starts_with("spotify:playlist:")) =>
+        {
+            Operation::UnsupportedDevelopmentMode
+        }
+        ApiRequest::Contains { .. } => Operation::UserData,
+        ApiRequest::MyPlaylists { .. } => Operation::PlaylistLibrary,
+        ApiRequest::CreatePlaylist { .. } => Operation::PlaylistCreation,
+        ApiRequest::Discover { .. } | ApiRequest::Search { .. } => Operation::PlaylistSearch,
+        ApiRequest::Playlist { id } => Operation::PlaylistMetadata(api.playlist_access(id)),
+        ApiRequest::PlaylistItems { id, .. } | ApiRequest::PlaylistSample { id, .. } => {
+            Operation::PlaylistItems(api.playlist_access(id))
+        }
+        ApiRequest::UpdatePlaylist { id, .. } | ApiRequest::FollowPlaylist { id, .. } => {
+            Operation::PlaylistMutation(api.playlist_access(id))
+        }
+        ApiRequest::AddToPlaylist { playlist_id, .. }
+        | ApiRequest::RemoveFromPlaylist { playlist_id, .. }
+        | ApiRequest::ReorderPlaylist { playlist_id, .. } => {
+            Operation::PlaylistMutation(api.playlist_access(playlist_id))
+        }
+        ApiRequest::Recommendations { .. }
+        | ApiRequest::ArtistTopTracks { .. }
+        | ApiRequest::RelatedArtists { .. } => Operation::UnsupportedDevelopmentMode,
+        ApiRequest::Artist { .. }
+        | ApiRequest::ArtistAlbums { .. }
+        | ApiRequest::Album { .. }
+        | ApiRequest::AlbumTracks { .. }
+        | ApiRequest::Show { .. }
+        | ApiRequest::ShowEpisodes { .. }
+        | ApiRequest::Track { .. } => Operation::Catalog,
+    }
+}
+
+fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
+    match response {
+        ApiResponse::Discover {
+            result: Ok(playlists),
+            ..
+        } => api.observe_playlists(playlists),
+        ApiResponse::MyPlaylists {
+            result: Ok(page), ..
+        } => api.observe_playlists(&page.items),
+        ApiResponse::Playlist {
+            result: Ok(playlist),
+            ..
+        }
+        | ApiResponse::PlaylistCreated(Ok(playlist)) => api.observe_playlist(playlist),
+        ApiResponse::Search {
+            result: Ok(results),
+            ..
+        } => {
+            if let Some(playlists) = &results.playlists {
+                api.observe_playlists(&playlists.items);
+            }
+        }
+        ApiResponse::Playlist {
+            id,
+            result: Err(error),
+        }
+        | ApiResponse::PlaylistItems {
+            id,
+            result: Err(error),
+            ..
+        }
+        | ApiResponse::PlaylistSample {
+            id,
+            result: Err(error),
+        }
+        | ApiResponse::PlaylistUpdated {
+            id,
+            result: Err(error),
+        }
+        | ApiResponse::PlaylistItemsChanged {
+            id,
+            result: Err(error),
+            ..
+        }
+        | ApiResponse::PlaylistFollowChanged {
+            id,
+            result: Err(error),
+            ..
+        } if error.status() == Some(403) => {
+            api.invalidate_playlist_access(&PlaylistId::new(id.clone()));
+        }
+        _ => {}
+    }
+}
+
+async fn handle(api: &ApiGateway, request: ApiRequest) -> ApiResponse {
+    let selected = api.client_for(operation_for(api, &request));
+    macro_rules! routed {
+        ($method:ident($($argument:expr),* $(,)?)) => {
+            match &selected {
+                Ok((_, client)) => client.$method($($argument),*).await,
+                Err(error) => Err(error.clone()),
+            }
+        };
+    }
+
+    let response = match request {
+        ApiRequest::Me => ApiResponse::Me(routed!(me())),
+        ApiRequest::Devices => ApiResponse::Devices(routed!(devices())),
         ApiRequest::PlaybackState { seq } => ApiResponse::PlaybackState {
             seq,
-            result: api.playback_state().await,
+            result: routed!(playback_state()),
         },
-        ApiRequest::Queue => ApiResponse::Queue(api.queue().await),
+        ApiRequest::Queue => ApiResponse::Queue(routed!(queue())),
         ApiRequest::RecentlyPlayed => {
-            ApiResponse::RecentlyPlayed(api.recently_played(50).await.map(|page| page.items))
+            ApiResponse::RecentlyPlayed(routed!(recently_played(50)).map(|page| page.items))
         }
         ApiRequest::TopTracks { offset, full } => ApiResponse::TopTracks {
-            result: api
-                .top_tracks("short_term", if full { 50 } else { 20 }, offset)
-                .await,
+            result: routed!(top_tracks("short_term", if full { 50 } else { 20 }, offset)),
             offset,
             full,
         },
-        ApiRequest::TopArtists => ApiResponse::TopArtists(
-            api.top_artists("medium_term", 20)
-                .await
-                .map(|page| page.items),
-        ),
+        ApiRequest::TopArtists => {
+            ApiResponse::TopArtists(routed!(top_artists("medium_term", 20)).map(|page| page.items))
+        }
         ApiRequest::Recommendations {
             seed_tracks,
             seed_artists,
         } => {
-            ApiResponse::Recommendations(api.recommendations(&seed_tracks, &seed_artists, 20).await)
+            ApiResponse::Recommendations(routed!(recommendations(&seed_tracks, &seed_artists, 20)))
         }
         ApiRequest::Discover { term } => {
-            let result = api
-                .search(&term, &["playlist"])
-                .await
+            let result = routed!(search(&term, &["playlist"]))
                 .map(|results| results.playlists.map(|page| page.items).unwrap_or_default());
             ApiResponse::Discover { term, result }
         }
         ApiRequest::MyPlaylists { offset } => ApiResponse::MyPlaylists {
             offset,
-            result: api.my_playlists(offset, 50).await,
+            result: routed!(my_playlists(offset, 50)),
         },
         ApiRequest::Playlist { id } => ApiResponse::Playlist {
-            result: api.playlist(&id).await,
+            result: routed!(playlist(&id)),
             id,
         },
         ApiRequest::PlaylistItems { id, offset } => ApiResponse::PlaylistItems {
-            result: api.playlist_items(&id, offset, 100).await,
+            result: routed!(playlist_items(&id, offset, 100)),
             id,
             offset,
         },
         ApiRequest::PlaylistSample { id, offset } => ApiResponse::PlaylistSample {
-            result: api.playlist_items(&id, offset, 100).await,
+            result: routed!(playlist_items(&id, offset, 100)),
             id,
         },
         ApiRequest::CreatePlaylist {
@@ -1907,19 +2728,24 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             name,
             public,
             description,
-        } => ApiResponse::PlaylistCreated(
-            api.create_playlist(&user_id, &name, public, &description)
-                .await,
-        ),
+        } => ApiResponse::PlaylistCreated(routed!(create_playlist(
+            &user_id,
+            &name,
+            public,
+            &description
+        ))),
         ApiRequest::UpdatePlaylist {
             id,
             name,
             description,
             public,
         } => ApiResponse::PlaylistUpdated {
-            result: api
-                .update_playlist(&id, name.as_deref(), description.as_deref(), public)
-                .await,
+            result: routed!(update_playlist(
+                &id,
+                name.as_deref(),
+                description.as_deref(),
+                public
+            )),
             id,
         },
         ApiRequest::AddToPlaylist {
@@ -1927,7 +2753,7 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             playlist_name,
             uris,
         } => ApiResponse::PlaylistItemsChanged {
-            result: api.add_playlist_items(&playlist_id, &uris, None).await,
+            result: routed!(add_playlist_items(&playlist_id, &uris, None)),
             id: playlist_id,
             message: format!("Added to {playlist_name}"),
         },
@@ -1936,9 +2762,11 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             uris,
             snapshot_id,
         } => ApiResponse::PlaylistItemsChanged {
-            result: api
-                .remove_playlist_items(&playlist_id, &uris, snapshot_id.as_deref())
-                .await,
+            result: routed!(remove_playlist_items(
+                &playlist_id,
+                &uris,
+                snapshot_id.as_deref()
+            )),
             id: playlist_id,
             message: "Removed from playlist".to_string(),
         },
@@ -1948,107 +2776,103 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             insert_before,
             snapshot_id,
         } => ApiResponse::PlaylistItemsChanged {
-            result: api
-                .reorder_playlist(
-                    &playlist_id,
-                    range_start,
-                    insert_before,
-                    snapshot_id.as_deref(),
-                )
-                .await,
+            result: routed!(reorder_playlist(
+                &playlist_id,
+                range_start,
+                insert_before,
+                snapshot_id.as_deref()
+            )),
             id: playlist_id,
             message: String::new(),
         },
         ApiRequest::FollowPlaylist { id, follow } => ApiResponse::PlaylistFollowChanged {
             result: if follow {
-                api.follow_playlist(&id).await
+                routed!(follow_playlist(&id))
             } else {
-                api.unfollow_playlist(&id).await
+                routed!(unfollow_playlist(&id))
             },
             id,
             followed: follow,
         },
         ApiRequest::SavedTracks { offset } => ApiResponse::SavedTracks {
             offset,
-            result: api.saved_tracks(offset, 50).await,
+            result: routed!(saved_tracks(offset, 50)),
         },
         ApiRequest::SavedAlbums { offset } => ApiResponse::SavedAlbums {
             offset,
-            result: api.saved_albums(offset, 50).await,
+            result: routed!(saved_albums(offset, 50)),
         },
         ApiRequest::FollowedArtists { after } => ApiResponse::FollowedArtists {
-            result: api.followed_artists(after.as_deref(), 50).await,
+            result: routed!(followed_artists(after.as_deref(), 50)),
             after,
         },
         ApiRequest::SavedShows { offset } => ApiResponse::SavedShows {
             offset,
-            result: api.saved_shows(offset, 50).await,
+            result: routed!(saved_shows(offset, 50)),
         },
         ApiRequest::SavedEpisodes { offset } => ApiResponse::SavedEpisodes {
             offset,
-            result: api.saved_episodes(offset, 50).await,
+            result: routed!(saved_episodes(offset, 50)),
         },
         ApiRequest::SetSaved { uris, saved } => ApiResponse::SavedChanged {
             result: if saved {
-                api.save(&uris).await
+                routed!(save(&uris))
             } else {
-                api.unsave(&uris).await
+                routed!(unsave(&uris))
             },
             uris,
             saved,
         },
         ApiRequest::Contains { uris, user_id } => ApiResponse::Contains {
-            result: api.contains(&uris, &user_id).await,
+            result: routed!(contains(&uris, &user_id)),
             uris,
         },
         ApiRequest::Search { query, serial } => ApiResponse::Search {
-            result: api
-                .search(
-                    &query,
-                    &["track", "artist", "album", "playlist", "show", "episode"],
-                )
-                .await,
+            result: routed!(search(
+                &query,
+                &["track", "artist", "album", "playlist", "show", "episode"]
+            )),
             query,
             serial,
         },
         ApiRequest::Artist { id } => ApiResponse::Artist {
-            result: api.artist(&id).await,
+            result: routed!(artist(&id)),
             id,
         },
         ApiRequest::ArtistTopTracks { id, name } => ApiResponse::ArtistTopTracks {
-            result: api.artist_top_tracks(&id, &name).await,
+            result: routed!(artist_top_tracks(&id, &name)),
             id,
         },
         ApiRequest::ArtistAlbums { id, groups, offset } => ApiResponse::ArtistAlbums {
-            result: api.artist_albums(&id, &groups, offset, 50).await,
+            result: routed!(artist_albums(&id, &groups, offset, 50)),
             id,
             groups,
             offset,
         },
         ApiRequest::RelatedArtists { id } => ApiResponse::RelatedArtists {
-            result: api.related_artists(&id).await,
+            result: routed!(related_artists(&id)),
             id,
         },
         ApiRequest::Album { id } => ApiResponse::Album {
-            result: api.album(&id).await,
+            result: routed!(album(&id)),
             id,
         },
         ApiRequest::AlbumTracks { id, offset } => ApiResponse::AlbumTracks {
-            result: api.album_tracks(&id, offset, 50).await,
+            result: routed!(album_tracks(&id, offset, 50)),
             id,
             offset,
         },
         ApiRequest::Show { id } => ApiResponse::Show {
-            result: api.show(&id).await,
+            result: routed!(show(&id)),
             id,
         },
         ApiRequest::ShowEpisodes { id, offset } => ApiResponse::ShowEpisodes {
-            result: api.show_episodes(&id, offset, 50).await,
+            result: routed!(show_episodes(&id, offset, 50)),
             id,
             offset,
         },
         ApiRequest::Track { id } => ApiResponse::Track {
-            result: api.track(&id).await,
+            result: routed!(track(&id)),
             id,
         },
         ApiRequest::Remote {
@@ -2062,14 +2886,14 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
         } => {
             let device = device_id.as_deref();
             let result = match action {
-                RemoteAction::Play => api.play(device, play.as_ref()).await,
-                RemoteAction::Pause => api.pause(device).await,
-                RemoteAction::Next => api.next(device).await,
-                RemoteAction::Previous => api.previous(device).await,
-                RemoteAction::Seek => api.seek(position_ms, device).await,
-                RemoteAction::Volume => api.set_volume(percent, device).await,
-                RemoteAction::Shuffle => api.set_shuffle(flag, device).await,
-                RemoteAction::Repeat => api.set_repeat(&repeat, device).await,
+                RemoteAction::Play => routed!(play(device, play.as_ref())),
+                RemoteAction::Pause => routed!(pause(device)),
+                RemoteAction::Next => routed!(next(device)),
+                RemoteAction::Previous => routed!(previous(device)),
+                RemoteAction::Seek => routed!(seek(position_ms, device)),
+                RemoteAction::Volume => routed!(set_volume(percent, device)),
+                RemoteAction::Shuffle => routed!(set_shuffle(flag, device)),
+                RemoteAction::Repeat => routed!(set_repeat(&repeat, device)),
             };
             ApiResponse::Remote { action, result }
         }
@@ -2079,8 +2903,8 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             shuffle,
         } => {
             let device = device_id.as_deref();
-            let result = match api.set_shuffle(shuffle, device).await {
-                Ok(()) => api.play(device, Some(&play)).await,
+            let result = match routed!(set_shuffle(shuffle, device)) {
+                Ok(()) => routed!(play(device, Some(&play))),
                 Err(error) => Err(error),
             };
             ApiResponse::Remote {
@@ -2089,7 +2913,7 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             }
         }
         ApiRequest::Transfer { device_id, play } => ApiResponse::Transferred {
-            result: api.transfer(&device_id, play).await,
+            result: routed!(transfer(&device_id, play)),
             device_id,
         },
         ApiRequest::AddToQueue {
@@ -2097,10 +2921,12 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             device_id,
             label,
         } => ApiResponse::QueueAdded {
-            result: api.add_to_queue(&uri, device_id.as_deref()).await,
+            result: routed!(add_to_queue(&uri, device_id.as_deref())),
             label,
         },
-    }
+    };
+    observe_playlists(api, &response);
+    response
 }
 
 /// Spotify's transcription of the track, when the local session can ask for

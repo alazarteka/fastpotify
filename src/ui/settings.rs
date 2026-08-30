@@ -97,7 +97,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Make it even faster",
-            "Spotify limits each app, and everyone shares this one. An app of your own has its own limit, but opens only playlists you own. Paste its Client ID here.",
+            "Spotify limits each app, and everyone shares this one. Add an app of your own for eligible requests; the shared app keeps full playlist coverage. Paste its Client ID here.",
             |ui| {
                 let response = Frame::new()
                     .fill(palette.surface)
@@ -133,46 +133,47 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
-        // Whether the app named above is the one signed in with. Switching
-        // means one more trip through the browser, so it is a button, not a
-        // side effect of typing.
-        let wanted = app
-            .settings
-            .web_client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .unwrap_or(crate::auth::DEFAULT_WEB_CLIENT_ID)
-            .to_string();
-        let own = wanted != crate::auth::DEFAULT_WEB_CLIENT_ID;
-        let in_use = app.web_app.as_deref() == Some(wanted.as_str());
-        if in_use && own {
+        // Authorization is explicit: editing the field never opens a browser.
+        let wanted = app.settings.web_client_id.as_deref();
+        let in_use = wanted.is_some() && app.web_app.as_deref() == wanted;
+        if in_use {
             widgets::setting_row(
                 ui,
                 &palette,
-                "Your app is in use",
-                "Requests go through your own limit.",
+                "Your app is authorized",
+                "Eligible requests use its independent limit; the shared app stays connected.",
                 |ui| {
-                    theme::text(ui, "In use", theme::medium(13.0), palette.accent);
+                    if theme::pill_button(ui, &palette, "Remove", false).clicked() {
+                        app.settings.web_client_id = None;
+                        app.actions.push(Action::ConfigurePersonalWebApp);
+                        changed = true;
+                    }
                 },
             );
-        } else if !in_use && app.web_app.is_some() {
-            let (title, detail) = if own {
-                (
-                    "Ready to switch to your app",
-                    "Fastpotify signs in again with it; your browser opens once.",
-                )
-            } else {
-                (
-                    "Back to the shared app?",
-                    "Fastpotify signs in again with it; your browser opens once.",
-                )
-            };
-            widgets::setting_row(ui, &palette, title, detail, |ui| {
-                if theme::pill_button(ui, &palette, "Switch now", true).clicked() {
-                    app.actions.push(Action::SwitchWebApp);
-                }
-            });
+        } else if wanted.is_some() {
+            widgets::setting_row(
+                ui,
+                &palette,
+                "Authorize your app",
+                "Spotify opens once to add this independent Web API session.",
+                |ui| {
+                    if theme::pill_button(ui, &palette, "Authorize", true).clicked() {
+                        app.actions.push(Action::ConfigurePersonalWebApp);
+                    }
+                },
+            );
+        } else if app.web_app.is_some() {
+            widgets::setting_row(
+                ui,
+                &palette,
+                "Remove personal authorization",
+                "The shared Web API session remains connected.",
+                |ui| {
+                    if theme::pill_button(ui, &palette, "Remove", false).clicked() {
+                        app.actions.push(Action::ConfigurePersonalWebApp);
+                    }
+                },
+            );
         }
     });
 

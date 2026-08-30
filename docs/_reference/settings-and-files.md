@@ -11,7 +11,8 @@ Fastpotify follows each platform's conventions. On Linux:
 | What | Where | Safe to delete? |
 | --- | --- | --- |
 | Settings | `~/.config/fastpotify/settings.json` | Yes, you lose preferences |
-| Web API sign-in | `~/.local/state/fastpotify/secrets-v1/web-api.secret` | Yes, you sign in again |
+| Shared Web API sign-in | `~/.local/state/fastpotify/secrets-v1/web-api.secret` | Yes, you sign in again |
+| Personal Web API sign-in | `~/.local/state/fastpotify/secrets-v1/personal-web-api.secret` | Yes, you authorize your app again |
 | Playback credential | `~/.local/state/fastpotify/secrets-v1/playback.secret` | Yes, you approve playback again |
 | Last session | `~/.local/state/fastpotify/session.json` | Yes |
 | Audio cache | `~/.cache/fastpotify/audio/` | Always |
@@ -21,8 +22,8 @@ Fastpotify follows each platform's conventions. On Linux:
 | Crash log | `~/.local/state/fastpotify/panic.log` | Always |
 
 Clearing caches never signs you out; credentials live in *state*, not
-*cache*, precisely so cleanup tools cannot log you out. Web and playback
-credentials are separate versioned items. On Unix, Fastpotify makes their
+*cache*, precisely so cleanup tools cannot log you out. Shared Web, personal
+Web, and playback credentials are separate versioned items. On Unix, Fastpotify makes their
 directories mode 0700 and files mode 0600, validates ownership and modes on
 read, and replaces files atomically. Windows uses the account ACL inherited
 from the local application-data directory; private-file opens do not follow
@@ -35,8 +36,9 @@ transaction. Unix captures the legacy pathname entry before unlinking it;
 Windows marks the retained handle itself for deletion. A concurrent legacy
 writer's replacement is therefore preserved rather than mistaken for the
 value that was migrated.
-Signing out clears the live providers and playback engine first, attempts to
-delete both new and legacy locations, and reports any partial failure.
+Signing out clears every live provider and the playback engine first, attempts
+to delete all new and legacy credential locations, and reports any partial
+failure. Removing a personal app clears only its provider and credential.
 
 The Windows test suite exercises hard-link rejection, filename locking before
 truncation, and handle-based replacement. The remaining platform validation is
@@ -82,7 +84,7 @@ One readable JSON file, written atomically. The interesting fields:
 | `check_for_updates` | `false` | Ask GitHub at most once a day for a newer release |
 | `lrclib_lyrics` | `false` | Ask LRCLIB when Spotify lyrics are unavailable |
 | `external_services_disclosed` | `false` | Records that the external-service choices were made after their disclosure was shown |
-| `web_client_id` | none | Your own Spotify app id, if you set one |
+| `web_client_id` | none | Optional personal Spotify app id used alongside the shared app |
 
 Both external-service options are off by default. Older settings written
 before the disclosure marker existed are migrated with both options off, even
