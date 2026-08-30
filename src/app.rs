@@ -844,6 +844,7 @@ impl App {
             }
             LocalPlayback::Unavailable => {
                 self.local_ready = false;
+                self.local.connected = false;
                 self.local_device_id = None;
                 if self.queued_play.take().is_some() {
                     self.clear_play_pending();
@@ -851,6 +852,7 @@ impl App {
             }
             LocalPlayback::Failed(message) => {
                 self.local_ready = false;
+                self.local.connected = false;
                 if self.queued_play.take().is_some() {
                     self.clear_play_pending();
                 }
@@ -858,6 +860,7 @@ impl App {
             }
             LocalPlayback::Authorizing | LocalPlayback::Connecting => {
                 self.local_ready = false;
+                self.local.connected = false;
             }
         }
         self.local_playback = status;
@@ -3619,12 +3622,14 @@ mod tests {
         assert_eq!(volume_to_percent(app.settings.volume), 35);
     }
 
-    #[test]
-    fn a_local_play_waits_for_reconnect_without_losing_shuffle() {
+    fn play_queued_during_reconnect() -> App {
         let mut app = headless_app();
-        app.local_ready = true;
-        app.local.connected = false;
+        app.local.connected = true;
         app.handle_playback(LocalPlayback::Connecting);
+        assert!(
+            !app.local.connected,
+            "the retired engine is no longer current"
+        );
         app.play_request(PlayRequest::context("spotify:album:x"), true);
 
         let queued = app.queued_play.as_ref().expect("queued while disconnected");
@@ -3633,25 +3638,86 @@ mod tests {
             Some("spotify:album:x")
         );
         assert!(queued.shuffle_first);
+        assert!(app.optimistic_playing.is_none());
+        app
+    }
 
-        app.handle_local(LocalState {
+    fn connected_snapshot(app: &App) -> LocalState {
+        LocalState {
             connected: true,
             volume: app.local.volume,
             ..LocalState::default()
+        }
+    }
+
+    fn assert_play_dispatched_once(app: &mut App) {
+        assert!(app.queued_play.is_none());
+        let dispatched = app
+            .optimistic_playing
+            .expect("the queued request reached the local player");
+        assert!(dispatched.0);
+
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
         });
+        app.handle_local(connected_snapshot(app));
+        assert_eq!(app.optimistic_playing, Some(dispatched));
+    }
+
+    #[test]
+    fn queued_play_waits_for_ready_after_current_engine_connects() {
+        let mut app = play_queued_during_reconnect();
+
+        app.handle_local(connected_snapshot(&app));
 
         assert!(app.queued_play.is_some());
+        assert!(app.optimistic_playing.is_none());
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
         });
 
-        assert!(app.queued_play.is_none());
+        assert_play_dispatched_once(&mut app);
         assert_eq!(
             app.assumed_context
                 .as_ref()
                 .and_then(|context| context.shuffle),
             Some(true)
         );
+    }
+
+    #[test]
+    fn queued_play_waits_for_current_engine_connection_after_ready() {
+        let mut app = play_queued_during_reconnect();
+
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+        });
+
+        assert!(app.queued_play.is_some());
+        assert!(app.optimistic_playing.is_none());
+        app.handle_local(connected_snapshot(&app));
+
+        assert_play_dispatched_once(&mut app);
+    }
+
+    #[test]
+    fn disconnected_between_connected_and_ready_keeps_play_queued() {
+        let mut app = play_queued_during_reconnect();
+
+        app.handle_local(connected_snapshot(&app));
+        app.handle_local(LocalState {
+            volume: app.local.volume,
+            ..LocalState::default()
+        });
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+        });
+
+        assert!(app.queued_play.is_some());
+        assert!(app.optimistic_playing.is_none());
+        app.handle_local(connected_snapshot(&app));
+
+        assert_play_dispatched_once(&mut app);
     }
 
     #[test]

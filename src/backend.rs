@@ -495,6 +495,86 @@ impl Waker {
     }
 }
 
+/// Keeps callbacks from an engine that has been replaced from publishing
+/// state behind its successor. The mutex orders retirement with channel send,
+/// so a retired callback is either fully delivered first or discarded.
+#[derive(Clone, Default)]
+struct EngineNotificationGuard(Arc<std::sync::Mutex<u64>>);
+
+impl EngineNotificationGuard {
+    fn notifier(
+        &self,
+        events: std::sync::mpsc::Sender<Event>,
+        commands: mpsc::UnboundedSender<Command>,
+        waker: Waker,
+    ) -> crate::player::Notify {
+        let generation = {
+            let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+            *current = current.wrapping_add(1);
+            *current
+        };
+        let active = self.clone();
+        Arc::new(move |event| {
+            let current = active.0.lock().unwrap_or_else(|poison| poison.into_inner());
+            if *current != generation {
+                return;
+            }
+            match event {
+                EngineEvent::State(state) => {
+                    let _ = events.send(Event::Local(Box::new(state)));
+                    waker.wake();
+                }
+                EngineEvent::SessionEnded => {
+                    let _ = commands.send(Command::Reconnect);
+                }
+            }
+            drop(current);
+        })
+    }
+
+    fn retire(&self) {
+        let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        *current = current.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod engine_notification_guard_tests {
+    use super::*;
+
+    #[test]
+    fn retired_engine_cannot_publish_behind_its_successor() {
+        let guard = EngineNotificationGuard::default();
+        let (events, event_rx) = std::sync::mpsc::channel();
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let retired = guard.notifier(events.clone(), commands.clone(), Waker::default());
+        let current = guard.notifier(events, commands, Waker::default());
+
+        current(EngineEvent::State(LocalState {
+            connected: true,
+            ..LocalState::default()
+        }));
+        retired(EngineEvent::State(LocalState::default()));
+        retired(EngineEvent::SessionEnded);
+
+        let Event::Local(state) = event_rx.try_recv().expect("current engine state") else {
+            panic!("the current notifier published an unexpected event");
+        };
+        assert!(state.connected);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        current(EngineEvent::SessionEnded);
+        assert!(matches!(command_rx.try_recv(), Ok(Command::Reconnect)));
+    }
+}
+
 /// The interface's handle to the runtime.
 pub struct Backend {
     commands: mpsc::UnboundedSender<Command>,
@@ -742,6 +822,7 @@ struct Worker {
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
+    engine_notifications: EngineNotificationGuard,
     engine: Option<Arc<Engine>>,
     web_tokens: Option<Arc<WebTokens>>,
     secrets: Arc<dyn SecretStore>,
@@ -785,6 +866,7 @@ impl Worker {
             events,
             commands,
             waker,
+            engine_notifications: EngineNotificationGuard::default(),
             engine: None,
             web_tokens: None,
             secrets,
@@ -868,6 +950,7 @@ impl Worker {
                 Command::SwitchWebApp(client_id) => self.switch_web_app(client_id),
             }
         }
+        self.engine_notifications.retire();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -1073,6 +1156,7 @@ impl Worker {
                 self.credential_epoch = self.credential_epoch.wrapping_add(1);
                 self.engine_busy = false;
                 self.pending_resume = None;
+                self.engine_notifications.retire();
                 if let Some(engine) = self.engine.take() {
                     engine.shutdown();
                 }
@@ -1092,18 +1176,11 @@ impl Worker {
     // ---- local playback engine -------------------------------------------
 
     fn engine_notify(&self) -> crate::player::Notify {
-        let events = self.events.clone();
-        let commands = self.commands.clone();
-        let waker = self.waker.clone();
-        Arc::new(move |event| match event {
-            EngineEvent::State(state) => {
-                let _ = events.send(Event::Local(Box::new(state)));
-                waker.wake();
-            }
-            EngineEvent::SessionEnded => {
-                let _ = commands.send(Command::Reconnect);
-            }
-        })
+        self.engine_notifications.notifier(
+            self.events.clone(),
+            self.commands.clone(),
+            self.waker.clone(),
+        )
     }
 
     /// Bring the engine up from a credential stored by a previous playback
@@ -1160,6 +1237,7 @@ impl Worker {
                 play: interrupted.playing,
                 ..LoadSpec::default()
             });
+            self.engine_notifications.retire();
             engine.shutdown();
         }
         let now = Instant::now();
@@ -1336,6 +1414,7 @@ impl Worker {
                     &credential,
                 ) {
                     self.pending_resume = None;
+                    self.engine_notifications.retire();
                     engine.shutdown();
                     self.emit(Event::Playback(LocalPlayback::Failed(format!(
                         "Spotify connected, but its playback credential could not be stored safely: {error}"
@@ -1354,11 +1433,13 @@ impl Worker {
             }
             (None, _) => {
                 self.pending_resume = None;
+                self.engine_notifications.retire();
                 let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
                 self.emit(Event::Playback(LocalPlayback::Failed(message)));
             }
             (Some(engine), None) => {
                 self.pending_resume = None;
+                self.engine_notifications.retire();
                 engine.shutdown();
                 self.emit(Event::Playback(LocalPlayback::Failed(
                     "Spotify did not return a reusable playback credential".into(),
@@ -1376,6 +1457,7 @@ impl Worker {
         self.premium = premium;
         if premium == Some(false) {
             self.pending_resume = None;
+            self.engine_notifications.retire();
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
             }

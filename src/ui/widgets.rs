@@ -482,6 +482,10 @@ struct Columns {
     more: f32,
 }
 
+fn row_menu_id(response: &egui::Response) -> egui::Id {
+    response.id.with("row-menu")
+}
+
 fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
     let extra_wide = width > 920.0;
     let wide = width > 760.0;
@@ -773,7 +777,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
 
     // More.
     let more_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.more, row_height));
-    let menu_id = ui.id().with(("row-menu", row.index));
+    let menu_id = row_menu_id(&response);
     if hovered || egui::Popup::is_id_open(ui.ctx(), menu_id) {
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -1377,4 +1381,34 @@ pub fn setting_row(
         ui.with_layout(Layout::right_to_left(Align::Center), control);
     });
     ui.add_space(10.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allocated_row_menu_ids(ctx: &egui::Context) -> [egui::Id; 2] {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))),
+            ..Default::default()
+        };
+        let mut ids = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let (_, current) = ui.allocate_exact_size(vec2(300.0, 40.0), Sense::click());
+            let (_, first_queued) = ui.allocate_exact_size(vec2(300.0, 40.0), Sense::click());
+            ids = Some([row_menu_id(&current), row_menu_id(&first_queued)]);
+        });
+        output.textures_delta.clear();
+        ids.expect("the test frame allocated both queue rows")
+    }
+
+    #[test]
+    fn duplicate_data_rows_get_distinct_stable_popup_ids() {
+        let ctx = egui::Context::default();
+        let first_frame = allocated_row_menu_ids(&ctx);
+        let second_frame = allocated_row_menu_ids(&ctx);
+
+        assert_ne!(first_frame[0], first_frame[1]);
+        assert_eq!(first_frame, second_frame);
+    }
 }
