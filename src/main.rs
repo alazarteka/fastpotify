@@ -197,13 +197,20 @@ fn run_control(control: Control) -> i32 {
             0
         }
         Ok(single_instance::Reply::Devices(snapshot)) => {
+            let snapshot = match sanitize_device_reply(&snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!("The running Fastpotify sent an invalid device list: {error}");
+                    return 1;
+                }
+            };
             if raw {
                 println!("{snapshot}");
             } else {
                 match format_devices(&snapshot) {
                     Ok(devices) => print!("{devices}"),
                     Err(error) => {
-                        eprintln!("The running Fastpotify sent an invalid device list: {error}");
+                        eprintln!("The sanitized device list became invalid: {error}");
                         return 1;
                     }
                 }
@@ -250,7 +257,7 @@ fn format_now_playing(snapshot: &str) -> String {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 #[cfg(any(test, not(target_os = "linux")))]
 struct ControlDeviceSnapshot {
     #[serde(default)]
@@ -265,6 +272,22 @@ struct ControlDeviceSnapshot {
     restricted: bool,
     #[serde(default)]
     supports_volume: Option<bool>,
+}
+
+/// Revalidates the raw reply and replaces terminal controls while preserving
+/// optional ids and printable Unicode fields.
+#[cfg(any(test, not(target_os = "linux")))]
+fn sanitize_device_reply(snapshot: &str) -> Result<String, serde_json::Error> {
+    let mut devices: Vec<ControlDeviceSnapshot> = serde_json::from_str(snapshot)?;
+    for device in &mut devices {
+        device.id = device
+            .id
+            .take()
+            .map(|id| single_instance::sanitize_control_field(&id));
+        device.name = single_instance::sanitize_control_field(&device.name);
+        device.kind = single_instance::sanitize_control_field(&device.kind);
+    }
+    serde_json::to_string(&devices)
 }
 
 /// The `devices` snapshot as one line per device, the active one marked.
@@ -351,6 +374,25 @@ mod control_tests {
             "* a\tKitchen speaker\tSpeaker\trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n* \tReceiver\tSpeaker\tnot transferable\n"
         );
         assert!(format_devices("not JSON").is_err());
+    }
+
+    #[test]
+    fn raw_device_output_revalidates_json_and_sanitizes_c1_fields() {
+        let snapshot = format!(
+            r#"[{{"id":"id{control}one","name":"Café{control}東京","kind":"Speaker{control}","active":true,"restricted":false,"supports_volume":true}},{{"id":null,"name":"Receiver","kind":"Audio","active":false,"restricted":false,"supports_volume":null}}]"#,
+            control = '\u{009b}'
+        );
+
+        let raw = sanitize_device_reply(&snapshot).expect("valid device JSON");
+        let devices: Vec<ControlDeviceSnapshot> =
+            serde_json::from_str(&raw).expect("sanitized device JSON");
+
+        assert!(raw.chars().all(|character| !character.is_control()));
+        assert_eq!(devices[0].id.as_deref(), Some("id one"));
+        assert_eq!(devices[0].name, "Café 東京");
+        assert_eq!(devices[0].kind, "Speaker ");
+        assert!(devices[1].id.is_none());
+        assert!(sanitize_device_reply("not JSON").is_err());
     }
 
     #[test]

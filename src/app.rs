@@ -1518,36 +1518,40 @@ impl App {
             return;
         };
         for command in commands {
-            let action = match command {
-                MediaCommand::Play => Some(Action::SetPlaying(true)),
-                MediaCommand::Pause | MediaCommand::Stop => Some(Action::SetPlaying(false)),
-                MediaCommand::PlayPause => Some(Action::TogglePlay),
-                MediaCommand::Next => Some(Action::Next),
-                MediaCommand::Previous => Some(Action::Previous),
-                MediaCommand::SeekBy(offset) => Some(Action::SeekBy(offset)),
-                MediaCommand::SetPosition {
-                    track_uri,
-                    position_ms,
-                } => self
-                    .now_playing()
-                    .filter(|now| now.uri == track_uri)
-                    .map(|_| Action::Seek(position_ms)),
-                MediaCommand::SetVolume(volume) => Some(Action::SetVolume(
-                    (volume.clamp(0.0, 1.0) * 100.0).round() as u8,
-                )),
-                MediaCommand::SetShuffle(shuffle) => Some(Action::SetShuffle(shuffle)),
-                MediaCommand::SetRepeat(mode) => Some(Action::SetRepeat(mode)),
-                MediaCommand::OpenUri(uri) => Some(Action::PlayContext {
-                    uri,
-                    offset_uri: None,
-                    offset_index: None,
-                }),
-                MediaCommand::Raise => Some(Action::ShowWindow),
-                MediaCommand::Quit => Some(Action::Quit),
-            };
-            if let Some(action) = action {
-                self.actions.push(action);
-            }
+            self.handle_media_command(command);
+        }
+    }
+
+    fn handle_media_command(&mut self, command: MediaCommand) {
+        let action = match command {
+            MediaCommand::Play => Some(Action::SetPlaying(true)),
+            MediaCommand::Pause | MediaCommand::Stop => Some(Action::SetPlaying(false)),
+            MediaCommand::PlayPause => Some(Action::TogglePlay),
+            MediaCommand::Next => Some(Action::Next),
+            MediaCommand::Previous => Some(Action::Previous),
+            MediaCommand::SeekBy(offset) => Some(Action::SeekBy(offset)),
+            MediaCommand::SetPosition {
+                track_uri,
+                position_ms,
+            } => self
+                .now_playing()
+                .filter(|now| now.uri == track_uri)
+                .map(|_| Action::Seek(position_ms)),
+            MediaCommand::SetVolume(volume) => Some(Action::SetVolume(
+                (volume.clamp(0.0, 1.0) * 100.0).round() as u8,
+            )),
+            MediaCommand::SetShuffle(shuffle) => Some(Action::SetShuffle(shuffle)),
+            MediaCommand::SetRepeat(mode) => Some(Action::SetRepeat(mode)),
+            MediaCommand::OpenUri(uri) => Some(Action::PlayContext {
+                uri,
+                offset_uri: None,
+                offset_index: None,
+            }),
+            MediaCommand::Raise => Some(Action::ShowWindow),
+            MediaCommand::Quit => Some(Action::Quit),
+        };
+        if let Some(action) = action {
+            self.actions.push(action);
         }
     }
 
@@ -1638,14 +1642,15 @@ impl App {
     }
 
     fn control_devices_snapshot(&self) -> String {
+        let clean = crate::single_instance::sanitize_control_field;
         let devices: Vec<_> = self
             .devices
             .iter()
             .map(|device| {
                 serde_json::json!({
-                    "id": device.id,
-                    "name": device.name,
-                    "kind": device.kind,
+                    "id": device.id.as_deref().map(clean),
+                    "name": clean(&device.name),
+                    "kind": clean(&device.kind),
                     "active": device.is_active,
                     "restricted": device.is_restricted,
                     "supports_volume": device.supports_volume,
@@ -5780,9 +5785,9 @@ mod tests {
         app.saved.insert("spotify:track:t1".to_owned(), true);
         app.devices = vec![
             Device {
-                id: Some("abc123".to_owned()),
-                name: "Kitchen\tspeaker".to_owned(),
-                kind: "Speaker".to_owned(),
+                id: Some("abc\u{009b}123".to_owned()),
+                name: "Kitchen\tspeaker\u{009b}".to_owned(),
+                kind: "Speak\u{009b}er".to_owned(),
                 is_active: true,
                 is_restricted: true,
                 supports_volume: Some(false),
@@ -5790,7 +5795,8 @@ mod tests {
             },
             Device {
                 id: None,
-                name: "Unaddressable".to_owned(),
+                name: "Unaddressable 東京".to_owned(),
+                kind: "Récepteur".to_owned(),
                 is_active: true,
                 ..Device::default()
             },
@@ -5829,13 +5835,15 @@ mod tests {
                 .all(|character| !character.is_control())
         );
         assert_eq!(devices.as_array().map(Vec::len), Some(2));
-        assert_eq!(devices[0]["id"], "abc123");
-        assert_eq!(devices[0]["name"], "Kitchen\tspeaker");
+        assert_eq!(devices[0]["id"], "abc 123");
+        assert_eq!(devices[0]["name"], "Kitchen speaker ");
+        assert_eq!(devices[0]["kind"], "Speak er");
         assert_eq!(devices[0]["active"], true);
         assert_eq!(devices[0]["restricted"], true);
         assert_eq!(devices[0]["supports_volume"], false);
         assert!(devices[1]["id"].is_null());
-        assert_eq!(devices[1]["name"], "Unaddressable");
+        assert_eq!(devices[1]["name"], "Unaddressable 東京");
+        assert_eq!(devices[1]["kind"], "Récepteur");
         assert_eq!(devices[1]["active"], true);
     }
 
@@ -5969,6 +5977,183 @@ mod tests {
         assert!(matches!(actions[1], Action::Previous));
         assert!(matches!(actions[2], Action::SetPlaying(true)));
         assert!(matches!(actions[3], Action::RefreshDevices));
+    }
+
+    fn authorized_transport_gateway(port: u16) -> std::sync::Arc<crate::api::ApiGateway> {
+        use crate::api::{AccountId, ApiSource, NetActivity, TokenProvider};
+
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let api = std::sync::Arc::new(crate::api::ApiGateway::new_at(
+            http,
+            std::sync::Arc::new(NetActivity::default()),
+            &format!("http://127.0.0.1:{port}/v1"),
+        ));
+        let shared = api.begin_verification(ApiSource::Shared, |_| {
+            TokenProvider::Fixed("shared-token".into())
+        });
+        api.install(ApiSource::Shared, shared, AccountId::new("same"))
+            .unwrap();
+        let personal = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-token".into())
+        });
+        api.install(ApiSource::Personal, personal, AccountId::new("same"))
+            .unwrap();
+        api
+    }
+
+    async fn await_dispatched_api_replies(
+        replies: std::sync::mpsc::Receiver<Event>,
+        expected: usize,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let mut received = 0;
+            while received < expected {
+                match replies
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("ordered API reply")
+                {
+                    Event::Api(_) => received += 1,
+                    _ => panic!("the transport fixture only dispatches API requests"),
+                }
+            }
+        })
+        .await
+        .expect("reply collector joins");
+    }
+
+    async fn dispatch_with_first_response_delayed(
+        requests: Vec<ApiRequest>,
+    ) -> (Vec<crate::api::test_support::ObservedRequest>, bool) {
+        use crate::api::test_support::DelayedResponses;
+
+        assert!(
+            matches!(requests.len(), 1 | 2),
+            "the fixture observes one or two mutations"
+        );
+        let request_count = requests.len();
+        let server = DelayedResponses::start(request_count);
+        let replies = crate::backend::dispatch_for_transport_test(
+            authorized_transport_gateway(server.port),
+            requests,
+        );
+        let (observed, arrived_early) = server.observe().await;
+        await_dispatched_api_replies(replies, request_count).await;
+        (observed, arrived_early != 0)
+    }
+
+    #[tokio::test]
+    async fn content_start_and_absolute_state_keep_source_order_at_the_wire() {
+        let mut play_then_pause = headless_app();
+        play_then_pause.local_ready = false;
+        let mut state = active_api_snapshot_on(false, "speaker");
+        state.is_playing = false;
+        deliver_remote_snapshot(&mut play_then_pause, state);
+        play_then_pause.selected_device = Some("speaker".into());
+        play_then_pause.backend.take_api_requests();
+        let controls: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        controls
+            .lock()
+            .expect("control queue")
+            .push(ControlCommand::PlayUri("spotify:track:one".into()));
+        play_then_pause.control_commands = Some(controls);
+        play_then_pause.handle_control_commands();
+        play_then_pause.handle_media_command(MediaCommand::Pause);
+        play_then_pause.apply_actions(&egui::Context::default());
+        assert!(!play_then_pause.believed_playing());
+
+        let (observed, arrived_early) =
+            dispatch_with_first_response_delayed(play_then_pause.backend.take_api_requests()).await;
+        assert!(!arrived_early, "Pause must wait for content loading");
+        assert_eq!(
+            observed[0].request_line,
+            "PUT /v1/me/player/play?device_id=speaker HTTP/1.1"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&observed[0].body)
+                .expect("play request JSON")["uris"][0],
+            "spotify:track:one"
+        );
+        assert_eq!(
+            observed[1].request_line,
+            "PUT /v1/me/player/pause?device_id=speaker HTTP/1.1"
+        );
+
+        let mut pause_then_play = headless_app();
+        pause_then_play.local_ready = false;
+        let mut state = active_api_snapshot_on(false, "speaker");
+        state.is_playing = true;
+        deliver_remote_snapshot(&mut pause_then_play, state);
+        pause_then_play.selected_device = Some("speaker".into());
+        pause_then_play.backend.take_api_requests();
+        let controls: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        controls
+            .lock()
+            .expect("control queue")
+            .push(ControlCommand::Pause);
+        pause_then_play.control_commands = Some(controls);
+        pause_then_play.handle_control_commands();
+        pause_then_play.handle_media_command(MediaCommand::OpenUri("spotify:album:many".into()));
+        pause_then_play.apply_actions(&egui::Context::default());
+        assert!(pause_then_play.believed_playing());
+
+        let (observed, arrived_early) =
+            dispatch_with_first_response_delayed(pause_then_play.backend.take_api_requests()).await;
+        assert!(!arrived_early, "content loading must wait for Pause");
+        assert_eq!(
+            observed[0].request_line,
+            "PUT /v1/me/player/pause?device_id=speaker HTTP/1.1"
+        );
+        assert_eq!(
+            observed[1].request_line,
+            "PUT /v1/me/player/play?device_id=speaker HTTP/1.1"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&observed[1].body)
+                .expect("play request JSON")["context_uri"],
+            "spotify:album:many"
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_mutation_order_is_scoped_to_one_target() {
+        let request = |action, device_id: &str| ApiRequest::Remote {
+            action,
+            device_id: Some(device_id.into()),
+            play: None,
+            position_ms: 0,
+            percent: 0,
+            flag: false,
+            repeat: String::new(),
+        };
+        let (observed, arrived_early) = dispatch_with_first_response_delayed(vec![
+            request(RemoteAction::Play, "speaker-a"),
+            request(RemoteAction::Pause, "speaker-b"),
+        ])
+        .await;
+        assert!(
+            arrived_early,
+            "a different target must not wait for the delayed target"
+        );
+        assert_eq!(
+            observed.len(),
+            2,
+            "a different target must not wait for the delayed target"
+        );
+        let mut lines: Vec<_> = observed
+            .iter()
+            .map(|request| request.request_line.as_str())
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(
+            lines,
+            [
+                "PUT /v1/me/player/pause?device_id=speaker-b HTTP/1.1",
+                "PUT /v1/me/player/play?device_id=speaker-a HTTP/1.1",
+            ]
+        );
     }
 
     #[tokio::test]

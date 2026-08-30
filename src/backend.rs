@@ -6,7 +6,8 @@
 //! the interface with `request_repaint`, so the app stays event-driven and
 //! idle when nothing is happening.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
@@ -15,8 +16,8 @@ use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::api::models::*;
 use crate::api::{
-    AccountId, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest, PlaylistId,
-    SessionState, TokenProvider, WebTokens,
+    AccountId, ApiClient, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest,
+    PlaylistId, SessionState, TokenProvider, WebTokens,
 };
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
@@ -216,6 +217,19 @@ impl ApiRequest {
                 | Self::PlaylistSample { .. }
                 | Self::Contains { .. }
         )
+    }
+
+    /// Player mutations for one Spotify Connect target must reach the Web API
+    /// in command-loop order. A content-bearing play is still a play mutation;
+    /// target ids split queues so an unrelated device is never held behind it.
+    fn playback_mutation_target(&self) -> Option<Option<String>> {
+        match self {
+            Self::Remote { device_id, .. }
+            | Self::PlayWithShuffle { device_id, .. }
+            | Self::AddToQueue { device_id, .. } => Some(device_id.clone()),
+            Self::Transfer { device_id, .. } => Some(Some(device_id.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -1406,6 +1420,7 @@ struct Worker {
     http: reqwest::Client,
     api: Arc<ApiGateway>,
     background_api: Arc<Semaphore>,
+    playback_mutations: PlaybackMutationQueues,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -1448,6 +1463,7 @@ impl Worker {
             web_client_id,
             api: Arc::new(ApiGateway::new(http.clone(), activity)),
             background_api: Arc::new(Semaphore::new(4)),
+            playback_mutations: PlaybackMutationQueues::default(),
             http,
             art,
             events,
@@ -2590,43 +2606,17 @@ impl Worker {
     // ---- api ----------------------------------------------------------------
 
     fn dispatch(&self, request: ApiRequest) {
-        let api = Arc::clone(&self.api);
-        let background_api = Arc::clone(&self.background_api);
-        let background = request.background();
-        let events = self.events.clone();
-        let waker = self.waker.clone();
-        let commands = self.commands.clone();
-        tokio::spawn(async move {
-            let _background_permit = if background {
-                background_api.acquire_owned().await.ok()
-            } else {
-                None
-            };
-            let response = handle(&api, request).await;
-            if let Some(ApiError::SignInExpired {
-                api_source,
-                session_generation,
-            }) = response.error()
-            {
-                if !api.is_current(*api_source, *session_generation) {
-                    return;
-                }
-                let _ = commands.send(Command::WebSessionExpired {
-                    source: *api_source,
-                    generation: *session_generation,
-                });
-            }
-            if let ApiResponse::Me(result) = &response {
-                let premium = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|user| user.product.as_deref())
-                    .map(|product| product == "premium");
-                let _ = commands.send(Command::AccountChecked { premium });
-            }
-            let _ = events.send(Event::Api(Box::new(response)));
-            waker.wake();
-        });
+        dispatch_api(
+            ApiDispatchContext {
+                api: Arc::clone(&self.api),
+                background_api: Arc::clone(&self.background_api),
+                events: self.events.clone(),
+                commands: self.commands.clone(),
+                waker: self.waker.clone(),
+            },
+            &self.playback_mutations,
+            request,
+        );
     }
 
     fn accent(&self, url: String) {
@@ -2646,6 +2636,165 @@ impl Worker {
             }
         });
     }
+}
+
+#[derive(Clone)]
+struct ApiDispatchContext {
+    api: Arc<ApiGateway>,
+    background_api: Arc<Semaphore>,
+    events: std::sync::mpsc::Sender<Event>,
+    commands: mpsc::UnboundedSender<Command>,
+    waker: Waker,
+}
+
+#[derive(Default)]
+struct PlaybackMutationQueues {
+    queues: Mutex<HashMap<Option<String>, Weak<PlaybackMutationQueue>>>,
+}
+
+impl PlaybackMutationQueues {
+    fn enqueue(
+        &self,
+        target: Option<String>,
+        request: PlaybackMutation,
+    ) -> (Arc<PlaybackMutationQueue>, bool) {
+        let queue = {
+            let mut queues = self
+                .queues
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            queues.retain(|_, queue| queue.strong_count() > 0);
+            match queues.get(&target).and_then(Weak::upgrade) {
+                Some(queue) => queue,
+                None => {
+                    let queue = Arc::new(PlaybackMutationQueue::default());
+                    queues.insert(target, Arc::downgrade(&queue));
+                    queue
+                }
+            }
+        };
+        let start_worker = queue.enqueue(request);
+        (queue, start_worker)
+    }
+}
+
+#[derive(Default)]
+struct PlaybackMutationQueue {
+    state: Mutex<PlaybackMutationQueueState>,
+}
+
+#[derive(Default)]
+struct PlaybackMutationQueueState {
+    pending: VecDeque<PlaybackMutation>,
+    running: bool,
+}
+
+type RoutedClient = Result<(ApiSource, Arc<ApiClient>), ApiError>;
+
+struct PlaybackMutation {
+    request: ApiRequest,
+    client: RoutedClient,
+}
+
+impl PlaybackMutationQueue {
+    fn enqueue(&self, request: PlaybackMutation) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.pending.push_back(request);
+        if state.running {
+            false
+        } else {
+            state.running = true;
+            true
+        }
+    }
+
+    fn next(&self) -> Option<PlaybackMutation> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match state.pending.pop_front() {
+            Some(request) => Some(request),
+            None => {
+                state.running = false;
+                None
+            }
+        }
+    }
+}
+
+fn dispatch_api(
+    context: ApiDispatchContext,
+    playback_mutations: &PlaybackMutationQueues,
+    request: ApiRequest,
+) {
+    if let Some(target) = request.playback_mutation_target() {
+        // Bind queued work to the session selected now. Replacing that
+        // session clears this client's provider instead of rerouting an old
+        // command through its successor.
+        let client = context
+            .api
+            .client_for(operation_for(&context.api, &request));
+        let (queue, start_worker) =
+            playback_mutations.enqueue(target, PlaybackMutation { request, client });
+        if start_worker {
+            tokio::spawn(async move {
+                while let Some(mutation) = queue.next() {
+                    dispatch_one(&context, mutation.request, Some(mutation.client)).await;
+                }
+            });
+        }
+    } else {
+        tokio::spawn(async move {
+            dispatch_one(&context, request, None).await;
+        });
+    }
+}
+
+async fn dispatch_one(
+    context: &ApiDispatchContext,
+    request: ApiRequest,
+    selected: Option<RoutedClient>,
+) {
+    let background = request.background();
+    let _background_permit = if background {
+        Arc::clone(&context.background_api)
+            .acquire_owned()
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let response = match selected {
+        Some(selected) => handle_routed(&context.api, request, selected).await,
+        None => handle(&context.api, request).await,
+    };
+    if let Some(ApiError::SignInExpired {
+        api_source,
+        session_generation,
+    }) = response.error()
+    {
+        if !context.api.is_current(*api_source, *session_generation) {
+            return;
+        }
+        let _ = context.commands.send(Command::WebSessionExpired {
+            source: *api_source,
+            generation: *session_generation,
+        });
+    }
+    if let ApiResponse::Me(result) = &response {
+        let premium = result
+            .as_ref()
+            .ok()
+            .and_then(|user| user.product.as_deref())
+            .map(|product| product == "premium");
+        let _ = context.commands.send(Command::AccountChecked { premium });
+    }
+    let _ = context.events.send(Event::Api(Box::new(response)));
+    context.waker.wake();
 }
 
 fn friendly_connect_error(error: &anyhow::Error) -> String {
@@ -2772,6 +2921,14 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
 
 async fn handle(api: &ApiGateway, request: ApiRequest) -> ApiResponse {
     let selected = api.client_for(operation_for(api, &request));
+    handle_routed(api, request, selected).await
+}
+
+async fn handle_routed(
+    api: &ApiGateway,
+    request: ApiRequest,
+    selected: RoutedClient,
+) -> ApiResponse {
     macro_rules! routed {
         ($method:ident($($argument:expr),* $(,)?)) => {
             match &selected {
@@ -3034,6 +3191,29 @@ pub(crate) async fn handle_for_transport_test(
     request: ApiRequest,
 ) -> ApiResponse {
     handle(api, request).await
+}
+
+/// Exercises the production dispatcher while a transport test controls when
+/// each loopback response is released.
+#[cfg(test)]
+pub(crate) fn dispatch_for_transport_test(
+    api: Arc<ApiGateway>,
+    requests: Vec<ApiRequest>,
+) -> std::sync::mpsc::Receiver<Event> {
+    let (events, replies) = std::sync::mpsc::channel();
+    let (commands, _command_replies) = mpsc::unbounded_channel();
+    let context = ApiDispatchContext {
+        api,
+        background_api: Arc::new(Semaphore::new(4)),
+        events,
+        commands,
+        waker: Waker::default(),
+    };
+    let playback_mutations = PlaybackMutationQueues::default();
+    for request in requests {
+        dispatch_api(context.clone(), &playback_mutations, request);
+    }
+    replies
 }
 
 /// Spotify's transcription of the track, when the local session can ask for
