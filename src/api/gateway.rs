@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::ApiSource;
-use super::client::{ApiClient, ApiError, NetActivity, TokenProvider};
+use super::client::{ApiClient, ApiError, BASE_URL, NetActivity, TokenProvider};
 use super::models::Playlist;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -131,35 +131,114 @@ fn classify_playlist(account: &AccountId, playlist: &Playlist) -> PlaylistAccess
 }
 
 struct Session {
-    state: RwLock<SessionState>,
+    live: RwLock<LiveSession>,
     generation: AtomicU64,
+    http: reqwest::Client,
+    activity: Arc<NetActivity>,
+    profile: ApiProfile,
+    base_url: String,
+}
+
+struct LiveSession {
+    state: SessionState,
     client: Arc<ApiClient>,
 }
 
 impl Session {
-    fn new(http: reqwest::Client, activity: Arc<NetActivity>, profile: ApiProfile) -> Self {
+    fn new(
+        http: reqwest::Client,
+        activity: Arc<NetActivity>,
+        profile: ApiProfile,
+        base_url: &str,
+    ) -> Self {
+        let client = Self::make_client(&http, &activity, profile, base_url);
         Self {
-            state: RwLock::new(SessionState::Unavailable),
+            live: RwLock::new(LiveSession {
+                state: SessionState::Unavailable,
+                client,
+            }),
             generation: AtomicU64::new(0),
-            client: Arc::new(ApiClient::new(
-                http,
-                activity,
-                profile.search_limit,
-                profile.artist_albums_limit,
-                profile.source,
-            )),
+            http,
+            activity,
+            profile,
+            base_url: base_url.to_owned(),
         }
     }
 
+    fn make_client(
+        http: &reqwest::Client,
+        activity: &Arc<NetActivity>,
+        profile: ApiProfile,
+        base_url: &str,
+    ) -> Arc<ApiClient> {
+        Arc::new(ApiClient::new_at(
+            http.clone(),
+            Arc::clone(activity),
+            profile.search_limit,
+            profile.artist_albums_limit,
+            profile.source,
+            base_url,
+        ))
+    }
+
+    fn fresh_client(&self) -> Arc<ApiClient> {
+        Self::make_client(&self.http, &self.activity, self.profile, &self.base_url)
+    }
+
+    fn client(&self) -> Arc<ApiClient> {
+        Arc::clone(
+            &self
+                .live
+                .read()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .client,
+        )
+    }
+
+    fn ready_client(&self) -> Option<Arc<ApiClient>> {
+        let live = self.live.read().unwrap_or_else(|lock| lock.into_inner());
+        matches!(live.state, SessionState::Ready { .. }).then(|| Arc::clone(&live.client))
+    }
+
+    fn replace_client(
+        &self,
+        provider: Option<TokenProvider>,
+        state: SessionState,
+    ) -> Arc<ApiClient> {
+        let client = self.fresh_client();
+        client.set_token_provider(provider);
+        let previous = {
+            let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+            live.state = state;
+            std::mem::replace(&mut live.client, Arc::clone(&client))
+        };
+        previous.set_token_provider(None);
+        client
+    }
+
     fn state(&self) -> SessionState {
-        self.state
+        self.live
             .read()
             .unwrap_or_else(|lock| lock.into_inner())
+            .state
             .clone()
     }
 
+    #[cfg(test)]
     fn set_state(&self, state: SessionState) {
-        *self.state.write().unwrap_or_else(|lock| lock.into_inner()) = state;
+        self.live
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .state = state;
+    }
+
+    fn set_ready_if_current(&self, generation: u64, account: AccountId) -> bool {
+        let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+        if self.generation() != generation || !matches!(live.state, SessionState::Authorizing) {
+            return false;
+        }
+        live.state = SessionState::Ready { account };
+        true
     }
 
     fn generation(&self) -> u64 {
@@ -179,9 +258,22 @@ pub struct ApiGateway {
 
 impl ApiGateway {
     pub fn new(http: reqwest::Client, activity: Arc<NetActivity>) -> Self {
+        Self::new_at(http, activity, BASE_URL)
+    }
+
+    pub(crate) fn new_at(
+        http: reqwest::Client,
+        activity: Arc<NetActivity>,
+        base_url: &str,
+    ) -> Self {
         Self {
-            shared: Session::new(http.clone(), Arc::clone(&activity), ApiProfile::SHARED),
-            personal: Session::new(http, activity, ApiProfile::PERSONAL),
+            shared: Session::new(
+                http.clone(),
+                Arc::clone(&activity),
+                ApiProfile::SHARED,
+                base_url,
+            ),
+            personal: Session::new(http, activity, ApiProfile::PERSONAL, base_url),
             playlist_access: Mutex::new(HashMap::new()),
         }
     }
@@ -207,15 +299,12 @@ impl ApiGateway {
         }
         let session = self.session(source);
         let generation = session.next_generation();
-        session
-            .client
-            .set_token_provider(Some(provider(generation)));
-        session.set_state(SessionState::Authorizing);
+        session.replace_client(Some(provider(generation)), SessionState::Authorizing);
         generation
     }
 
     pub fn verification_client(&self, source: ApiSource) -> Arc<ApiClient> {
-        Arc::clone(&self.session(source).client)
+        self.session(source).client()
     }
 
     /// Marks a verified session ready. The shared session is the canonical
@@ -261,8 +350,9 @@ impl ApiGateway {
             },
         }
         self.session(source)
-            .set_state(SessionState::Ready { account });
-        Ok(())
+            .set_ready_if_current(generation, account)
+            .then_some(())
+            .ok_or(ApiError::NotSignedIn)
     }
 
     pub fn clear(&self, source: ApiSource) {
@@ -277,8 +367,7 @@ impl ApiGateway {
     fn clear_session(&self, source: ApiSource) {
         let session = self.session(source);
         session.next_generation();
-        session.client.set_token_provider(None);
-        session.set_state(SessionState::Unavailable);
+        session.replace_client(None, SessionState::Unavailable);
         if source == ApiSource::Shared {
             self.playlist_access
                 .lock()
@@ -323,11 +412,9 @@ impl ApiGateway {
     ) -> Result<(ApiSource, Arc<ApiClient>), ApiError> {
         let source = plan(operation, self.personal_ready());
         let session = self.session(source);
-        if !matches!(session.state(), SessionState::Ready { .. }) {
-            return Err(ApiError::NotSignedIn);
-        }
+        let client = session.ready_client().ok_or(ApiError::NotSignedIn)?;
         log::debug!("Spotify route operation={operation:?} source={source}");
-        Ok((source, Arc::clone(&session.client)))
+        Ok((source, client))
     }
 
     pub fn playlist_access(&self, id: &str) -> PlaylistAccess {
@@ -552,5 +639,134 @@ mod tests {
         ));
         assert!(gateway.clear_if_current(ApiSource::Shared, current));
         assert_eq!(gateway.state(ApiSource::Shared), SessionState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn replaced_personal_generation_cannot_mutate_successor_transport_state() {
+        use crate::api::test_support::{read_request, write_response};
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for index in 0..5 {
+                let (stream, _) = listener.accept().expect("API request");
+                let request = read_request(&stream);
+                observed_tx.send(request).expect("test receives request");
+                match index {
+                    0 => write_response(
+                        stream,
+                        "404 Not Found",
+                        &[],
+                        r#"{"error":{"status":404,"message":"gone"}}"#,
+                    ),
+                    1 => {
+                        release_rx.recv().expect("release old response");
+                        write_response(
+                            stream,
+                            "429 Too Many Requests",
+                            &[("retry-after", "1")],
+                            r#"{"error":{"status":429,"message":"slow"}}"#,
+                        );
+                    }
+                    2..=4 => write_response(stream, "200 OK", &[], "{}"),
+                    _ => unreachable!(),
+                }
+            }
+        });
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let gateway = Arc::new(ApiGateway::new_at(
+            http,
+            Arc::new(NetActivity::default()),
+            &format!("http://127.0.0.1:{port}/v1"),
+        ));
+        let shared = gateway
+            .begin_verification(ApiSource::Shared, |_| TokenProvider::Fixed("shared".into()));
+        gateway
+            .install(ApiSource::Shared, shared, AccountId::new("same"))
+            .unwrap();
+        let old_generation =
+            gateway.begin_verification(ApiSource::Personal, |_| TokenProvider::Fixed("old".into()));
+        gateway
+            .install(ApiSource::Personal, old_generation, AccountId::new("same"))
+            .unwrap();
+        let old_client = gateway.verification_client(ApiSource::Personal);
+        let old_request_client = Arc::clone(&old_client);
+        let old_request =
+            tokio::spawn(async move { old_request_client.playlist_items("old", 0, 100).await });
+
+        let first = observed_rx.recv().await.expect("old modern request");
+        assert!(
+            first
+                .request_line
+                .starts_with("GET /v1/playlists/old/items?")
+        );
+        assert_eq!(first.authorization.as_deref(), Some("Bearer old"));
+        let old_fallback = observed_rx.recv().await.expect("old fallback request");
+        assert!(
+            old_fallback
+                .request_line
+                .starts_with("GET /v1/playlists/old/tracks?")
+        );
+        assert_eq!(old_fallback.authorization.as_deref(), Some("Bearer old"));
+
+        let new_generation =
+            gateway.begin_verification(ApiSource::Personal, |_| TokenProvider::Fixed("new".into()));
+        gateway
+            .install(ApiSource::Personal, new_generation, AccountId::new("same"))
+            .unwrap();
+        let new_client = gateway.verification_client(ApiSource::Personal);
+        release_tx.send(()).expect("release old fallback 429");
+        for _ in 0..100 {
+            if old_client.cooldown_active().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(old_client.cooldown_active().await);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            new_client.playlist_items("new", 0, 100),
+        )
+        .await
+        .expect("successor does not inherit the old cooldown")
+        .expect("successor request succeeds");
+        let second = observed_rx.recv().await.expect("new modern request");
+        assert!(
+            second
+                .request_line
+                .starts_with("GET /v1/playlists/new/items?")
+        );
+        assert_eq!(second.authorization.as_deref(), Some("Bearer new"));
+
+        old_request
+            .await
+            .expect("old task joins")
+            .expect("old fallback succeeds");
+        let old_retry = observed_rx.recv().await.expect("old fallback retry");
+        assert!(
+            old_retry
+                .request_line
+                .starts_with("GET /v1/playlists/old/tracks?")
+        );
+
+        new_client
+            .playlist_items("new-again", 0, 100)
+            .await
+            .expect("successor keeps modern endpoints");
+        let final_request = observed_rx.recv().await.expect("final modern request");
+        assert!(
+            final_request
+                .request_line
+                .starts_with("GET /v1/playlists/new-again/items?")
+        );
+        assert_eq!(final_request.authorization.as_deref(), Some("Bearer new"));
+        server.join().expect("server exits");
     }
 }

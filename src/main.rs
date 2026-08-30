@@ -185,7 +185,8 @@ fn control_request(control: &Control) -> (String, bool) {
 #[cfg(not(target_os = "linux"))]
 fn run_control(control: Control) -> i32 {
     let (verb, raw) = control_request(&control);
-    match single_instance::send(&verb) {
+    let dirs = paths::AppDirs::discover();
+    match single_instance::send(&dirs, &verb) {
         Ok(single_instance::Reply::Ok) => 0,
         Ok(single_instance::Reply::NowPlaying(snapshot)) => {
             if raw {
@@ -418,7 +419,7 @@ fn main() -> eframe::Result<()> {
     #[cfg(not(feature = "demo"))]
     let guarded = true;
     let instance = if guarded {
-        match single_instance::acquire(&waker) {
+        match single_instance::acquire(&dirs, &waker) {
             single_instance::Outcome::Only(guard) => Some(guard),
             single_instance::Outcome::Surfaced => {
                 log::info!("Fastpotify is already running; asked it to show its window");

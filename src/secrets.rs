@@ -626,6 +626,47 @@ pub fn read_private_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>
     read_private_file(path, limit, false)
 }
 
+/// Deletes an owner-private file only if it still contains the caller's
+/// expected bytes. A process-lifetime lease uses this to avoid removing a
+/// newer owner's replacement file during shutdown.
+pub fn delete_private_if_matches(path: &Path, expected: &[u8], limit: usize) -> Result<bool> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "private file has no parent directory".into(),
+    })?;
+    ensure_private_dir(parent)?;
+    let _parent_guard = platform_file::lock_directory(parent)?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io("inspect a private file before deletion", path, error)),
+    };
+    validate_file_metadata(path, &metadata, true)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    platform_file::configure_legacy(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|error| io("open a private file before deletion", path, error))?;
+    validate_open_file(path, &file, true)?;
+    let contents = read_open_bounded(path, &mut file, limit)?;
+    if contents != expected {
+        return Ok(false);
+    }
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stem = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let captured = parent.join(format!(
+        ".{stem}.deleting-{}-{sequence}",
+        std::process::id()
+    ));
+    platform_file::delete_prepared_legacy(&mut file, path, &captured, expected, limit)?;
+    sync_parent(parent)?;
+    Ok(true)
+}
+
 fn validate_or_harden_directory(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     if is_link_or_reparse(metadata) || !metadata.is_dir() {
         return Err(SecretError::UnsafePath {

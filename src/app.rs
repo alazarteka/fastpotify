@@ -3769,9 +3769,9 @@ impl App {
                 public,
                 add_uris,
             } => {
-                let Some(user_id) = self.user_id().map(str::to_string) else {
+                if self.user_id().is_none() {
                     return;
-                };
+                }
                 self.playlist_busy = true;
                 self.dialog = Some(Dialog::CreatePlaylist {
                     name: name.clone(),
@@ -3779,7 +3779,6 @@ impl App {
                     add_uris,
                 });
                 self.backend.api(ApiRequest::CreatePlaylist {
-                    user_id,
                     name,
                     public,
                     description: String::new(),

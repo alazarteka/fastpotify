@@ -87,7 +87,6 @@ pub enum ApiRequest {
         offset: u32,
     },
     CreatePlaylist {
-        user_id: String,
         name: String,
         public: bool,
         description: String,
@@ -1229,6 +1228,74 @@ mod api_routing_tests {
                 },
             ),
             Operation::UnsupportedDevelopmentMode
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_creation_uses_the_personal_me_endpoint() {
+        use crate::api::test_support::{read_request, write_response};
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("playlist request");
+            let request = read_request(&stream);
+            write_response(
+                stream,
+                "200 OK",
+                &[],
+                r#"{"id":"created","name":"Road mix"}"#,
+            );
+            request
+        });
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let api = ApiGateway::new_at(
+            http,
+            Arc::new(NetActivity::default()),
+            &format!("http://127.0.0.1:{port}/v1"),
+        );
+        let shared = api.begin_verification(ApiSource::Shared, |_| {
+            TokenProvider::Fixed("shared-token".into())
+        });
+        api.install(ApiSource::Shared, shared, AccountId::new("same"))
+            .unwrap();
+        let personal = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-token".into())
+        });
+        api.install(ApiSource::Personal, personal, AccountId::new("same"))
+            .unwrap();
+
+        let response = handle(
+            &api,
+            ApiRequest::CreatePlaylist {
+                name: "Road mix".into(),
+                public: false,
+                description: "For later".into(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response,
+            ApiResponse::PlaylistCreated(Ok(Playlist { ref id, .. })) if id == "created"
+        ));
+        let request = server.join().expect("server exits");
+        assert_eq!(request.request_line, "POST /v1/me/playlists HTTP/1.1");
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer personal-token")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).expect("playlist JSON"),
+            serde_json::json!({
+                "name": "Road mix",
+                "public": false,
+                "description": "For later",
+            })
         );
     }
 }
@@ -2743,16 +2810,10 @@ async fn handle(api: &ApiGateway, request: ApiRequest) -> ApiResponse {
             id,
         },
         ApiRequest::CreatePlaylist {
-            user_id,
             name,
             public,
             description,
-        } => ApiResponse::PlaylistCreated(routed!(create_playlist(
-            &user_id,
-            &name,
-            public,
-            &description
-        ))),
+        } => ApiResponse::PlaylistCreated(routed!(create_playlist(&name, public, &description))),
         ApiRequest::UpdatePlaylist {
             id,
             name,

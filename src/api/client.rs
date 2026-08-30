@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use super::ApiSource;
 use super::models::*;
 
-const BASE_URL: &str = "https://api.spotify.com/v1";
+pub(crate) const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -90,23 +90,33 @@ fn is_quota_exhausted(body: &str) -> bool {
 #[derive(Clone)]
 pub enum TokenProvider {
     Web(std::sync::Arc<WebTokens>),
+    #[cfg(test)]
+    Fixed(String),
 }
 
 impl TokenProvider {
     async fn access_token(&self) -> Result<String> {
         match self {
             Self::Web(tokens) => tokens.access_token(false).await,
+            #[cfg(test)]
+            Self::Fixed(token) => Ok(token.clone()),
         }
     }
 
     async fn invalidate(&self) -> Result<()> {
-        let Self::Web(tokens) = self;
-        tokens.access_token(true).await.map(drop)
+        match self {
+            Self::Web(tokens) => tokens.access_token(true).await.map(drop),
+            #[cfg(test)]
+            Self::Fixed(_) => Ok(()),
+        }
     }
 
     fn deactivate(&self) {
-        let Self::Web(tokens) = self;
-        tokens.deactivate();
+        match self {
+            Self::Web(tokens) => tokens.deactivate(),
+            #[cfg(test)]
+            Self::Fixed(_) => {}
+        }
     }
 }
 
@@ -356,6 +366,7 @@ impl Drop for ActivityGuard<'_> {
 
 pub struct ApiClient {
     http: reqwest::Client,
+    base_url: String,
     tokens: Mutex<Option<TokenProvider>>,
     limiter: Semaphore,
     cooldown_until: tokio::sync::Mutex<Instant>,
@@ -374,8 +385,27 @@ impl ApiClient {
         artist_albums_limit: u32,
         source: ApiSource,
     ) -> Self {
+        Self::new_at(
+            http,
+            activity,
+            search_limit,
+            artist_albums_limit,
+            source,
+            BASE_URL,
+        )
+    }
+
+    pub(crate) fn new_at(
+        http: reqwest::Client,
+        activity: Arc<NetActivity>,
+        search_limit: u32,
+        artist_albums_limit: u32,
+        source: ApiSource,
+        base_url: &str,
+    ) -> Self {
         Self {
             http,
+            base_url: base_url.trim_end_matches('/').to_owned(),
             tokens: Mutex::new(None),
             limiter: Semaphore::new(MAX_IN_FLIGHT),
             cooldown_until: tokio::sync::Mutex::new(Instant::now()),
@@ -433,6 +463,11 @@ impl ApiClient {
         *until = (*until).max(Instant::now() + wait);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cooldown_active(&self) -> bool {
+        *self.cooldown_until.lock().await > Instant::now()
+    }
+
     // ---- transport -------------------------------------------------------
 
     async fn send(
@@ -445,7 +480,7 @@ impl ApiClient {
         let url = if path.starts_with("http") {
             path.to_string()
         } else {
-            format!("{BASE_URL}{path}")
+            format!("{}{path}", self.base_url)
         };
         let provider = self.provider()?;
         let started = Instant::now();
@@ -788,19 +823,13 @@ impl ApiClient {
 
     pub async fn create_playlist(
         &self,
-        user_id: &str,
         name: &str,
         public: bool,
         description: &str,
     ) -> Result<Playlist> {
         let body = json!({ "name": name, "public": public, "description": description });
         let value = self
-            .write(
-                Method::POST,
-                &format!("/users/{user_id}/playlists"),
-                &[],
-                Some(&body),
-            )
+            .write(Method::POST, "/me/playlists", &[], Some(&body))
             .await?
             .unwrap_or(Value::Null);
         serde_json::from_value(value).map_err(|error| ApiError::Decode(error.to_string()))

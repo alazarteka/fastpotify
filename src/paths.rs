@@ -47,6 +47,13 @@ impl AppDirs {
         self.state.join("session.json")
     }
 
+    /// Process-lifetime authentication for the non-Linux control socket.
+    /// This is deliberately outside the Spotify credential store: signing
+    /// out must not break activation of the still-running application.
+    pub fn control_token_file(&self) -> PathBuf {
+        self.state.join("control-ipc.secret")
+    }
+
     /// Versioned owner-private Web and playback credential files.
     pub fn secrets_dir(&self) -> PathBuf {
         self.state.join("secrets-v1")
