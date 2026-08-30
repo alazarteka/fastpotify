@@ -35,7 +35,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let panel = egui::Panel::left("sidebar")
         .resizable(true)
         .default_size(app.settings.sidebar_width)
-        .size_range(210.0..=440.0)
+        .size_range(crate::settings::SIDEBAR_WIDTH_MIN..=crate::settings::SIDEBAR_WIDTH_MAX)
         .show_separator_line(false)
         .frame(Frame::new().fill(palette.panel).inner_margin(Margin {
             left: 12,
@@ -114,6 +114,18 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         theme::text(ui, "Your Library", theme::bold(15.0), palette.text);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if theme::icon_button(
+                ui,
+                Icon::PanelLeft,
+                18.0,
+                palette.secondary,
+                palette.text,
+                "Hide sidebar (Ctrl+B)",
+            )
+            .clicked()
+            {
+                app.actions.push(Action::ToggleSidebar);
+            }
             let add = theme::icon_button(
                 ui,
                 Icon::Plus,

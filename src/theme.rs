@@ -353,6 +353,7 @@ pub enum Icon {
     Music,
     Pause,
     PauseFilled,
+    PanelLeft,
     Pencil,
     Play,
     PlayFilled,
@@ -438,6 +439,7 @@ const ICONS: &[(Icon, &str, &[u8])] = icons! {
     Music => "music",
     Pause => "pause",
     PauseFilled => "pause-filled",
+    PanelLeft => "panel-left",
     Pencil => "pencil",
     Play => "play",
     PlayFilled => "play-filled",
@@ -534,6 +536,9 @@ pub fn icon_button(
     if tooltip.is_empty() {
         response
     } else {
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+        });
         response.on_hover_text(tooltip)
     }
 }

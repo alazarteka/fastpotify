@@ -73,6 +73,11 @@ One readable JSON file, written atomically. The interesting fields:
 | `audio_cache_mb` | `1024` | On-disk audio cache budget |
 | `theme` | `dark` | `dark`, `light`, or `system` |
 | `accent_from_art` | `true` | Tint pages with album art |
+| `sidebar_visible` | `true` | Show the library sidebar |
+| `sidebar_width` | `250` | Library sidebar width |
+| `lyrics_width` | `360` | Lyrics panel width |
+| `queue_width` | `360` | Queue panel width |
+| `zoom` | `1.0` | Interface zoom from 50% to 250% |
 | `keep_playing_in_background` | `true` | Keep playing after the window closes |
 | `check_for_updates` | `false` | Ask GitHub at most once a day for a newer release |
 | `lrclib_lyrics` | `false` | Ask LRCLIB when Spotify lyrics are unavailable |
@@ -83,6 +88,11 @@ Both external-service options are off by default. Older settings written
 before the disclosure marker existed are migrated with both options off, even
 if an old build had enabled release checks by default. Enabling either switch
 in Settings records that the disclosure was shown.
+
+`session.json` carries restorable runtime state separately from preferences:
+the current page, recent and resumed playback, shuffle and table sorting,
+window geometry, and whether the queue panel was open. Older files remain
+valid; missing fields use their defaults.
 
 ## Command line
 
@@ -108,7 +118,7 @@ interface work. Demo mode never writes settings.
 
 `--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
 and `--demo-show` adds surfaces on top of it: a comma separated list of
-`queue`, `devices`, `shortcuts`, `create`, and `light`.
+`queue`, `devices`, `shortcuts`, `create`, `light`, and `focus`.
 
 `--demo-shot <PATH>` writes the window to a PNG and exits, which is how the
 screenshots in these pages are made:

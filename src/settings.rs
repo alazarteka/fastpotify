@@ -8,6 +8,19 @@ use serde::{Deserialize, Serialize};
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
 
+pub const SIDEBAR_WIDTH_MIN: f32 = 210.0;
+pub const SIDEBAR_WIDTH_MAX: f32 = 440.0;
+pub const LYRICS_WIDTH_MIN: f32 = 280.0;
+pub const LYRICS_WIDTH_MAX: f32 = 640.0;
+pub const QUEUE_WIDTH_MIN: f32 = 280.0;
+pub const QUEUE_WIDTH_MAX: f32 = 560.0;
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 2.5;
+
+const SIDEBAR_WIDTH_DEFAULT: f32 = 250.0;
+const PANEL_WIDTH_DEFAULT: f32 = 360.0;
+const ZOOM_DEFAULT: f32 = 1.0;
+
 fn load_private_json<T>(path: &Path, max_bytes: usize, kind: &str) -> T
 where
     T: DeserializeOwned + Default,
@@ -90,7 +103,11 @@ pub struct Settings {
     pub accent_from_art: bool,
     /// Last local volume, 0..=65535.
     pub volume: u16,
+    /// Whether the library sidebar is visible.
+    pub sidebar_visible: bool,
     pub sidebar_width: f32,
+    pub lyrics_width: f32,
+    pub queue_width: f32,
     pub search_history: Vec<String>,
     pub show_shortcut_hints: bool,
     /// A personal Spotify Web API application id, if the user registered one.
@@ -110,6 +127,8 @@ pub struct Settings {
     pub external_services_disclosed: bool,
     /// Context URIs pinned to the top of the sidebar, in pin order.
     pub pinned_contexts: Vec<String>,
+    /// Interface zoom, egui's zoom factor; Ctrl+plus/minus changes it.
+    pub zoom: f32,
 }
 
 impl Default for Settings {
@@ -127,7 +146,10 @@ impl Default for Settings {
             theme: ThemeChoice::Dark,
             accent_from_art: true,
             volume: (u16::MAX as u32 * 70 / 100) as u16,
-            sidebar_width: 250.0,
+            sidebar_visible: true,
+            sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            lyrics_width: PANEL_WIDTH_DEFAULT,
+            queue_width: PANEL_WIDTH_DEFAULT,
             search_history: Vec::new(),
             show_shortcut_hints: true,
             web_client_id: None,
@@ -137,6 +159,7 @@ impl Default for Settings {
             lrclib_lyrics: false,
             external_services_disclosed: false,
             pinned_contexts: Vec::new(),
+            zoom: ZOOM_DEFAULT,
         }
     }
 }
@@ -145,7 +168,30 @@ impl Settings {
     pub fn load(path: &Path) -> Self {
         let mut settings = load_private_json(path, MAX_SETTINGS_BYTES, "settings");
         Self::enforce_external_service_consent(&mut settings);
+        settings.normalize_layout();
         settings
+    }
+
+    pub(crate) fn normalize_layout(&mut self) {
+        self.sidebar_width = bounded_f32(
+            self.sidebar_width,
+            SIDEBAR_WIDTH_MIN,
+            SIDEBAR_WIDTH_MAX,
+            SIDEBAR_WIDTH_DEFAULT,
+        );
+        self.lyrics_width = bounded_f32(
+            self.lyrics_width,
+            LYRICS_WIDTH_MIN,
+            LYRICS_WIDTH_MAX,
+            PANEL_WIDTH_DEFAULT,
+        );
+        self.queue_width = bounded_f32(
+            self.queue_width,
+            QUEUE_WIDTH_MIN,
+            QUEUE_WIDTH_MAX,
+            PANEL_WIDTH_DEFAULT,
+        );
+        self.zoom = bounded_f32(self.zoom, ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT);
     }
 
     fn enforce_external_service_consent(settings: &mut Self) {
@@ -180,6 +226,14 @@ impl Settings {
     }
 }
 
+fn bounded_f32(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
 /// Restorable UI session: what was open when the app last closed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -195,6 +249,12 @@ pub struct SessionState {
     pub shuffle_on: bool,
     /// Each table's chosen sort, keyed by its encoded page.
     pub sorts: Vec<(String, crate::model::TableSort)>,
+    /// Last window inner size, to restore on next launch.
+    pub window_size: Option<[f32; 2]>,
+    /// Last window outer position, to restore on next launch.
+    pub window_pos: Option<[f32; 2]>,
+    /// Whether the queue panel was open.
+    pub queue_open: Option<bool>,
 }
 
 impl SessionState {
@@ -246,15 +306,44 @@ mod tests {
     }
 
     #[test]
+    fn older_settings_keep_desktop_layout_defaults() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.sidebar_visible);
+        assert_eq!(settings.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(settings.lyrics_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(settings.queue_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(settings.zoom, ZOOM_DEFAULT);
+    }
+
+    #[test]
+    fn desktop_layout_values_are_normalized_before_use() {
+        let mut settings = Settings {
+            sidebar_width: 10.0,
+            lyrics_width: 5_000.0,
+            queue_width: f32::INFINITY,
+            zoom: 10.0,
+            ..Settings::default()
+        };
+        settings.normalize_layout();
+        assert_eq!(settings.sidebar_width, SIDEBAR_WIDTH_MIN);
+        assert_eq!(settings.lyrics_width, LYRICS_WIDTH_MAX);
+        assert_eq!(settings.queue_width, PANEL_WIDTH_DEFAULT);
+        assert_eq!(settings.zoom, ZOOM_MAX);
+    }
+
+    #[test]
     fn older_session_files_default_new_persistence_fields() {
         let session: SessionState =
             serde_json::from_str(r#"{"last_page":"home","last_position_ms":1200}"#).unwrap();
         assert!(!session.shuffle_on);
         assert!(session.sorts.is_empty());
+        assert_eq!(session.window_size, None);
+        assert_eq!(session.window_pos, None);
+        assert_eq!(session.queue_open, None);
     }
 
     #[test]
-    fn shuffle_and_table_sort_round_trip_together() {
+    fn playback_and_desktop_session_state_round_trip_together() {
         let session = SessionState {
             shuffle_on: true,
             sorts: vec![(
@@ -264,6 +353,9 @@ mod tests {
                     ascending: false,
                 },
             )],
+            window_size: Some([1280.0, 800.0]),
+            window_pos: Some([120.0, 80.0]),
+            queue_open: Some(true),
             ..SessionState::default()
         };
         let restored: SessionState =

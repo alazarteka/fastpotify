@@ -469,6 +469,35 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
+        widgets::setting_row(
+            ui,
+            &palette,
+            "Interface zoom",
+            "Ctrl+Plus and Ctrl+Minus work anywhere; Ctrl+0 resets.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let mut zoom = app.settings.zoom;
+                    if theme::soft_button(ui, &palette, None, "-", false).clicked() {
+                        zoom = (zoom - 0.1).max(crate::settings::ZOOM_MIN);
+                    }
+                    theme::text(
+                        ui,
+                        format!("{:.0}%", zoom * 100.0),
+                        theme::medium(13.5),
+                        palette.text,
+                    );
+                    if theme::soft_button(ui, &palette, None, "+", false).clicked() {
+                        zoom = (zoom + 0.1).min(crate::settings::ZOOM_MAX);
+                    }
+                    if (zoom - app.settings.zoom).abs() > 0.001 {
+                        app.settings.zoom = zoom;
+                        ui.ctx().set_zoom_factor(zoom);
+                        changed = true;
+                    }
+                });
+            },
+        );
     });
 
     section(ui, &palette, "Storage", |ui| {

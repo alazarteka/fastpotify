@@ -39,6 +39,9 @@ fn nav_button(
         theme::paint_icon(ui, icon, rect, 20.0, color);
     }
     if enabled {
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+        });
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(tooltip)
@@ -56,6 +59,17 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         |ui| {
             ui.add_space(super::widgets::PAGE_PADDING);
             ui.spacing_mut().item_spacing.x = 8.0;
+            if !app.settings.sidebar_visible {
+                if nav_button(ui, &palette, Icon::PanelLeft, true, "Show sidebar (Ctrl+B)")
+                    .clicked()
+                {
+                    app.actions.push(Action::ToggleSidebar);
+                }
+                ui.add_space(2.0);
+                if nav_button(ui, &palette, Icon::House, true, "Home").clicked() {
+                    app.actions.push(Action::Open(Page::Home));
+                }
+            }
             if nav_button(ui, &palette, Icon::ChevronLeft, app.can_go_back(), "Back").clicked() {
                 app.actions.push(Action::Back);
             }

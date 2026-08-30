@@ -47,6 +47,26 @@ const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
 /// waiting for the ordinary poll.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
 const CONTAINS_BATCH: usize = 50;
+const WINDOW_MIN_SIZE: [f32; 2] = [400.0, 300.0];
+const WINDOW_MAX_SIZE: [f32; 2] = [3000.0, 2000.0];
+const WINDOW_POSITION_MIN: f32 = -1000.0;
+const WINDOW_POSITION_MAX: f32 = 5000.0;
+
+fn valid_window_size(size: [f32; 2]) -> bool {
+    (WINDOW_MIN_SIZE[0]..=WINDOW_MAX_SIZE[0]).contains(&size[0])
+        && (WINDOW_MIN_SIZE[1]..=WINDOW_MAX_SIZE[1]).contains(&size[1])
+}
+
+fn valid_window_position(position: [f32; 2]) -> bool {
+    (WINDOW_POSITION_MIN..=WINDOW_POSITION_MAX).contains(&position[0])
+        && (WINDOW_POSITION_MIN..=WINDOW_POSITION_MAX).contains(&position[1])
+}
+
+fn geometry_changed(previous: Option<[f32; 2]>, current: [f32; 2]) -> bool {
+    previous.is_none_or(|previous| {
+        (previous[0] - current[0]).abs() > 1.0 || (previous[1] - current[1]).abs() > 1.0
+    })
+}
 
 pub struct RemoteSnapshot {
     pub state: PlaybackState,
@@ -165,6 +185,8 @@ pub struct App {
     pub offline: bool,
     pub palette: Palette,
     applied_dark: Option<bool>,
+    /// The saved zoom has been applied to this window's context once.
+    zoom_applied: bool,
 
     pub auth: AuthStatus,
     pub user: Option<User>,
@@ -233,6 +255,9 @@ pub struct App {
     remote_recheck_at: Option<Instant>,
     pub seek_preview: Option<f32>,
     pub volume_preview: Option<f32>,
+    /// Last valid window geometry, restored whenever the window is recreated.
+    last_window_size: Option<[f32; 2]>,
+    last_window_pos: Option<[f32; 2]>,
     last_eviction: Instant,
     pub sign_in_url: Option<String>,
     /// The Web API application the current sign-in belongs to, so Settings
@@ -306,7 +331,8 @@ const GLIDE_START: f32 = 120.0;
 const GLIDE_STOP: f32 = 40.0;
 
 impl App {
-    pub fn new(waker: &Waker, dirs: AppDirs, settings: Settings, options: AppOptions) -> Self {
+    pub fn new(waker: &Waker, dirs: AppDirs, mut settings: Settings, options: AppOptions) -> Self {
+        settings.normalize_layout();
         let engine_config = engine_config(&dirs, &settings);
         let backend = Backend::spawn(
             dirs.clone(),
@@ -331,6 +357,10 @@ impl App {
             .and_then(Page::decode)
             .filter(|page| !matches!(page, Page::Settings | Page::Queue))
             .unwrap_or(Page::Home);
+        let last_window_size = session.window_size.filter(|size| valid_window_size(*size));
+        let last_window_pos = session
+            .window_pos
+            .filter(|position| valid_window_position(*position));
 
         let mut app = Self {
             dirs,
@@ -350,6 +380,7 @@ impl App {
             offline: false,
             palette: Palette::dark(),
             applied_dark: None,
+            zoom_applied: false,
             auth: AuthStatus::Starting,
             user: None,
             local_device_id: None,
@@ -382,7 +413,7 @@ impl App {
             accents: HashMap::new(),
             accent_pending: HashSet::new(),
             dialog: None,
-            show_queue_panel: false,
+            show_queue_panel: session.queue_open.unwrap_or(false),
             show_lyrics_panel: false,
             lyrics_uri: None,
             lyrics: Loadable::NotLoaded,
@@ -398,6 +429,8 @@ impl App {
             remote_recheck_at: None,
             seek_preview: None,
             volume_preview: None,
+            last_window_size,
+            last_window_pos,
             last_eviction: Instant::now(),
             sign_in_url: None,
             web_app: None,
@@ -453,6 +486,7 @@ impl App {
             ThemeChoice::System => egui::ThemePreference::System,
         });
         self.applied_dark = None;
+        self.zoom_applied = false;
         self.window_hidden = false;
         self.hide_intent = false;
         self.wants_show = false;
@@ -465,6 +499,19 @@ impl App {
         }
         if let Some(tray) = &mut self.tray {
             tray.attach();
+        }
+        if let Some(size) = self.last_window_size {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                size[0], size[1],
+            )));
+        }
+        if let Some(position) = self.last_window_pos {
+            // This is a no-op on Wayland; the bounds keep a stale monitor
+            // layout from marooning the window elsewhere.
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                position[0],
+                position[1],
+            )));
         }
         // egui's consensus wheel speed is 40 points per line, about a third
         // of what every other player scrolls per notch; trackpads report
@@ -1017,6 +1064,26 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
+        if !self.zoom_applied {
+            self.zoom_applied = true;
+            if (ctx.zoom_factor() - self.settings.zoom).abs() > 0.001 {
+                ctx.set_zoom_factor(self.settings.zoom);
+            }
+        } else {
+            let requested = ctx.zoom_factor();
+            let zoom = if requested.is_finite() {
+                requested.clamp(crate::settings::ZOOM_MIN, crate::settings::ZOOM_MAX)
+            } else {
+                1.0
+            };
+            if (requested - zoom).abs() > 0.001 {
+                ctx.set_zoom_factor(zoom);
+            }
+            if (zoom - self.settings.zoom).abs() > 0.001 {
+                self.settings.zoom = zoom;
+                self.mark_settings_dirty();
+            }
+        }
         self.toasts
             .retain(|toast| toast.created.elapsed() < TOAST_LIFETIME);
 
@@ -3328,8 +3395,13 @@ impl App {
                 self.history_index = 0;
                 self.mark_session_dirty();
             }
+            Action::ToggleSidebar => {
+                self.settings.sidebar_visible = !self.settings.sidebar_visible;
+                self.mark_settings_dirty();
+            }
             Action::ToggleQueuePanel => {
                 self.show_queue_panel = !self.show_queue_panel;
+                self.mark_session_dirty();
                 if self.show_queue_panel {
                     self.show_lyrics_panel = false;
                     self.refresh_queue(true);
@@ -3338,6 +3410,9 @@ impl App {
             Action::ToggleLyricsPanel => {
                 self.show_lyrics_panel = !self.show_lyrics_panel;
                 if self.show_lyrics_panel {
+                    if self.show_queue_panel {
+                        self.mark_session_dirty();
+                    }
                     self.show_queue_panel = false;
                     self.lyrics_following = true;
                     self.request_lyrics();
@@ -3485,6 +3560,25 @@ impl App {
         crate::ui::show(self, ui);
         self.apply_actions(ctx);
         self.sync_media_controls();
+
+        let mut geometry_dirty = false;
+        if let Some(rect) = ctx.input(|input| input.viewport().inner_rect) {
+            let size = [rect.width(), rect.height()];
+            if valid_window_size(size) && geometry_changed(self.last_window_size, size) {
+                self.last_window_size = Some(size);
+                geometry_dirty = true;
+            }
+        }
+        if let Some(rect) = ctx.input(|input| input.viewport().outer_rect) {
+            let position = [rect.min.x, rect.min.y];
+            if valid_window_position(position) && geometry_changed(self.last_window_pos, position) {
+                self.last_window_pos = Some(position);
+                geometry_dirty = true;
+            }
+        }
+        if geometry_dirty {
+            self.mark_session_dirty();
+        }
 
         let playing = self.now_playing().is_some_and(|now| now.playing);
         if playing {
@@ -3655,6 +3749,9 @@ impl App {
                 last_position_ms: self.resume_position_ms,
                 shuffle_on: self.shuffle_wanted,
                 sorts,
+                window_size: self.last_window_size,
+                window_pos: self.last_window_pos,
+                queue_open: Some(self.show_queue_panel),
             }
             .save(&self.dirs.session_file());
         }
@@ -3743,6 +3840,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn window_geometry_rejects_unusable_session_values() {
+        assert!(valid_window_size([1240.0, 800.0]));
+        assert!(!valid_window_size([399.0, 800.0]));
+        assert!(!valid_window_size([1240.0, f32::NAN]));
+        assert!(valid_window_position([-500.0, 2400.0]));
+        assert!(!valid_window_position([5001.0, 0.0]));
+        assert!(!valid_window_position([f32::INFINITY, 0.0]));
+    }
+
+    #[test]
+    fn geometry_changes_ignore_subpixel_noise() {
+        assert!(!geometry_changed(Some([1000.0, 700.0]), [1000.5, 699.5]));
+        assert!(geometry_changed(Some([1000.0, 700.0]), [1002.0, 700.0]));
+        assert!(geometry_changed(None, [1000.0, 700.0]));
+    }
+
+    #[test]
     fn volume_conversions_round_trip() {
         assert_eq!(volume_to_percent(u16::MAX), 100);
         assert_eq!(volume_to_percent(0), 0);
@@ -3771,6 +3885,11 @@ mod tests {
         app
     }
 
+    fn egui_pass(ctx: &egui::Context, run_ui: impl FnMut(&mut egui::Ui)) {
+        let mut output = ctx.run_ui(Default::default(), run_ui);
+        output.textures_delta.clear();
+    }
+
     fn snapshot_at(percent: u8) -> LocalState {
         LocalState {
             volume: percent_to_volume(percent),
@@ -3783,6 +3902,44 @@ mod tests {
         let mut app = headless_app();
         app.set_volume(80, true);
         assert_eq!(volume_to_percent(app.settings.volume), 80);
+        assert!(app.settings_dirty);
+    }
+
+    #[test]
+    fn panel_and_sidebar_actions_dirty_their_own_state_files() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        app.actions.push(Action::ToggleQueuePanel);
+        app.apply_actions(&ctx);
+        assert!(app.show_queue_panel);
+        assert!(app.session_dirty);
+
+        app.session_dirty = false;
+        app.actions.push(Action::ToggleSidebar);
+        app.apply_actions(&ctx);
+        assert!(!app.settings.sidebar_visible);
+        assert!(app.settings_dirty);
+        assert!(!app.session_dirty);
+    }
+
+    #[test]
+    fn interface_zoom_is_applied_once_then_tracks_bounded_context_changes() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.settings.zoom = 1.4;
+
+        egui_pass(&ctx, |ui| app.tick(ui.ctx()));
+        egui_pass(&ctx, |_| {});
+        assert!((ctx.zoom_factor() - 1.4).abs() < 0.001);
+
+        app.settings_dirty = false;
+        ctx.set_zoom_factor(4.0);
+        egui_pass(&ctx, |_| {});
+        egui_pass(&ctx, |ui| app.tick(ui.ctx()));
+        egui_pass(&ctx, |_| {});
+        assert_eq!(ctx.zoom_factor(), crate::settings::ZOOM_MAX);
+        assert_eq!(app.settings.zoom, crate::settings::ZOOM_MAX);
         assert!(app.settings_dirty);
     }
 

@@ -98,6 +98,7 @@ media keys, so there is only ever one.
 | `S` / `R` | Shuffle / cycle repeat |
 | `Q` | Queue panel |
 | `Ctrl+F` or `/` | Search |
+| `Ctrl+B` | Show or hide the sidebar |
 | `Alt+←` / `Alt+→` | Back or forward |
 | `Ctrl+H` / `Ctrl+L` | Home / Liked Songs |
 | `Ctrl+Shift+A` / `Ctrl+Shift+B` | Playing artist / album |
@@ -111,6 +112,7 @@ On macOS, `Cmd` replaces `Ctrl`.
 
 Everything lives in Settings (Ctrl+,): the Connect device name, audio
 quality up to 320 kbps, volume normalisation, autoplay, gapless playback,
-the audio backend on Linux, the audio cache size, themes, album-art
-tinting, and the close-to-tray behaviour. Playback settings apply with one
-button that restarts the local player; nothing else needs a restart.
+the audio backend on Linux, the audio cache size, themes, interface layout
+and zoom, album-art tinting, and the close-to-tray behaviour. Playback
+settings apply with one button that restarts the local player; nothing else
+needs a restart.
