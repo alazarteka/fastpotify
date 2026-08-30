@@ -218,6 +218,8 @@ pub struct LoadSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerCommand {
     Toggle,
+    /// An absolute Spirc play or pause, for ordered command batches.
+    SetPlaying(bool),
     Next,
     Previous,
     Seek(u32),
@@ -438,6 +440,8 @@ impl Engine {
         let spirc = &self.spirc;
         match command {
             PlayerCommand::Toggle => spirc.play_pause()?,
+            PlayerCommand::SetPlaying(true) => spirc.play()?,
+            PlayerCommand::SetPlaying(false) => spirc.pause()?,
             PlayerCommand::Next => spirc.next()?,
             PlayerCommand::Previous => spirc.prev()?,
             PlayerCommand::Seek(position_ms) => spirc.set_position_ms(position_ms)?,

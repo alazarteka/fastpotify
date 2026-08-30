@@ -1465,12 +1465,11 @@ impl App {
         let commands: Vec<ControlCommand> =
             std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         for command in commands {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
                 ControlCommand::PlayPause => Some(Action::TogglePlay),
-                ControlCommand::Play => (!playing).then_some(Action::TogglePlay),
-                ControlCommand::Pause => playing.then_some(Action::TogglePlay),
+                ControlCommand::Play => Some(Action::SetPlaying(true)),
+                ControlCommand::Pause => Some(Action::SetPlaying(false)),
                 ControlCommand::Next => Some(Action::Next),
                 ControlCommand::Previous => Some(Action::Previous),
                 ControlCommand::SeekBy(offset) => Some(Action::SeekBy(offset)),
@@ -1519,10 +1518,9 @@ impl App {
             return;
         };
         for command in commands {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
             let action = match command {
-                MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
-                MediaCommand::Pause | MediaCommand::Stop => playing.then_some(Action::TogglePlay),
+                MediaCommand::Play => Some(Action::SetPlaying(true)),
+                MediaCommand::Pause | MediaCommand::Stop => Some(Action::SetPlaying(false)),
                 MediaCommand::PlayPause => Some(Action::TogglePlay),
                 MediaCommand::Next => Some(Action::Next),
                 MediaCommand::Previous => Some(Action::Previous),
@@ -1623,8 +1621,7 @@ impl App {
             (None, true) => self.settings.device_name.as_str(),
             (None, false) => "",
         };
-        // Tabs separate the fields, so a tab inside one would shift the rest.
-        let clean = |text: &str| text.replace(['\t', '\r', '\n'], " ");
+        let clean = crate::single_instance::sanitize_control_field;
         format!(
             "{state}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{saved}\t{}",
             clean(&now.title),
@@ -1644,15 +1641,15 @@ impl App {
         let devices: Vec<_> = self
             .devices
             .iter()
-            .filter_map(|device| {
-                Some(serde_json::json!({
-                    "id": device.id.as_deref()?,
+            .map(|device| {
+                serde_json::json!({
+                    "id": device.id,
                     "name": device.name,
                     "kind": device.kind,
                     "active": device.is_active,
                     "restricted": device.is_restricted,
                     "supports_volume": device.supports_volume,
-                }))
+                })
             })
             .collect();
         serde_json::to_string(&devices)
@@ -3270,6 +3267,34 @@ impl App {
         }
     }
 
+    fn set_playing(&mut self, wanted: bool) {
+        if !wanted && self.queued_play.take().is_some() {
+            self.clear_play_pending();
+            return;
+        }
+        if self.believed_playing() == wanted {
+            return;
+        }
+        match self.target() {
+            Target::Local if wanted && !self.local.is_active() => self.toggle_play(),
+            Target::Local => {
+                self.backend.player(PlayerCommand::SetPlaying(wanted));
+                self.optimistic_playing = Some((wanted, Instant::now()));
+            }
+            Target::Remote(device_id) => {
+                self.set_play_pending(vec!["::set-playing".into()]);
+                let action = if wanted {
+                    RemoteAction::Play
+                } else {
+                    RemoteAction::Pause
+                };
+                if self.remote(action, device_id) {
+                    self.optimistic_playing = Some((wanted, Instant::now()));
+                }
+            }
+        }
+    }
+
     fn seek(&mut self, position_ms: u32) {
         match self.target() {
             Target::Local => self.backend.player(PlayerCommand::Seek(position_ms)),
@@ -3638,6 +3663,7 @@ impl App {
             },
             Action::ShufflePlay(uri) => self.play_request(PlayRequest::context(uri), true),
             Action::TogglePlay => self.toggle_play(),
+            Action::SetPlaying(playing) => self.set_playing(playing),
             Action::Next => match self.target() {
                 Target::Local => self.backend.player(PlayerCommand::Next),
                 Target::Remote(device_id) => {
@@ -5688,15 +5714,15 @@ mod tests {
     }
 
     #[test]
-    fn control_snapshots_append_state_and_publish_device_capabilities() {
+    fn control_snapshots_sanitize_fields_and_publish_idless_device_capabilities() {
         let mut app = headless_app();
         app.handle_local(LocalState {
             connected: true,
             playback: Playback::Playing,
             track: Some(crate::player::LocalTrack {
                 uri: "spotify:track:t1".to_owned(),
-                title: "Go\tNow\n".to_owned(),
-                artists: vec!["The Band".to_owned()],
+                title: "Go\tNow\n\u{1b}[31m\u{7}".to_owned(),
+                artists: vec!["The\u{0} Band".to_owned()],
                 album: "First".to_owned(),
                 art_url: Some("https://i.scdn.co/image/abc".to_owned()),
                 duration_ms: 200_000,
@@ -5722,6 +5748,7 @@ mod tests {
             Device {
                 id: None,
                 name: "Unaddressable".to_owned(),
+                is_active: true,
                 ..Device::default()
             },
         ];
@@ -5738,8 +5765,8 @@ mod tests {
             fields,
             [
                 "playing",
-                "Go Now ",
-                "The Band",
+                "Go Now  [31m ",
+                "The  Band",
                 "First",
                 "20000",
                 "200000",
@@ -5751,12 +5778,22 @@ mod tests {
                 "Fastpotify",
             ]
         );
-        assert_eq!(devices.as_array().map(Vec::len), Some(1));
+        assert_eq!(fields.len(), 12);
+        assert!(
+            fields
+                .iter()
+                .flat_map(|field| field.chars())
+                .all(|character| !character.is_control())
+        );
+        assert_eq!(devices.as_array().map(Vec::len), Some(2));
         assert_eq!(devices[0]["id"], "abc123");
         assert_eq!(devices[0]["name"], "Kitchen\tspeaker");
         assert_eq!(devices[0]["active"], true);
         assert_eq!(devices[0]["restricted"], true);
         assert_eq!(devices[0]["supports_volume"], false);
+        assert!(devices[1]["id"].is_null());
+        assert_eq!(devices[1]["name"], "Unaddressable");
+        assert_eq!(devices[1]["active"], true);
     }
 
     #[test]
@@ -5783,26 +5820,137 @@ mod tests {
         assert!(!app.control_devices_stale);
     }
 
-    /// `play` and `pause` say what state to end in, so the one that would
-    /// undo the current state does nothing.
     #[test]
-    fn play_and_pause_do_not_toggle_the_wrong_way() {
-        let mut app = headless_app();
+    fn batched_absolute_play_pause_obeys_the_last_command_in_all_orders() {
+        let cases = [
+            (
+                false,
+                [ControlCommand::Play, ControlCommand::Pause],
+                false,
+                &[RemoteAction::Play, RemoteAction::Pause][..],
+            ),
+            (
+                false,
+                [ControlCommand::Pause, ControlCommand::Play],
+                true,
+                &[RemoteAction::Play][..],
+            ),
+            (
+                true,
+                [ControlCommand::Play, ControlCommand::Pause],
+                false,
+                &[RemoteAction::Pause][..],
+            ),
+            (
+                true,
+                [ControlCommand::Pause, ControlCommand::Play],
+                true,
+                &[RemoteAction::Pause, RemoteAction::Play][..],
+            ),
+        ];
+        for (started_playing, commands, expected, expected_remote) in cases {
+            let remote_commands = commands.clone();
+            let mut app = headless_app();
+            let local = active_local_snapshot(
+                &app,
+                false,
+                if started_playing {
+                    Playback::Playing
+                } else {
+                    Playback::Paused
+                },
+            );
+            app.handle_local(local);
+            let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+            queue.lock().expect("the queue").extend(commands);
+            app.control_commands = Some(queue);
+
+            app.handle_control_commands();
+            app.apply_actions(&egui::Context::default());
+
+            assert_eq!(app.believed_playing(), expected);
+            let expected_local: Vec<_> = expected_remote
+                .iter()
+                .map(|action| PlayerCommand::SetPlaying(*action == RemoteAction::Play))
+                .collect();
+            assert_eq!(
+                app.backend.take_player_commands(),
+                expected_local,
+                "expected {} absolute local transitions",
+                expected_remote.len()
+            );
+
+            let mut remote = headless_app();
+            remote.local_ready = false;
+            let mut state = active_api_snapshot_on(false, "speaker");
+            state.is_playing = started_playing;
+            deliver_remote_snapshot(&mut remote, state);
+            remote.selected_device = Some("speaker".into());
+            remote.backend.take_api_requests();
+            let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+            queue.lock().expect("the queue").extend(remote_commands);
+            remote.control_commands = Some(queue);
+
+            remote.handle_control_commands();
+            remote.apply_actions(&egui::Context::default());
+
+            let remote_actions: Vec<_> = remote
+                .backend
+                .take_api_requests()
+                .into_iter()
+                .filter_map(|request| match request {
+                    ApiRequest::Remote { action, .. } => Some(action),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(remote.believed_playing(), expected);
+            assert_eq!(remote_actions, expected_remote);
+        }
+    }
+
+    #[test]
+    fn absolute_play_pause_batch_preserves_state_when_target_rejects_it() {
+        for (started_playing, commands) in [
+            (false, [ControlCommand::Play, ControlCommand::Pause]),
+            (true, [ControlCommand::Pause, ControlCommand::Play]),
+        ] {
+            let mut app = headless_app();
+            app.local_ready = false;
+            let mut state = active_api_snapshot_on(false, "restricted");
+            state.is_playing = started_playing;
+            state.device.as_mut().expect("device").is_restricted = true;
+            deliver_remote_snapshot(&mut app, state);
+            app.selected_device = Some("restricted".into());
+            app.backend.take_api_requests();
+            let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+            queue.lock().expect("the queue").extend(commands);
+            app.control_commands = Some(queue);
+
+            app.handle_control_commands();
+            app.apply_actions(&egui::Context::default());
+
+            assert_eq!(app.believed_playing(), started_playing);
+            assert!(app.backend.take_api_requests().is_empty());
+            assert!(
+                app.toasts
+                    .iter()
+                    .any(|toast| toast.message.contains("restricted"))
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_pause_cancels_a_play_queued_during_reconnect() {
+        let mut app = play_queued_during_reconnect();
         let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
-        app.control_commands = Some(std::sync::Arc::clone(&queue));
+        queue.lock().expect("the queue").push(ControlCommand::Pause);
+        app.control_commands = Some(queue);
 
-        // Nothing is playing in a headless app, so `pause` has nothing to do
-        // and `play` asks for the toggle.
-        queue
-            .lock()
-            .expect("the queue")
-            .extend([ControlCommand::Pause, ControlCommand::Play]);
         app.handle_control_commands();
+        app.apply_actions(&egui::Context::default());
 
-        assert!(
-            matches!(app.actions.as_slice(), [Action::TogglePlay]),
-            "{:?}",
-            app.actions
-        );
+        assert!(app.queued_play.is_none());
+        assert!(!app.any_play_pending());
+        assert!(app.backend.take_player_commands().is_empty());
     }
 }

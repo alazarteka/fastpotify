@@ -9,6 +9,18 @@ use crate::theme::{self, Icon};
 
 pub const BUTTON_RECT_ID: &str = "devices-button-rect";
 
+fn is_active(device: &Device, selected_id: Option<&str>) -> bool {
+    device.is_active
+        || device
+            .id
+            .as_deref()
+            .is_some_and(|id| selected_id == Some(id))
+}
+
+fn is_transferable(device: &Device, active: bool) -> bool {
+    !active && !device.is_restricted && device.id.is_some()
+}
+
 pub fn device_icon(kind: &str) -> Icon {
     match kind.to_ascii_lowercase().as_str() {
         "computer" => Icon::Laptop,
@@ -152,7 +164,7 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                     crate::app::Target::Local => local_id.clone(),
                     crate::app::Target::Remote(id) => id,
                 };
-                devices.sort_by_key(|device| device.id != active_id);
+                devices.sort_by_key(|device| !is_active(device, active_id.as_deref()));
 
                 if !app.local_ready {
                     enable_playback_row(app, ui);
@@ -169,13 +181,13 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
 
                 for device in &devices {
                     let is_local = device.id.is_some() && device.id == local_id;
-                    let active = device.id.is_some() && device.id == active_id;
+                    let active = is_active(device, active_id.as_deref());
                     let name = if is_local && !device.name.contains("this computer") {
                         format!("{} (this computer)", device.name)
                     } else {
                         device.name.clone()
                     };
-                    let selectable = !active && !device.is_restricted && device.id.is_some();
+                    let selectable = is_transferable(device, active);
                     let sense = if selectable {
                         Sense::click()
                     } else {
@@ -212,6 +224,8 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         "Restricted".to_string()
                     } else if is_local {
                         "Play here".to_string()
+                    } else if device.id.is_none() {
+                        "Not transferable".to_string()
                     } else {
                         device.kind.replace('_', " ")
                     };
@@ -242,6 +256,10 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         response.on_hover_text(
                             "Spotify marks this device as unavailable to remote controls",
                         );
+                    } else if device.id.is_none() {
+                        response.on_hover_text(
+                            "Spotify did not provide an ID for transferring playback",
+                        );
                     }
                 }
             });
@@ -256,5 +274,30 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
     });
     if clicked_outside {
         app.show_devices = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idless_active_device_is_visible_as_active_but_not_transferable() {
+        let active = Device {
+            id: None,
+            name: "Current speaker".into(),
+            is_active: true,
+            ..Device::default()
+        };
+        let inactive = Device {
+            id: None,
+            name: "Sleeping speaker".into(),
+            ..Device::default()
+        };
+
+        assert!(is_active(&active, None));
+        assert!(!is_transferable(&active, is_active(&active, None)));
+        assert!(!is_active(&inactive, None));
+        assert!(!is_transferable(&inactive, is_active(&inactive, None)));
     }
 }

@@ -231,8 +231,8 @@ fn run_control(_control: Control) -> i32 {
 fn format_now_playing(snapshot: &str) -> String {
     let mut fields = snapshot.split('\t');
     let state = fields.next().unwrap_or_default();
-    let title = fields.next().unwrap_or_default();
-    let artists = fields.next().unwrap_or_default();
+    let title = single_instance::sanitize_control_field(fields.next().unwrap_or_default());
+    let artists = single_instance::sanitize_control_field(fields.next().unwrap_or_default());
     let _album = fields.next();
     let position_ms: u32 = fields.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
     let duration_ms: u32 = fields.next().and_then(|ms| ms.parse().ok()).unwrap_or(0);
@@ -254,7 +254,7 @@ fn format_now_playing(snapshot: &str) -> String {
 #[cfg(any(test, not(target_os = "linux")))]
 struct ControlDeviceSnapshot {
     #[serde(default)]
-    id: String,
+    id: Option<String>,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -268,27 +268,18 @@ struct ControlDeviceSnapshot {
 }
 
 /// The `devices` snapshot as one line per device, the active one marked.
-/// The id comes first because `fastpotify transfer` is what it is for.
+/// The id comes first because `fastpotify transfer` is what it is for; it is
+/// blank when Spotify did not provide a transferable ID.
 #[cfg(any(test, not(target_os = "linux")))]
 fn format_devices(snapshot: &str) -> Result<String, serde_json::Error> {
     let devices: Vec<ControlDeviceSnapshot> = serde_json::from_str(snapshot)?;
-    let clean = |field: &str| {
-        field
-            .chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect::<String>()
-    };
     Ok(devices
         .iter()
         .map(|device| {
             let limitation = if device.restricted {
                 "restricted"
+            } else if device.id.is_none() {
+                "not transferable"
             } else if device.supports_volume == Some(false) {
                 "fixed volume"
             } else {
@@ -297,9 +288,9 @@ fn format_devices(snapshot: &str) -> Result<String, serde_json::Error> {
             format!(
                 "{}{}\t{}\t{}\t{limitation}\n",
                 if device.active { "* " } else { "  " },
-                clean(&device.id),
-                clean(&device.name),
-                clean(&device.kind),
+                single_instance::sanitize_control_field(device.id.as_deref().unwrap_or_default()),
+                single_instance::sanitize_control_field(&device.name),
+                single_instance::sanitize_control_field(&device.kind),
             )
         })
         .collect())
@@ -350,21 +341,23 @@ mod control_tests {
             {"id":"a","name":"Kitchen\tspeaker","kind":"Speaker","active":true,
              "restricted":true,"supports_volume":false},
             {"id":"b","name":"Phone\nupstairs","kind":"Smartphone","active":false,
-             "restricted":false,"supports_volume":false}
+             "restricted":false,"supports_volume":false},
+            {"id":null,"name":"Receiver","kind":"Speaker","active":true,
+             "restricted":false,"supports_volume":true}
         ]"#;
 
         assert_eq!(
             format_devices(snapshot).expect("device JSON"),
-            "* a\tKitchen speaker\tSpeaker\trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n"
+            "* a\tKitchen speaker\tSpeaker\trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n* \tReceiver\tSpeaker\tnot transferable\n"
         );
         assert!(format_devices("not JSON").is_err());
     }
 
     #[test]
-    fn now_playing_output_keeps_the_existing_human_shape() {
+    fn now_playing_output_sanitizes_controls_and_keeps_the_human_shape() {
         assert_eq!(
-            format_now_playing("playing\tGo\tThe Band\tFirst\t65000\t180000"),
-            "▶ Go — The Band  [1:05 / 3:00]"
+            format_now_playing("playing\tGo\u{1b}[31m\u{7}\tThe\u{0} Band\tFirst\t65000\t180000"),
+            "▶ Go [31m  — The  Band  [1:05 / 3:00]"
         );
         assert_eq!(format_now_playing("stopped"), "Nothing playing");
     }

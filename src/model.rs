@@ -468,6 +468,8 @@ pub enum Action {
     },
     ShufflePlay(String),
     TogglePlay,
+    /// Reach this playback state even if an earlier action in the batch changed it.
+    SetPlaying(bool),
     Next,
     Previous,
     Seek(u32),

@@ -126,6 +126,35 @@ pub const NOTHING_PLAYING: &str = "stopped";
 /// A stable JSON shape before Spotify has returned any devices.
 pub const NO_DEVICES: &str = "[]";
 
+/// Replaces terminal and wire control characters in one externally sourced
+/// field without changing its printable Unicode text.
+pub fn sanitize_control_field(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// Sanitizes a complete now-playing wire line while retaining tabs as its
+/// field separators. Snapshot production sanitizes fields before joining;
+/// this second boundary also protects raw CLI output from a malformed peer.
+pub fn sanitize_snapshot_line(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character != '\t' && character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Loopback port that marks a running instance on platforms without a bus.
 /// Registered to nothing; chosen high and out of the ephemeral range.
 #[cfg(not(target_os = "linux"))]
@@ -270,7 +299,7 @@ fn send_to(port: u16, token: &str, verb: &str) -> std::io::Result<Reply> {
     if line == OK_REPLY {
         Ok(Reply::Ok)
     } else if let Some(snapshot) = line.strip_prefix(NOW_REPLY) {
-        Ok(Reply::NowPlaying(snapshot.to_owned()))
+        Ok(Reply::NowPlaying(sanitize_snapshot_line(snapshot)))
     } else if let Some(snapshot) = line.strip_prefix(DEVICES_REPLY) {
         Ok(Reply::Devices(snapshot.to_owned()))
     } else {
@@ -716,6 +745,35 @@ mod tests {
             .err()
             .expect("an oversized reply is rejected");
         assert_eq!(reply_error.kind(), std::io::ErrorKind::InvalidData);
+        server.join().expect("server exits");
+    }
+
+    #[test]
+    fn raw_snapshot_reply_sanitizes_terminal_control_characters() {
+        use std::io::Write as _;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let token = "a".repeat(CONTROL_TOKEN_HEX_BYTES);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one client");
+            read_line(&mut stream).expect("control request");
+            stream
+                .write_all(format!("{NOW_REPLY}playing\tGo\u{1b}[31m\u{7}\tBand\n").as_bytes())
+                .expect("snapshot reply");
+        });
+
+        let Reply::NowPlaying(snapshot) = send_to(port, &token, "nowplaying").expect("reply")
+        else {
+            panic!("unexpected reply type");
+        };
+        assert_eq!(snapshot, "playing\tGo [31m \tBand");
+        assert!(
+            snapshot
+                .chars()
+                .all(|character| character == '\t' || !character.is_control())
+        );
         server.join().expect("server exits");
     }
 
