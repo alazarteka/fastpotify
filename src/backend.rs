@@ -383,11 +383,16 @@ pub enum Command {
     EngineConnected {
         engine: Box<Option<Engine>>,
         credential: Option<Credentials>,
+        generation: u64,
         epoch: u64,
         error: Option<String>,
     },
-    /// Internal: librespot's session ended on its own.
+    /// Ask the current local engine to reconnect.
     Reconnect,
+    /// Internal: one particular librespot session ended on its own.
+    EngineEnded {
+        generation: u64,
+    },
     /// Ask GitHub whether a newer release exists.
     CheckForUpdates,
     /// The words of a track, from LRCLIB.
@@ -507,14 +512,14 @@ impl EngineNotificationGuard {
         events: std::sync::mpsc::Sender<Event>,
         commands: mpsc::UnboundedSender<Command>,
         waker: Waker,
-    ) -> crate::player::Notify {
+    ) -> (u64, crate::player::Notify) {
         let generation = {
             let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
             *current = current.wrapping_add(1);
             *current
         };
         let active = self.clone();
-        Arc::new(move |event| {
+        let notify = Arc::new(move |event| {
             let current = active.0.lock().unwrap_or_else(|poison| poison.into_inner());
             if *current != generation {
                 return;
@@ -525,11 +530,12 @@ impl EngineNotificationGuard {
                     waker.wake();
                 }
                 EngineEvent::SessionEnded => {
-                    let _ = commands.send(Command::Reconnect);
+                    let _ = commands.send(Command::EngineEnded { generation });
                 }
             }
             drop(current);
-        })
+        });
+        (generation, notify)
     }
 
     fn retire(&self) {
@@ -538,8 +544,123 @@ impl EngineNotificationGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EngineConnectionLifecycle {
+    #[default]
+    Idle,
+    Connecting {
+        generation: u64,
+        restart_after_completion: bool,
+    },
+    Active {
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartDisposition {
+    Ignore,
+    Deferred,
+    Now,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionDisposition {
+    Ignore,
+    PublishReady,
+    Restart,
+}
+
+impl EngineConnectionLifecycle {
+    fn is_idle(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn begin(&mut self, generation: u64) {
+        debug_assert!(matches!(self, Self::Idle));
+        *self = Self::Connecting {
+            generation,
+            restart_after_completion: false,
+        };
+    }
+
+    fn reconnect_requested(&mut self) -> RestartDisposition {
+        match *self {
+            Self::Connecting { .. } => RestartDisposition::Ignore,
+            Self::Active { .. } => {
+                *self = Self::Idle;
+                RestartDisposition::Now
+            }
+            Self::Idle => RestartDisposition::Now,
+        }
+    }
+
+    fn session_ended(&mut self, generation: u64) -> RestartDisposition {
+        match *self {
+            Self::Connecting {
+                generation: current,
+                restart_after_completion,
+            } if generation == current => {
+                if restart_after_completion {
+                    RestartDisposition::Ignore
+                } else {
+                    *self = Self::Connecting {
+                        generation: current,
+                        restart_after_completion: true,
+                    };
+                    RestartDisposition::Deferred
+                }
+            }
+            Self::Active {
+                generation: current,
+            } if generation == current => {
+                *self = Self::Idle;
+                RestartDisposition::Now
+            }
+            _ => RestartDisposition::Ignore,
+        }
+    }
+
+    fn engine_connected(&mut self, generation: u64) -> CompletionDisposition {
+        let Self::Connecting {
+            generation: current,
+            restart_after_completion,
+        } = *self
+        else {
+            return CompletionDisposition::Ignore;
+        };
+        if generation != current {
+            return CompletionDisposition::Ignore;
+        }
+        if restart_after_completion {
+            *self = Self::Idle;
+            CompletionDisposition::Restart
+        } else {
+            *self = Self::Active { generation };
+            CompletionDisposition::PublishReady
+        }
+    }
+
+    fn retire(&mut self, generation: u64) {
+        match *self {
+            Self::Connecting {
+                generation: current,
+                ..
+            }
+            | Self::Active {
+                generation: current,
+            } if current == generation => *self = Self::Idle,
+            _ => {}
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
 #[cfg(test)]
-mod engine_notification_guard_tests {
+mod engine_lifecycle_tests {
     use super::*;
 
     #[test]
@@ -547,8 +668,8 @@ mod engine_notification_guard_tests {
         let guard = EngineNotificationGuard::default();
         let (events, event_rx) = std::sync::mpsc::channel();
         let (commands, mut command_rx) = mpsc::unbounded_channel();
-        let retired = guard.notifier(events.clone(), commands.clone(), Waker::default());
-        let current = guard.notifier(events, commands, Waker::default());
+        let (_, retired) = guard.notifier(events.clone(), commands.clone(), Waker::default());
+        let (_, current) = guard.notifier(events, commands, Waker::default());
 
         current(EngineEvent::State(LocalState {
             connected: true,
@@ -569,9 +690,56 @@ mod engine_notification_guard_tests {
             command_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
 
-        current(EngineEvent::SessionEnded);
-        assert!(matches!(command_rx.try_recv(), Ok(Command::Reconnect)));
+    #[test]
+    fn ended_connecting_candidate_restarts_once_without_becoming_ready() {
+        let guard = EngineNotificationGuard::default();
+        let (events, _event_rx) = std::sync::mpsc::channel();
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (generation, notify) =
+            guard.notifier(events.clone(), commands.clone(), Waker::default());
+        let mut lifecycle = EngineConnectionLifecycle::default();
+        lifecycle.begin(generation);
+
+        notify(EngineEvent::SessionEnded);
+        let ended_generation = match command_rx.try_recv() {
+            Ok(Command::EngineEnded { generation }) => generation,
+            _ => panic!("the session ending did not identify its engine generation"),
+        };
+
+        assert_eq!(
+            lifecycle.session_ended(ended_generation),
+            RestartDisposition::Deferred
+        );
+        guard.retire();
+        assert_eq!(
+            lifecycle.session_ended(ended_generation),
+            RestartDisposition::Ignore
+        );
+        assert_eq!(
+            lifecycle.engine_connected(generation),
+            CompletionDisposition::Restart
+        );
+        assert_eq!(
+            lifecycle.engine_connected(generation),
+            CompletionDisposition::Ignore
+        );
+
+        let (successor, _successor_notify) = guard.notifier(events, commands, Waker::default());
+        lifecycle.begin(successor);
+        assert_eq!(
+            lifecycle.session_ended(generation),
+            RestartDisposition::Ignore
+        );
+        assert_eq!(
+            lifecycle.engine_connected(generation),
+            CompletionDisposition::Ignore
+        );
+        assert_eq!(
+            lifecycle.engine_connected(successor),
+            CompletionDisposition::PublishReady
+        );
     }
 }
 
@@ -823,12 +991,10 @@ struct Worker {
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
     engine_notifications: EngineNotificationGuard,
+    engine_connection: EngineConnectionLifecycle,
     engine: Option<Arc<Engine>>,
     web_tokens: Option<Arc<WebTokens>>,
     secrets: Arc<dyn SecretStore>,
-    /// True while a playback grant or engine connection is in flight, so a
-    /// second attempt does not pile up.
-    engine_busy: bool,
     signed_in: bool,
     /// The plan, once the Web API has answered.
     premium: Option<bool>,
@@ -867,10 +1033,10 @@ impl Worker {
             commands,
             waker,
             engine_notifications: EngineNotificationGuard::default(),
+            engine_connection: EngineConnectionLifecycle::default(),
             engine: None,
             web_tokens: None,
             secrets,
-            engine_busy: false,
             signed_in: false,
             premium: None,
             authorization: AuthorizationLifecycle::default(),
@@ -933,11 +1099,13 @@ impl Worker {
                 Command::EngineConnected {
                     engine,
                     credential,
+                    generation,
                     epoch,
                     error,
-                } => self.on_engine_connected(*engine, credential, epoch, error),
+                } => self.on_engine_connected(*engine, credential, generation, epoch, error),
                 Command::AccountChecked { premium } => self.on_account_checked(premium),
                 Command::Reconnect => self.reconnect_engine(),
+                Command::EngineEnded { generation } => self.on_engine_ended(generation),
                 Command::CheckForUpdates => self.check_for_updates(),
                 Command::Lyrics(request) => self.fetch_lyrics(*request),
                 Command::LoadPlaylistCache { id } => self.load_playlist_cache(id),
@@ -950,6 +1118,7 @@ impl Worker {
                 Command::SwitchWebApp(client_id) => self.switch_web_app(client_id),
             }
         }
+        self.engine_connection.reset();
         self.engine_notifications.retire();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
@@ -1154,7 +1323,7 @@ impl Worker {
                 self.signed_in = false;
                 self.auth_epoch = self.auth_epoch.wrapping_add(1);
                 self.credential_epoch = self.credential_epoch.wrapping_add(1);
-                self.engine_busy = false;
+                self.engine_connection.reset();
                 self.pending_resume = None;
                 self.engine_notifications.retire();
                 if let Some(engine) = self.engine.take() {
@@ -1175,7 +1344,7 @@ impl Worker {
 
     // ---- local playback engine -------------------------------------------
 
-    fn engine_notify(&self) -> crate::player::Notify {
+    fn engine_notify(&self) -> (u64, crate::player::Notify) {
         self.engine_notifications.notifier(
             self.events.clone(),
             self.commands.clone(),
@@ -1186,7 +1355,8 @@ impl Worker {
     /// Bring the engine up from a credential stored by a previous playback
     /// authorization, if there is one. Silent when there is nothing to resume.
     fn resume_engine(&mut self) {
-        if self.engine.is_some() || self.engine_busy || self.premium == Some(false) {
+        if self.engine.is_some() || !self.engine_connection.is_idle() || self.premium == Some(false)
+        {
             return;
         }
         match self.saved_playback_credentials() {
@@ -1230,6 +1400,24 @@ impl Worker {
         if !self.signed_in {
             return;
         }
+        match self.engine_connection.reconnect_requested() {
+            RestartDisposition::Ignore | RestartDisposition::Deferred => {}
+            RestartDisposition::Now => self.restart_engine_now(),
+        }
+    }
+
+    fn on_engine_ended(&mut self, generation: u64) {
+        if !self.signed_in {
+            return;
+        }
+        match self.engine_connection.session_ended(generation) {
+            RestartDisposition::Ignore => {}
+            RestartDisposition::Deferred => self.engine_notifications.retire(),
+            RestartDisposition::Now => self.restart_engine_now(),
+        }
+    }
+
+    fn restart_engine_now(&mut self) {
         if let Some(engine) = self.engine.take() {
             self.pending_resume = engine.interrupted().map(|interrupted| LoadSpec {
                 uris: vec![interrupted.uri],
@@ -1240,6 +1428,10 @@ impl Worker {
             self.engine_notifications.retire();
             engine.shutdown();
         }
+        self.schedule_engine_reconnect();
+    }
+
+    fn schedule_engine_reconnect(&mut self) {
         let now = Instant::now();
         self.reconnects
             .retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(600));
@@ -1262,7 +1454,7 @@ impl Worker {
     /// a distinct grant from the Web API sign-in: it uses Spotify's streaming
     /// client identity, the one librespot can play with.
     fn authorize_playback(&mut self) {
-        if self.engine_busy || self.authorization.is_active() {
+        if !self.engine_connection.is_idle() || self.authorization.is_active() {
             return;
         }
         if self.premium == Some(false) {
@@ -1330,7 +1522,7 @@ impl Worker {
     /// on "Connecting to Spotify"). The reusable credential comes back to
     /// the command loop and must be durably stored before the engine is used.
     fn connect_engine(&mut self, credentials: Credentials) {
-        if self.engine_busy || !self.signed_in {
+        if !self.engine_connection.is_idle() || !self.signed_in {
             return;
         }
         if self.premium == Some(false) {
@@ -1339,10 +1531,10 @@ impl Worker {
             )));
             return;
         }
-        self.engine_busy = true;
         self.emit(Event::Playback(LocalPlayback::Connecting));
         let config = self.engine_config.clone();
-        let notify = self.engine_notify();
+        let (generation, notify) = self.engine_notify();
+        self.engine_connection.begin(generation);
         let commands = self.commands.clone();
         let waker = self.waker.clone();
         let epoch = self.credential_epoch;
@@ -1353,6 +1545,7 @@ impl Worker {
                     let _ = commands.send(Command::EngineConnected {
                         engine: Box::new(None),
                         credential: None,
+                        generation,
                         epoch,
                         error: Some(error.to_string()),
                     });
@@ -1368,6 +1561,7 @@ impl Worker {
                 Ok(Ok((engine, credential))) => Command::EngineConnected {
                     engine: Box::new(Some(engine)),
                     credential: Some(credential),
+                    generation,
                     epoch,
                     error: None,
                 },
@@ -1376,6 +1570,7 @@ impl Worker {
                     Command::EngineConnected {
                         engine: Box::new(None),
                         credential: None,
+                        generation,
                         epoch,
                         error: Some(friendly_connect_error(&error)),
                     }
@@ -1383,6 +1578,7 @@ impl Worker {
                 Err(_) => Command::EngineConnected {
                     engine: Box::new(None),
                     credential: None,
+                    generation,
                     epoch,
                     error: Some("Connecting to Spotify timed out".into()),
                 },
@@ -1396,6 +1592,7 @@ impl Worker {
         &mut self,
         engine: Option<Engine>,
         credential: Option<Credentials>,
+        generation: u64,
         epoch: u64,
         error: Option<String>,
     ) {
@@ -1405,7 +1602,13 @@ impl Worker {
             }
             return;
         }
-        self.engine_busy = false;
+        let completion = self.engine_connection.engine_connected(generation);
+        if completion == CompletionDisposition::Ignore {
+            if let Some(engine) = engine {
+                engine.shutdown();
+            }
+            return;
+        }
         match (engine, credential) {
             (Some(engine), Some(credential)) => {
                 if let Err(error) = crate::secrets::store_json(
@@ -1414,11 +1617,25 @@ impl Worker {
                     &credential,
                 ) {
                     self.pending_resume = None;
+                    self.engine_connection.retire(generation);
                     self.engine_notifications.retire();
                     engine.shutdown();
                     self.emit(Event::Playback(LocalPlayback::Failed(format!(
                         "Spotify connected, but its playback credential could not be stored safely: {error}"
                     ))));
+                    return;
+                }
+                if completion == CompletionDisposition::Restart {
+                    if let Some(interrupted) = engine.interrupted() {
+                        self.pending_resume = Some(LoadSpec {
+                            uris: vec![interrupted.uri],
+                            position_ms: interrupted.position_ms,
+                            play: interrupted.playing,
+                            ..LoadSpec::default()
+                        });
+                    }
+                    engine.shutdown();
+                    self.schedule_engine_reconnect();
                     return;
                 }
                 let device_id = engine.device_id().to_string();
@@ -1433,12 +1650,14 @@ impl Worker {
             }
             (None, _) => {
                 self.pending_resume = None;
+                self.engine_connection.retire(generation);
                 self.engine_notifications.retire();
                 let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
                 self.emit(Event::Playback(LocalPlayback::Failed(message)));
             }
             (Some(engine), None) => {
                 self.pending_resume = None;
+                self.engine_connection.retire(generation);
                 self.engine_notifications.retire();
                 engine.shutdown();
                 self.emit(Event::Playback(LocalPlayback::Failed(
@@ -1457,6 +1676,7 @@ impl Worker {
         self.premium = premium;
         if premium == Some(false) {
             self.pending_resume = None;
+            self.engine_connection.reset();
             self.engine_notifications.retire();
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
