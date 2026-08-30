@@ -165,6 +165,7 @@ pub fn strip_html(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#x27;", "'")
         .replace("&#39;", "'")
+        .replace("&#x2F;", "/")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
 }
@@ -207,5 +208,6 @@ mod tests {
             strip_html("Hi <a href=\"x\">there</a> &amp; you"),
             "Hi there & you"
         );
+        assert_eq!(strip_html("ONE&#x2F;TWO&#x2F;THREE"), "ONE/TWO/THREE");
     }
 }

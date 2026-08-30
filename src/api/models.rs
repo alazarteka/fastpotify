@@ -13,7 +13,7 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    let items: Vec<Option<T>> = Vec::deserialize(deserializer)?;
+    let items = Option::<Vec<Option<T>>>::deserialize(deserializer)?.unwrap_or_default();
     Ok(items.into_iter().flatten().collect())
 }
 
@@ -65,6 +65,7 @@ pub struct Cursors {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Image {
+    #[serde(default, deserialize_with = "null_default")]
     pub url: String,
     #[serde(default)]
     pub width: Option<u32>,
@@ -76,6 +77,9 @@ pub struct Image {
 pub fn pick_image(images: &[Image], target: u32) -> Option<&str> {
     let mut best: Option<&Image> = None;
     for image in images {
+        if image.url.is_empty() {
+            continue;
+        }
         let width = image.width.unwrap_or(u32::MAX);
         match best {
             None => best = Some(image),
@@ -114,7 +118,7 @@ pub struct Followers {
 pub struct ArtistRef {
     #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
     #[serde(default)]
     pub uri: Option<String>,
@@ -122,11 +126,11 @@ pub struct ArtistRef {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Artist {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
     #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
@@ -142,11 +146,11 @@ pub struct Artist {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Album {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
     #[serde(default)]
     pub album_type: Option<String>,
@@ -176,9 +180,9 @@ pub struct Album {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Copyright {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub text: String,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "null_default")]
     pub kind: String,
 }
 
@@ -208,9 +212,9 @@ impl Album {
 pub struct Track {
     #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
     #[serde(default)]
     pub duration_ms: u32,
@@ -267,15 +271,15 @@ pub struct ResumePoint {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Episode {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
     #[serde(default)]
     pub duration_ms: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub description: String,
     #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
@@ -293,15 +297,15 @@ pub struct Episode {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Show {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub publisher: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub description: String,
     #[serde(default, deserialize_with = "null_default")]
     pub images: Vec<Image>,
@@ -331,11 +335,11 @@ pub struct TrackCount {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Playlist {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -511,9 +515,9 @@ pub struct PlayHistory {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Context {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub uri: String,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "null_default")]
     pub kind: String,
 }
 
@@ -521,7 +525,7 @@ pub struct Context {
 pub struct Device {
     #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub name: String,
     #[serde(default)]
     pub is_active: bool,
@@ -531,13 +535,13 @@ pub struct Device {
     pub volume_percent: Option<u8>,
     #[serde(default)]
     pub supports_volume: Option<bool>,
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "null_default")]
     pub kind: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct DeviceList {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "skip_nulls")]
     pub devices: Vec<Device>,
 }
 
@@ -545,7 +549,7 @@ pub struct DeviceList {
 pub struct PlaybackState {
     #[serde(default)]
     pub device: Option<Device>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub repeat_state: String,
     #[serde(default)]
     pub shuffle_state: bool,
@@ -614,7 +618,7 @@ impl SearchResults {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct User {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub id: String,
     #[serde(default)]
     pub display_name: Option<String>,
@@ -668,7 +672,7 @@ pub struct ApiErrorBody {
 pub struct ApiErrorDetail {
     #[serde(default)]
     pub status: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub message: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -722,6 +726,17 @@ mod tests {
         assert_eq!(pick_image(&images, 100), Some("medium"));
         assert_eq!(pick_image(&images, 1000), Some("large"));
         assert_eq!(pick_image(&[], 64), None);
+        assert_eq!(
+            pick_image(
+                &[Image {
+                    url: String::new(),
+                    width: Some(64),
+                    height: Some(64),
+                }],
+                64
+            ),
+            None
+        );
     }
 
     #[test]
@@ -730,6 +745,71 @@ mod tests {
         let artist: Artist = serde_json::from_str(json).unwrap();
         assert!(artist.images.is_empty());
         assert!(artist.genres.is_empty());
+    }
+
+    #[test]
+    fn spotify_null_strings_and_lists_do_not_fail_a_response() {
+        let playback: PlaybackState = serde_json::from_value(serde_json::json!({
+            "device": {"name": null, "type": null},
+            "repeat_state": null,
+            "context": {"uri": null, "type": null},
+            "item": {
+                "type": "track",
+                "name": null,
+                "uri": null,
+                "artists": [{"name": null}],
+                "album": {
+                    "id": null,
+                    "name": null,
+                    "uri": null,
+                    "images": [{"url": null}],
+                    "copyrights": [{"text": null, "type": null}]
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(playback.repeat_state, "");
+        assert_eq!(playback.context.unwrap(), Context::default());
+        assert_eq!(playback.device.unwrap().name, "");
+        let PlayableItem::Track(track) = playback.item.unwrap() else {
+            panic!("track response");
+        };
+        assert_eq!(track.name, "");
+        assert_eq!(track.artists[0].name, "");
+        assert_eq!(track.album.unwrap().images[0].url, "");
+
+        let results: SearchResults = serde_json::from_value(serde_json::json!({
+            "artists": {"items": [{"id": null, "name": null, "uri": null}]},
+            "playlists": {"items": [{"id": null, "name": null, "uri": null}]},
+            "shows": {"items": [{
+                "id": null,
+                "name": null,
+                "uri": null,
+                "publisher": null,
+                "description": null,
+                "episodes": {"items": [{
+                    "id": null,
+                    "name": null,
+                    "uri": null,
+                    "description": null
+                }]}
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(results.artists.unwrap().items[0], Artist::default());
+        assert_eq!(results.playlists.unwrap().items[0], Playlist::default());
+        let shows = results.shows.unwrap();
+        let show = &shows.items[0];
+        assert_eq!(show.publisher, "");
+        assert_eq!(show.episodes.as_ref().unwrap().items[0], Episode::default());
+
+        let devices: DeviceList = serde_json::from_str(r#"{"devices":null}"#).unwrap();
+        assert!(devices.devices.is_empty());
+        let user: User = serde_json::from_str(r#"{"id":null}"#).unwrap();
+        assert_eq!(user.id, "");
+        let error: ApiErrorBody =
+            serde_json::from_str(r#"{"error":{"status":400,"message":null}}"#).unwrap();
+        assert_eq!(error.error.message, "");
     }
 
     #[test]

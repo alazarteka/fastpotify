@@ -2,7 +2,7 @@
 
 use egui::{Align, Layout, Rect, Sense, Vec2, pos2, vec2};
 
-use crate::api::models::{Album, PlayableItem, Playlist, pick_image};
+use crate::api::models::{Album, Copyright, PlayableItem, Playlist, pick_image};
 use crate::app::App;
 use crate::model::{Action, Dialog, Loadable, Page, PagedList, RowContext, SortColumn, TableSort};
 use crate::theme::{self, Icon, Palette};
@@ -435,6 +435,32 @@ fn total_duration(items: &[TableItem]) -> u64 {
         .sum()
 }
 
+fn copyright_lines(copyrights: &[Copyright]) -> Vec<String> {
+    let mut credits: Vec<(String, Vec<&str>)> = Vec::new();
+    for copyright in copyrights {
+        let core = copyright
+            .text
+            .trim_start_matches(['©', '℗'])
+            .trim_start_matches("(C)")
+            .trim_start_matches("(P)")
+            .trim()
+            .to_string();
+        if core.is_empty() {
+            continue;
+        }
+        let mark = if copyright.kind == "P" { "℗" } else { "©" };
+        match credits.iter_mut().find(|(held, _)| *held == core) {
+            Some((_, marks)) if !marks.contains(&mark) => marks.push(mark),
+            Some(_) => {}
+            None => credits.push((core, vec![mark])),
+        }
+    }
+    credits
+        .into_iter()
+        .map(|(core, marks)| format!("{} {core}", marks.join(" ")))
+        .collect()
+}
+
 fn items_of(
     list: &PagedList<crate::api::models::PlaylistItem>,
     owner_id: Option<&str>,
@@ -535,18 +561,22 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             // collaborations; a playlist made together today is recognised
             // by who added its songs.
             let owner_id = playlist.owner.id.as_deref();
-            let others = page
-                .contributors
-                .iter()
-                .filter(|id| Some(id.as_str()) != owner_id)
-                .count();
-            let made_together = playlist.collaborative || others > 0;
+            let editorial = owner_id == Some("spotify");
+            let others = if editorial {
+                0
+            } else {
+                page.contributors
+                    .iter()
+                    .filter(|id| !id.is_empty() && Some(id.as_str()) != owner_id)
+                    .count()
+            };
+            let made_together = !editorial && (playlist.collaborative || others > 0);
             let mut byline = vec![(playlist.owner_name().to_string(), None)];
             if others > 0 {
                 let named: Vec<String> = page
                     .contributors
                     .iter()
-                    .filter(|id| Some(id.as_str()) != owner_id)
+                    .filter(|id| !id.is_empty() && Some(id.as_str()) != owner_id)
                     .filter_map(|id| app.user_names.get(id)?.clone())
                     .collect();
                 byline.push((
@@ -711,17 +741,7 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     palette.secondary,
                 );
             }
-            for copyright in &album.copyrights {
-                let prefix = if copyright.kind == "P" { "℗ " } else { "© " };
-                let text = if copyright.text.starts_with('©')
-                    || copyright.text.starts_with('℗')
-                    || copyright.text.starts_with("(C)")
-                    || copyright.text.starts_with("(P)")
-                {
-                    copyright.text.clone()
-                } else {
-                    format!("{prefix}{}", copyright.text)
-                };
+            for text in copyright_lines(&album.copyrights) {
                 theme::text(ui, text, theme::regular(11.5), palette.dim);
             }
         }
@@ -900,4 +920,30 @@ fn rect_after(ui: &egui::Ui, height: f32) -> Rect {
 #[allow(dead_code)]
 fn palette_of(app: &App) -> Palette {
     app.palette
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_copyright_credits_share_one_line() {
+        let copyrights = vec![
+            Copyright {
+                text: "© 2026 Example Label".into(),
+                kind: "C".into(),
+            },
+            Copyright {
+                text: "(P) 2026 Example Label".into(),
+                kind: "P".into(),
+            },
+            Copyright {
+                text: "2026 Example Label".into(),
+                kind: "P".into(),
+            },
+            Copyright::default(),
+        ];
+
+        assert_eq!(copyright_lines(&copyrights), vec!["© ℗ 2026 Example Label"]);
+    }
 }
