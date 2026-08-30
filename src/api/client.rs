@@ -36,6 +36,8 @@ pub enum ApiError {
     RateLimited,
     #[error("Spotify's Development Mode quota is exhausted; try again after the quota resets")]
     QuotaExhausted,
+    #[error("too many playback commands are waiting; try again")]
+    PlaybackBackpressure,
     #[error("your {api_source} Spotify sign-in expired; please authorize it again")]
     SignInExpired {
         api_source: ApiSource,

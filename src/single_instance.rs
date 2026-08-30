@@ -137,7 +137,7 @@ pub const NO_DEVICES: &str = "[]";
 pub fn sanitize_control_field(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() {
+            if unsafe_terminal_control(character) {
                 ' '
             } else {
                 character
@@ -152,13 +152,29 @@ pub fn sanitize_control_field(text: &str) -> String {
 pub fn sanitize_snapshot_line(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character != '\t' && character.is_control() {
+            if character != '\t' && unsafe_terminal_control(character) {
                 ' '
             } else {
                 character
             }
         })
         .collect()
+}
+
+/// C0/C1 controls, Unicode line separators, and directional formatting marks
+/// can alter terminal output without appearing as text. Directional controls
+/// are selected explicitly so useful format characters such as the zero-width
+/// joiner in emoji sequences remain intact.
+fn unsafe_terminal_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{206f}'
+        )
 }
 
 /// Loopback port that marks a running instance on platforms without a bus.
@@ -875,7 +891,12 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("one client");
             read_line(&mut stream).expect("control request");
             stream
-                .write_all(format!("{NOW_REPLY}playing\tGo\u{1b}[31m\u{7}\tBand\n").as_bytes())
+                .write_all(
+                    format!(
+                        "{NOW_REPLY}playing\tCafé 東京 👩‍💻 e\u{301}\u{1b}\u{009b}\u{202e}\u{2066}\tBand\n"
+                    )
+                    .as_bytes(),
+                )
                 .expect("snapshot reply");
         });
 
@@ -883,13 +904,23 @@ mod tests {
         else {
             panic!("unexpected reply type");
         };
-        assert_eq!(snapshot, "playing\tGo [31m \tBand");
+        assert_eq!(snapshot, "playing\tCafé 東京 👩‍💻 e\u{301}    \tBand");
         assert!(
             snapshot
                 .chars()
-                .all(|character| character == '\t' || !character.is_control())
+                .all(|character| character == '\t' || !unsafe_terminal_control(character))
         );
         server.join().expect("server exits");
+    }
+
+    #[test]
+    fn field_sanitizer_preserves_ordinary_unicode_and_emoji_joiners() {
+        let ordinary = "Café 東京 👩‍💻 e\u{301}";
+        assert_eq!(sanitize_control_field(ordinary), ordinary);
+        assert_eq!(
+            sanitize_control_field("a\u{0}b\u{009b}c\u{061c}d\u{200e}e\u{202d}f\u{2067}g"),
+            "a b c d e f g"
+        );
     }
 
     /// The whole channel over a real socket: commands reach the app queue and

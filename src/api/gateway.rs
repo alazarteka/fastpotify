@@ -132,7 +132,6 @@ fn classify_playlist(account: &AccountId, playlist: &Playlist) -> PlaylistAccess
 
 struct Session {
     live: RwLock<LiveSession>,
-    generation: AtomicU64,
     http: reqwest::Client,
     activity: Arc<NetActivity>,
     profile: ApiProfile,
@@ -140,6 +139,7 @@ struct Session {
 }
 
 struct LiveSession {
+    generation: u64,
     state: SessionState,
     client: Arc<ApiClient>,
 }
@@ -154,10 +154,10 @@ impl Session {
         let client = Self::make_client(&http, &activity, profile, base_url);
         Self {
             live: RwLock::new(LiveSession {
+                generation: 0,
                 state: SessionState::Unavailable,
                 client,
             }),
-            generation: AtomicU64::new(0),
             http,
             activity,
             profile,
@@ -195,25 +195,55 @@ impl Session {
         )
     }
 
-    fn ready_client(&self) -> Option<Arc<ApiClient>> {
+    fn ready_client(&self) -> Option<(u64, Arc<ApiClient>)> {
         let live = self.live.read().unwrap_or_else(|lock| lock.into_inner());
-        matches!(live.state, SessionState::Ready { .. }).then(|| Arc::clone(&live.client))
+        matches!(live.state, SessionState::Ready { .. })
+            .then(|| (live.generation, Arc::clone(&live.client)))
     }
 
-    fn replace_client(
-        &self,
-        provider: Option<TokenProvider>,
-        state: SessionState,
-    ) -> Arc<ApiClient> {
+    fn begin(&self, provider: impl FnOnce(u64) -> TokenProvider) -> u64 {
+        let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+        let generation = live
+            .generation
+            .checked_add(1)
+            .expect("Spotify session generation exhausted");
         let client = self.fresh_client();
-        client.set_token_provider(provider);
-        let previous = {
-            let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
-            live.state = state;
-            std::mem::replace(&mut live.client, Arc::clone(&client))
-        };
+        client.set_token_provider(Some(provider(generation)));
+        let previous = std::mem::replace(&mut live.client, client);
+        live.generation = generation;
+        live.state = SessionState::Authorizing;
+        // Route selection cannot observe the replacement until the old
+        // provider has been synchronously retired.
         previous.set_token_provider(None);
-        client
+        generation
+    }
+
+    fn clear(&self) {
+        let client = self.fresh_client();
+        let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+        let previous = std::mem::replace(&mut live.client, client);
+        live.generation = live
+            .generation
+            .checked_add(1)
+            .expect("Spotify session generation exhausted");
+        live.state = SessionState::Unavailable;
+        previous.set_token_provider(None);
+    }
+
+    fn clear_if_generation(&self, generation: u64) -> bool {
+        let client = self.fresh_client();
+        let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+        if live.generation != generation {
+            return false;
+        }
+        let previous = std::mem::replace(&mut live.client, client);
+        live.generation = live
+            .generation
+            .checked_add(1)
+            .expect("Spotify session generation exhausted");
+        live.state = SessionState::Unavailable;
+        previous.set_token_provider(None);
+        true
     }
 
     fn state(&self) -> SessionState {
@@ -234,7 +264,7 @@ impl Session {
 
     fn set_ready_if_current(&self, generation: u64, account: AccountId) -> bool {
         let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
-        if self.generation() != generation || !matches!(live.state, SessionState::Authorizing) {
+        if live.generation != generation || !matches!(live.state, SessionState::Authorizing) {
             return false;
         }
         live.state = SessionState::Ready { account };
@@ -242,17 +272,45 @@ impl Session {
     }
 
     fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.live
+            .read()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .generation
     }
 
-    fn next_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    fn is_ready_generation(&self, generation: u64) -> bool {
+        let live = self.live.read().unwrap_or_else(|lock| lock.into_inner());
+        live.generation == generation && matches!(live.state, SessionState::Ready { .. })
     }
+
+    #[cfg(test)]
+    fn next_generation(&self) -> u64 {
+        let mut live = self.live.write().unwrap_or_else(|lock| lock.into_inner());
+        live.generation = live
+            .generation
+            .checked_add(1)
+            .expect("Spotify session generation exhausted");
+        live.generation
+    }
+}
+
+/// One atomic routing decision, including the client whose mutable transport
+/// state belongs only to this authorization generation.
+#[derive(Clone)]
+pub(crate) struct ApiRoute {
+    pub source: ApiSource,
+    pub generation: u64,
+    pub revision: u64,
+    pub client: Arc<ApiClient>,
 }
 
 pub struct ApiGateway {
     shared: Session,
     personal: Session,
+    /// Linearizes session transitions with route selection and guarded event
+    /// publication. The revision gives queued work a compact route identity.
+    routing: RwLock<()>,
+    route_revision: AtomicU64,
     playlist_access: Mutex<HashMap<PlaylistId, PlaylistAccess>>,
 }
 
@@ -274,6 +332,8 @@ impl ApiGateway {
                 base_url,
             ),
             personal: Session::new(http, activity, ApiProfile::PERSONAL, base_url),
+            routing: RwLock::new(()),
+            route_revision: AtomicU64::new(0),
             playlist_access: Mutex::new(HashMap::new()),
         }
     }
@@ -294,12 +354,16 @@ impl ApiGateway {
         source: ApiSource,
         provider: impl FnOnce(u64) -> TokenProvider,
     ) -> u64 {
+        let _routing = self
+            .routing
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner());
         if source == ApiSource::Shared {
-            self.clear_session(ApiSource::Personal);
+            self.clear_session_locked(ApiSource::Personal);
         }
         let session = self.session(source);
-        let generation = session.next_generation();
-        session.replace_client(Some(provider(generation)), SessionState::Authorizing);
+        let generation = session.begin(provider);
+        self.advance_route_revision();
         generation
     }
 
@@ -315,6 +379,10 @@ impl ApiGateway {
         generation: u64,
         account: AccountId,
     ) -> Result<(), ApiError> {
+        let _routing = self
+            .routing
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner());
         if self.session(source).generation() != generation
             || !matches!(self.state(source), SessionState::Authorizing)
         {
@@ -349,25 +417,34 @@ impl ApiGateway {
                 }
             },
         }
-        self.session(source)
+        let installed = self
+            .session(source)
             .set_ready_if_current(generation, account)
             .then_some(())
-            .ok_or(ApiError::NotSignedIn)
+            .ok_or(ApiError::NotSignedIn);
+        if installed.is_ok() {
+            self.advance_route_revision();
+        }
+        installed
     }
 
     pub fn clear(&self, source: ApiSource) {
-        self.clear_session(source);
+        let _routing = self
+            .routing
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.clear_session_locked(source);
         if source == ApiSource::Shared {
             // The personal identity is meaningful only relative to the
             // canonical shared account. It must never remain routable alone.
-            self.clear_session(ApiSource::Personal);
+            self.clear_session_locked(ApiSource::Personal);
         }
     }
 
-    fn clear_session(&self, source: ApiSource) {
+    fn clear_session_locked(&self, source: ApiSource) {
         let session = self.session(source);
-        session.next_generation();
-        session.replace_client(None, SessionState::Unavailable);
+        session.clear();
+        self.advance_route_revision();
         if source == ApiSource::Shared {
             self.playlist_access
                 .lock()
@@ -377,7 +454,12 @@ impl ApiGateway {
     }
 
     pub fn clear_all(&self) {
-        self.clear(ApiSource::Shared);
+        let _routing = self
+            .routing
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.clear_session_locked(ApiSource::Shared);
+        self.clear_session_locked(ApiSource::Personal);
         self.playlist_access
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
@@ -387,10 +469,21 @@ impl ApiGateway {
     /// Clears only the session that dispatched a failing request. A late
     /// response from a replaced provider cannot retire its successor.
     pub fn clear_if_current(&self, source: ApiSource, generation: u64) -> bool {
-        if !self.is_current(source, generation) {
+        let _routing = self
+            .routing
+            .write()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if !self.session(source).clear_if_generation(generation) {
             return false;
         }
-        self.clear(source);
+        self.advance_route_revision();
+        if source == ApiSource::Shared {
+            self.playlist_access
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .clear();
+            self.clear_session_locked(ApiSource::Personal);
+        }
         true
     }
 
@@ -410,11 +503,60 @@ impl ApiGateway {
         &self,
         operation: Operation,
     ) -> Result<(ApiSource, Arc<ApiClient>), ApiError> {
+        self.route_for(operation)
+            .map(|route| (route.source, route.client))
+    }
+
+    pub(crate) fn route_for(&self, operation: Operation) -> Result<ApiRoute, ApiError> {
+        let _routing = self.routing.read().unwrap_or_else(|lock| lock.into_inner());
+        let revision = self.route_revision.load(Ordering::Acquire);
         let source = plan(operation, self.personal_ready());
-        let session = self.session(source);
-        let client = session.ready_client().ok_or(ApiError::NotSignedIn)?;
+        let (generation, client) = self
+            .session(source)
+            .ready_client()
+            .ok_or(ApiError::NotSignedIn)?;
         log::debug!("Spotify route operation={operation:?} source={source}");
-        Ok((source, client))
+        Ok(ApiRoute {
+            source,
+            generation,
+            revision,
+            client,
+        })
+    }
+
+    pub(crate) fn route_is_current(&self, operation: Operation, route: &ApiRoute) -> bool {
+        let _routing = self.routing.read().unwrap_or_else(|lock| lock.into_inner());
+        self.route_is_current_locked(operation, route)
+    }
+
+    pub(crate) fn with_current_route(
+        &self,
+        operation: Operation,
+        route: &ApiRoute,
+        action: impl FnOnce(),
+    ) -> bool {
+        let _routing = self.routing.read().unwrap_or_else(|lock| lock.into_inner());
+        if !self.route_is_current_locked(operation, route) {
+            return false;
+        }
+        action();
+        true
+    }
+
+    fn route_is_current_locked(&self, operation: Operation, route: &ApiRoute) -> bool {
+        self.route_revision.load(Ordering::Acquire) == route.revision
+            && plan(operation, self.personal_ready()) == route.source
+            && self
+                .session(route.source)
+                .is_ready_generation(route.generation)
+    }
+
+    fn advance_route_revision(&self) {
+        self.route_revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            })
+            .expect("Spotify route revision exhausted");
     }
 
     pub fn playlist_access(&self, id: &str) -> PlaylistAccess {

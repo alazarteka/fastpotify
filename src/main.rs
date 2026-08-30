@@ -361,45 +361,51 @@ mod control_tests {
     #[test]
     fn device_output_marks_capabilities_and_sanitizes_terminal_fields() {
         let snapshot = r#"[
-            {"id":"a","name":"Kitchen\tspeaker","kind":"Speaker","active":true,
+            {"id":"a\u202e","name":"Kitchen\tspeaker\u2067","kind":"Speaker\u009b","active":true,
              "restricted":true,"supports_volume":false},
             {"id":"b","name":"Phone\nupstairs","kind":"Smartphone","active":false,
              "restricted":false,"supports_volume":false},
-            {"id":null,"name":"Receiver","kind":"Speaker","active":true,
+            {"id":null,"name":"Receiver 👩‍💻 é","kind":"Récepteur 東京","active":true,
              "restricted":false,"supports_volume":true}
         ]"#;
 
         assert_eq!(
             format_devices(snapshot).expect("device JSON"),
-            "* a\tKitchen speaker\tSpeaker\trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n* \tReceiver\tSpeaker\tnot transferable\n"
+            "* a \tKitchen speaker \tSpeaker \trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n* \tReceiver 👩‍💻 é\tRécepteur 東京\tnot transferable\n"
         );
         assert!(format_devices("not JSON").is_err());
     }
 
     #[test]
-    fn raw_device_output_revalidates_json_and_sanitizes_c1_fields() {
+    fn raw_device_output_revalidates_json_and_sanitizes_control_fields() {
         let snapshot = format!(
-            r#"[{{"id":"id{control}one","name":"Café{control}東京","kind":"Speaker{control}","active":true,"restricted":false,"supports_volume":true}},{{"id":null,"name":"Receiver","kind":"Audio","active":false,"restricted":false,"supports_volume":null}}]"#,
-            control = '\u{009b}'
+            r#"[{{"id":"id{c1}{bidi}one","name":"Café\u001b{arabic_mark}東京","kind":"Speaker{isolate}","active":true,"restricted":false,"supports_volume":true}},{{"id":null,"name":"Receiver 👩‍💻 é","kind":"Audio","active":false,"restricted":false,"supports_volume":null}}]"#,
+            c1 = '\u{009b}',
+            bidi = '\u{202e}',
+            arabic_mark = '\u{061c}',
+            isolate = '\u{2066}',
         );
 
         let raw = sanitize_device_reply(&snapshot).expect("valid device JSON");
         let devices: Vec<ControlDeviceSnapshot> =
             serde_json::from_str(&raw).expect("sanitized device JSON");
 
-        assert!(raw.chars().all(|character| !character.is_control()));
-        assert_eq!(devices[0].id.as_deref(), Some("id one"));
-        assert_eq!(devices[0].name, "Café 東京");
+        assert!(!raw.contains(['\u{009b}', '\u{202e}', '\u{061c}', '\u{2066}']));
+        assert_eq!(devices[0].id.as_deref(), Some("id  one"));
+        assert_eq!(devices[0].name, "Café  東京");
         assert_eq!(devices[0].kind, "Speaker ");
         assert!(devices[1].id.is_none());
+        assert_eq!(devices[1].name, "Receiver 👩‍💻 é");
         assert!(sanitize_device_reply("not JSON").is_err());
     }
 
     #[test]
     fn now_playing_output_sanitizes_controls_and_keeps_the_human_shape() {
         assert_eq!(
-            format_now_playing("playing\tGo\u{1b}[31m\u{7}\tThe\u{0} Band\tFirst\t65000\t180000"),
-            "▶ Go [31m  — The  Band  [1:05 / 3:00]"
+            format_now_playing(
+                "playing\tCafé 👩‍💻\u{1b}\u{009b}\u{202e}\tThe\u{0}\u{2067} Band 東京\tFirst\t65000\t180000"
+            ),
+            "▶ Café 👩‍💻    — The   Band 東京  [1:05 / 3:00]"
         );
         assert_eq!(format_now_playing("stopped"), "Nothing playing");
     }

@@ -7,13 +7,14 @@
 //! idle when nothing is happening.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use librespot_core::authentication::Credentials;
 use librespot_protocol::authentication::AuthenticationType;
 use tokio::sync::{Semaphore, mpsc, watch};
 
+use crate::api::gateway::ApiRoute;
 use crate::api::models::*;
 use crate::api::{
     AccountId, ApiClient, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest,
@@ -219,16 +220,32 @@ impl ApiRequest {
         )
     }
 
-    /// Player mutations for one Spotify Connect target must reach the Web API
-    /// in command-loop order. A content-bearing play is still a play mutation;
-    /// target ids split queues so an unrelated device is never held behind it.
-    fn playback_mutation_target(&self) -> Option<Option<String>> {
+    /// The scheduler resources mutated by this request. An omitted device id
+    /// aliases whichever device is active when Spotify executes the request;
+    /// transfer additionally changes that global alias and its destination.
+    fn playback_mutation_lanes(&self) -> Option<PlaybackMutationLanes> {
         match self {
             Self::Remote { device_id, .. }
             | Self::PlayWithShuffle { device_id, .. }
-            | Self::AddToQueue { device_id, .. } => Some(device_id.clone()),
-            Self::Transfer { device_id, .. } => Some(Some(device_id.clone())),
+            | Self::AddToQueue { device_id, .. } => Some(match device_id {
+                Some(device_id) => PlaybackMutationLanes::explicit(device_id.clone()),
+                None => PlaybackMutationLanes::active(),
+            }),
+            Self::Transfer { device_id, .. } => {
+                Some(PlaybackMutationLanes::transfer(device_id.clone()))
+            }
             _ => None,
+        }
+    }
+
+    fn authoritative_playback_mutation(&self) -> bool {
+        match self {
+            Self::Remote { action, .. } => {
+                !matches!(action, RemoteAction::Next | RemoteAction::Previous)
+            }
+            Self::Transfer { .. } | Self::PlayWithShuffle { .. } => true,
+            Self::AddToQueue { .. } => false,
+            _ => false,
         }
     }
 }
@@ -1420,7 +1437,7 @@ struct Worker {
     http: reqwest::Client,
     api: Arc<ApiGateway>,
     background_api: Arc<Semaphore>,
-    playback_mutations: PlaybackMutationQueues,
+    playback_mutations: Arc<PlaybackMutationScheduler>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
@@ -1463,7 +1480,7 @@ impl Worker {
             web_client_id,
             api: Arc::new(ApiGateway::new(http.clone(), activity)),
             background_api: Arc::new(Semaphore::new(4)),
-            playback_mutations: PlaybackMutationQueues::default(),
+            playback_mutations: Arc::new(PlaybackMutationScheduler::default()),
             http,
             art,
             events,
@@ -1583,7 +1600,9 @@ impl Worker {
                     self.configure_personal_web_app(client_id)
                 }
             }
+            self.playback_mutations.retire_stale(&self.api);
         }
+        self.playback_mutations.retire_all();
         self.engine_connection.reset();
         self.engine_notifications.retire();
         if let Some(engine) = self.engine.take() {
@@ -2647,106 +2666,353 @@ struct ApiDispatchContext {
     waker: Waker,
 }
 
-#[derive(Default)]
-struct PlaybackMutationQueues {
-    queues: Mutex<HashMap<Option<String>, Weak<PlaybackMutationQueue>>>,
-}
-
-impl PlaybackMutationQueues {
-    fn enqueue(
-        &self,
-        target: Option<String>,
-        request: PlaybackMutation,
-    ) -> (Arc<PlaybackMutationQueue>, bool) {
-        let queue = {
-            let mut queues = self
-                .queues
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            queues.retain(|_, queue| queue.strong_count() > 0);
-            match queues.get(&target).and_then(Weak::upgrade) {
-                Some(queue) => queue,
-                None => {
-                    let queue = Arc::new(PlaybackMutationQueue::default());
-                    queues.insert(target, Arc::downgrade(&queue));
-                    queue
-                }
-            }
-        };
-        let start_worker = queue.enqueue(request);
-        (queue, start_worker)
-    }
-}
-
-#[derive(Default)]
-struct PlaybackMutationQueue {
-    state: Mutex<PlaybackMutationQueueState>,
-}
-
-#[derive(Default)]
-struct PlaybackMutationQueueState {
-    pending: VecDeque<PlaybackMutation>,
-    running: bool,
-}
-
 type RoutedClient = Result<(ApiSource, Arc<ApiClient>), ApiError>;
 
-struct PlaybackMutation {
-    request: ApiRequest,
-    client: RoutedClient,
+const MAX_RUNNING_PLAYBACK_MUTATIONS: usize = 6;
+const MAX_PENDING_PLAYBACK_MUTATIONS: usize = 32;
+
+/// Resources whose mutations can alias at Spotify's player endpoint. The
+/// active-device lane is global, while an explicit device lane remains
+/// independent. Transfer touches both because it changes the active alias and
+/// names the device that becomes active.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackMutationLanes {
+    active_device: bool,
+    device_id: Option<String>,
 }
 
-impl PlaybackMutationQueue {
-    fn enqueue(&self, request: PlaybackMutation) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.pending.push_back(request);
-        if state.running {
-            false
-        } else {
-            state.running = true;
-            true
+impl PlaybackMutationLanes {
+    fn active() -> Self {
+        Self {
+            active_device: true,
+            device_id: None,
         }
     }
 
-    fn next(&self) -> Option<PlaybackMutation> {
+    fn explicit(device_id: String) -> Self {
+        Self {
+            active_device: false,
+            device_id: Some(device_id),
+        }
+    }
+
+    fn transfer(device_id: String) -> Self {
+        Self {
+            active_device: true,
+            device_id: Some(device_id),
+        }
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        (self.active_device && other.active_device)
+            || self
+                .device_id
+                .as_ref()
+                .zip(other.device_id.as_ref())
+                .is_some_and(|(left, right)| left == right)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PlaybackSessionId {
+    source: ApiSource,
+    generation: u64,
+    revision: u64,
+}
+
+impl From<&ApiRoute> for PlaybackSessionId {
+    fn from(route: &ApiRoute) -> Self {
+        Self {
+            source: route.source,
+            generation: route.generation,
+            revision: route.revision,
+        }
+    }
+}
+
+struct PlaybackMutation {
+    id: u64,
+    lanes: PlaybackMutationLanes,
+    request: ApiRequest,
+}
+
+struct RunningPlaybackMutation {
+    lanes: PlaybackMutationLanes,
+    abort: tokio::task::AbortHandle,
+}
+
+struct PlaybackSessionQueue {
+    route: ApiRoute,
+    pending: VecDeque<PlaybackMutation>,
+    running: HashMap<u64, RunningPlaybackMutation>,
+}
+
+impl PlaybackSessionQueue {
+    fn new(route: ApiRoute) -> Self {
+        Self {
+            route,
+            pending: VecDeque::new(),
+            running: HashMap::new(),
+        }
+    }
+
+    /// Earlier blocked mutations reserve their lanes, preventing a later
+    /// conflicting request from overtaking while still allowing unrelated
+    /// explicit devices to run.
+    fn next_ready(&self) -> Option<usize> {
+        if self.running.len() >= MAX_RUNNING_PLAYBACK_MUTATIONS {
+            return None;
+        }
+        let mut reserved: Vec<&PlaybackMutationLanes> = self
+            .running
+            .values()
+            .map(|running| &running.lanes)
+            .collect();
+        for (index, mutation) in self.pending.iter().enumerate() {
+            let blocked = reserved
+                .iter()
+                .any(|lanes| lanes.conflicts_with(&mutation.lanes));
+            reserved.push(&mutation.lanes);
+            if !blocked {
+                return Some(index);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Default)]
+struct PlaybackMutationSchedulerState {
+    next_id: u64,
+    sessions: HashMap<PlaybackSessionId, PlaybackSessionQueue>,
+}
+
+#[derive(Default)]
+struct PlaybackMutationScheduler {
+    state: Mutex<PlaybackMutationSchedulerState>,
+}
+
+impl PlaybackMutationScheduler {
+    fn enqueue(
+        self: &Arc<Self>,
+        context: ApiDispatchContext,
+        request: ApiRequest,
+        lanes: PlaybackMutationLanes,
+    ) {
+        let authoritative = request.authoritative_playback_mutation();
+        let (mut state, route) = loop {
+            let route = match context.api.route_for(Operation::Playback) {
+                Ok(route) => route,
+                Err(error) => {
+                    tokio::spawn(async move {
+                        dispatch_one(&context, request, Some(Err(error))).await;
+                    });
+                    return;
+                }
+            };
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            self.retire_stale_locked(&mut state, &context.api);
+            if context.api.route_is_current(Operation::Playback, &route) {
+                break (state, route);
+            }
+        };
+        let identity = PlaybackSessionId::from(&route);
+        let mut rejected = None;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .expect("playback mutation id exhausted");
+        let mutation = PlaybackMutation {
+            id: state.next_id,
+            lanes,
+            request,
+        };
+        let session = state
+            .sessions
+            .entry(identity)
+            .or_insert_with(|| PlaybackSessionQueue::new(route.clone()));
+        // At the bound, preserve a newly submitted absolute state by
+        // replacing the oldest pending mutation. Relative commands are
+        // rejected instead of being silently dropped or replayed later.
+        if session.pending.len() < MAX_PENDING_PLAYBACK_MUTATIONS {
+            session.pending.push_back(mutation);
+        } else if authoritative {
+            rejected = session.pending.pop_front();
+            session.pending.push_back(mutation);
+        } else {
+            rejected = Some(mutation);
+        }
+        if let Some(rejected) = rejected {
+            let response = playback_backpressure_response(rejected.request);
+            context
+                .api
+                .with_current_route(Operation::Playback, &route, || {
+                    publish_api_response(&context, response);
+                });
+        }
+        self.pump_locked(&mut state, identity, &context);
+    }
+
+    fn complete(
+        self: &Arc<Self>,
+        identity: PlaybackSessionId,
+        mutation_id: u64,
+        context: ApiDispatchContext,
+        response: ApiResponse,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match state.pending.pop_front() {
-            Some(request) => Some(request),
-            None => {
-                state.running = false;
-                None
+        let Some(session) = state.sessions.get_mut(&identity) else {
+            return;
+        };
+        if session.running.remove(&mutation_id).is_none() {
+            return;
+        }
+        let route = session.route.clone();
+        let session_expired = matches!(response.error(), Some(ApiError::SignInExpired { .. }));
+        if !context
+            .api
+            .with_current_route(Operation::Playback, &route, || {
+                publish_api_response(&context, response);
+            })
+        {
+            Self::retire_session_locked(&mut state, identity);
+            return;
+        }
+        if session_expired {
+            Self::retire_session_locked(&mut state, identity);
+            return;
+        }
+        self.pump_locked(&mut state, identity, &context);
+        if state
+            .sessions
+            .get(&identity)
+            .is_some_and(|session| session.pending.is_empty() && session.running.is_empty())
+        {
+            state.sessions.remove(&identity);
+        }
+    }
+
+    fn pump_locked(
+        self: &Arc<Self>,
+        state: &mut PlaybackMutationSchedulerState,
+        identity: PlaybackSessionId,
+        context: &ApiDispatchContext,
+    ) {
+        loop {
+            let Some(index) = state
+                .sessions
+                .get(&identity)
+                .and_then(PlaybackSessionQueue::next_ready)
+            else {
+                return;
+            };
+            let (route, mutation) = {
+                let session = state
+                    .sessions
+                    .get_mut(&identity)
+                    .expect("ready playback session exists");
+                let mutation = session
+                    .pending
+                    .remove(index)
+                    .expect("ready playback mutation exists");
+                (session.route.clone(), mutation)
+            };
+            let mutation_id = mutation.id;
+            let running_lanes = mutation.lanes.clone();
+            let scheduler = Arc::clone(self);
+            let task_context = context.clone();
+            let task = tokio::spawn(async move {
+                let selected = Ok((route.source, Arc::clone(&route.client)));
+                let response = handle_routed(&task_context.api, mutation.request, selected).await;
+                scheduler.complete(identity, mutation_id, task_context, response);
+            });
+            state
+                .sessions
+                .get_mut(&identity)
+                .expect("running playback session exists")
+                .running
+                .insert(
+                    mutation_id,
+                    RunningPlaybackMutation {
+                        lanes: running_lanes,
+                        abort: task.abort_handle(),
+                    },
+                );
+        }
+    }
+
+    fn retire_stale(&self, api: &ApiGateway) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.retire_stale_locked(&mut state, api);
+    }
+
+    fn retire_stale_locked(&self, state: &mut PlaybackMutationSchedulerState, api: &ApiGateway) {
+        let stale: Vec<_> = state
+            .sessions
+            .iter()
+            .filter_map(|(identity, session)| {
+                (!api.route_is_current(Operation::Playback, &session.route)).then_some(*identity)
+            })
+            .collect();
+        for identity in stale {
+            Self::retire_session_locked(state, identity);
+        }
+    }
+
+    fn retire_all(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for (_, session) in state.sessions.drain() {
+            for running in session.running.into_values() {
+                running.abort.abort();
             }
         }
+    }
+
+    fn retire_session_locked(
+        state: &mut PlaybackMutationSchedulerState,
+        identity: PlaybackSessionId,
+    ) {
+        if let Some(session) = state.sessions.remove(&identity) {
+            for running in session.running.into_values() {
+                running.abort.abort();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.sessions.values().fold((0, 0), |counts, session| {
+            (
+                counts.0 + session.running.len(),
+                counts.1 + session.pending.len(),
+            )
+        })
     }
 }
 
 fn dispatch_api(
     context: ApiDispatchContext,
-    playback_mutations: &PlaybackMutationQueues,
+    playback_mutations: &Arc<PlaybackMutationScheduler>,
     request: ApiRequest,
 ) {
-    if let Some(target) = request.playback_mutation_target() {
-        // Bind queued work to the session selected now. Replacing that
-        // session clears this client's provider instead of rerouting an old
-        // command through its successor.
-        let client = context
-            .api
-            .client_for(operation_for(&context.api, &request));
-        let (queue, start_worker) =
-            playback_mutations.enqueue(target, PlaybackMutation { request, client });
-        if start_worker {
-            tokio::spawn(async move {
-                while let Some(mutation) = queue.next() {
-                    dispatch_one(&context, mutation.request, Some(mutation.client)).await;
-                }
-            });
-        }
+    if let Some(lanes) = request.playback_mutation_lanes() {
+        playback_mutations.enqueue(context, request, lanes);
     } else {
         tokio::spawn(async move {
             dispatch_one(&context, request, None).await;
@@ -2772,6 +3038,10 @@ async fn dispatch_one(
         Some(selected) => handle_routed(&context.api, request, selected).await,
         None => handle(&context.api, request).await,
     };
+    publish_api_response(context, response);
+}
+
+fn publish_api_response(context: &ApiDispatchContext, response: ApiResponse) {
     if let Some(ApiError::SignInExpired {
         api_source,
         session_generation,
@@ -2795,6 +3065,29 @@ async fn dispatch_one(
     }
     let _ = context.events.send(Event::Api(Box::new(response)));
     context.waker.wake();
+}
+
+fn playback_backpressure_response(request: ApiRequest) -> ApiResponse {
+    let error = ApiError::PlaybackBackpressure;
+    match request {
+        ApiRequest::Remote { action, .. } => ApiResponse::Remote {
+            action,
+            result: Err(error),
+        },
+        ApiRequest::Transfer { device_id, .. } => ApiResponse::Transferred {
+            device_id,
+            result: Err(error),
+        },
+        ApiRequest::PlayWithShuffle { .. } => ApiResponse::Remote {
+            action: RemoteAction::Play,
+            result: Err(error),
+        },
+        ApiRequest::AddToQueue { label, .. } => ApiResponse::QueueAdded {
+            label,
+            result: Err(error),
+        },
+        _ => unreachable!("only playback mutations enter the bounded scheduler"),
+    }
 }
 
 fn friendly_connect_error(error: &anyhow::Error) -> String {
@@ -3196,24 +3489,602 @@ pub(crate) async fn handle_for_transport_test(
 /// Exercises the production dispatcher while a transport test controls when
 /// each loopback response is released.
 #[cfg(test)]
+pub(crate) struct TransportDispatcher {
+    context: ApiDispatchContext,
+    playback_mutations: Arc<PlaybackMutationScheduler>,
+}
+
+#[cfg(test)]
+impl TransportDispatcher {
+    pub(crate) fn new(api: Arc<ApiGateway>) -> (Self, std::sync::mpsc::Receiver<Event>) {
+        let (events, replies) = std::sync::mpsc::channel();
+        let (commands, _command_replies) = mpsc::unbounded_channel();
+        let context = ApiDispatchContext {
+            api,
+            background_api: Arc::new(Semaphore::new(4)),
+            events,
+            commands,
+            waker: Waker::default(),
+        };
+        (
+            Self {
+                context,
+                playback_mutations: Arc::new(PlaybackMutationScheduler::default()),
+            },
+            replies,
+        )
+    }
+
+    pub(crate) fn dispatch(&self, request: ApiRequest) {
+        dispatch_api(self.context.clone(), &self.playback_mutations, request);
+    }
+
+    pub(crate) fn retire_stale(&self) {
+        self.playback_mutations.retire_stale(&self.context.api);
+    }
+
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.playback_mutations.counts()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.playback_mutations.retire_all();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn dispatch_for_transport_test(
     api: Arc<ApiGateway>,
     requests: Vec<ApiRequest>,
 ) -> std::sync::mpsc::Receiver<Event> {
-    let (events, replies) = std::sync::mpsc::channel();
-    let (commands, _command_replies) = mpsc::unbounded_channel();
-    let context = ApiDispatchContext {
-        api,
-        background_api: Arc::new(Semaphore::new(4)),
-        events,
-        commands,
-        waker: Waker::default(),
-    };
-    let playback_mutations = PlaybackMutationQueues::default();
+    let (dispatcher, replies) = TransportDispatcher::new(api);
     for request in requests {
-        dispatch_api(context.clone(), &playback_mutations, request);
+        dispatcher.dispatch(request);
     }
     replies
+}
+
+#[cfg(test)]
+mod playback_scheduler_tests {
+    use super::*;
+    use crate::api::test_support::{
+        DelayedResponses, ObservedRequest, read_request, write_response,
+    };
+    use std::io::Write as _;
+    use std::net::{Ipv4Addr, TcpListener};
+
+    fn authorized_gateway(port: u16, personal: bool) -> Arc<ApiGateway> {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let api = Arc::new(ApiGateway::new_at(
+            http,
+            Arc::new(NetActivity::default()),
+            &format!("http://127.0.0.1:{port}/v1"),
+        ));
+        let shared = api.begin_verification(ApiSource::Shared, |_| {
+            TokenProvider::Fixed("shared-token".into())
+        });
+        api.install(ApiSource::Shared, shared, AccountId::new("same"))
+            .expect("shared session");
+        if personal {
+            let generation = api.begin_verification(ApiSource::Personal, |_| {
+                TokenProvider::Fixed("personal-token".into())
+            });
+            api.install(ApiSource::Personal, generation, AccountId::new("same"))
+                .expect("personal session");
+        }
+        api
+    }
+
+    fn transfer(device_id: &str) -> ApiRequest {
+        ApiRequest::Transfer {
+            device_id: device_id.into(),
+            play: true,
+        }
+    }
+
+    fn remote(action: RemoteAction, device_id: Option<&str>) -> ApiRequest {
+        ApiRequest::Remote {
+            action,
+            device_id: device_id.map(str::to_owned),
+            play: None,
+            position_ms: 0,
+            percent: 0,
+            flag: false,
+            repeat: String::new(),
+        }
+    }
+
+    fn request_label(request: &ObservedRequest) -> String {
+        if request.request_line == "PUT /v1/me/player HTTP/1.1" {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("transfer body")["device_ids"][0]
+                .as_str()
+                .expect("transfer destination")
+                .to_owned()
+        } else {
+            request.request_line.clone()
+        }
+    }
+
+    async fn delayed_pair(first: ApiRequest, second: ApiRequest) -> (Vec<ObservedRequest>, usize) {
+        let server = DelayedResponses::start(2);
+        let replies =
+            dispatch_for_transport_test(authorized_gateway(server.port, true), vec![first, second]);
+        let observed = server.observe().await;
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..2 {
+                assert!(matches!(
+                    replies.recv_timeout(Duration::from_secs(2)),
+                    Ok(Event::Api(_))
+                ));
+            }
+        })
+        .await
+        .expect("reply collector joins");
+        observed
+    }
+
+    struct BlockedFirstServer {
+        port: u16,
+        first: Option<tokio::sync::oneshot::Receiver<ObservedRequest>>,
+        second: Option<tokio::sync::oneshot::Receiver<ObservedRequest>>,
+        release: std::sync::mpsc::Sender<()>,
+        done: tokio::sync::oneshot::Receiver<usize>,
+    }
+
+    impl BlockedFirstServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback API");
+            let port = listener.local_addr().expect("API address").port();
+            let (first_tx, first) = tokio::sync::oneshot::channel();
+            let (second_tx, second) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let (mut first_stream, _) = listener.accept().expect("old request");
+                first_tx
+                    .send(read_request(&first_stream))
+                    .expect("publish old request");
+                listener.set_nonblocking(true).expect("nonblocking accept");
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let second_stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "successor request was blocked");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept successor request: {error}"),
+                    }
+                };
+                let second_request = read_request(&second_stream);
+                second_tx
+                    .send(second_request)
+                    .expect("publish successor request");
+                write_response(second_stream, "200 OK", &[], "{}");
+                release_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("release old request");
+                let _ = first_stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                );
+                let deadline = Instant::now() + Duration::from_millis(250);
+                let mut unexpected = 0;
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = read_request(&stream);
+                            write_response(stream, "200 OK", &[], "{}");
+                            unexpected += 1;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("probe retired queue: {error}"),
+                    }
+                }
+                let _ = done_tx.send(unexpected);
+            });
+            Self {
+                port,
+                first: Some(first),
+                second: Some(second),
+                release,
+                done,
+            }
+        }
+
+        async fn first(&mut self) -> ObservedRequest {
+            self.first
+                .take()
+                .expect("first request receiver")
+                .await
+                .expect("first request arrives")
+        }
+
+        async fn second(&mut self) -> ObservedRequest {
+            self.second
+                .take()
+                .expect("second request receiver")
+                .await
+                .expect("second request arrives")
+        }
+
+        async fn finish(self) -> usize {
+            self.release.send(()).expect("release old response");
+            self.done.await.expect("server exits")
+        }
+    }
+
+    async fn receive_one_api_reply(
+        replies: std::sync::mpsc::Receiver<Event>,
+    ) -> std::sync::mpsc::Receiver<Event> {
+        tokio::task::spawn_blocking(move || {
+            assert!(matches!(
+                replies.recv_timeout(Duration::from_secs(2)),
+                Ok(Event::Api(_))
+            ));
+            replies
+        })
+        .await
+        .expect("reply collector joins")
+    }
+
+    #[tokio::test]
+    async fn transfers_share_the_global_active_device_lane_in_both_orders() {
+        for destinations in [["speaker-a", "speaker-b"], ["speaker-b", "speaker-a"]] {
+            let (observed, arrived_early) =
+                delayed_pair(transfer(destinations[0]), transfer(destinations[1])).await;
+            assert_eq!(arrived_early, 0, "the second transfer must not race");
+            assert_eq!(
+                observed.iter().map(request_label).collect::<Vec<_>>(),
+                destinations
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_orders_active_alias_and_destination_mutations() {
+        let cases = [
+            (
+                transfer("speaker-a"),
+                remote(RemoteAction::Pause, None),
+                [
+                    "speaker-a".to_owned(),
+                    "PUT /v1/me/player/pause HTTP/1.1".to_owned(),
+                ],
+            ),
+            (
+                remote(RemoteAction::Play, None),
+                transfer("speaker-a"),
+                [
+                    "PUT /v1/me/player/play HTTP/1.1".to_owned(),
+                    "speaker-a".to_owned(),
+                ],
+            ),
+            (
+                transfer("speaker-a"),
+                remote(RemoteAction::Pause, Some("speaker-a")),
+                [
+                    "speaker-a".to_owned(),
+                    "PUT /v1/me/player/pause?device_id=speaker-a HTTP/1.1".to_owned(),
+                ],
+            ),
+            (
+                remote(RemoteAction::Play, Some("speaker-a")),
+                transfer("speaker-a"),
+                [
+                    "PUT /v1/me/player/play?device_id=speaker-a HTTP/1.1".to_owned(),
+                    "speaker-a".to_owned(),
+                ],
+            ),
+        ];
+        for (first, second, expected) in cases {
+            let (observed, arrived_early) = delayed_pair(first, second).await;
+            assert_eq!(arrived_early, 0, "aliased mutations must not race");
+            assert_eq!(
+                observed.iter().map(request_label).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_does_not_block_an_unrelated_explicit_device() {
+        let (observed, arrived_early) = delayed_pair(
+            transfer("speaker-a"),
+            remote(RemoteAction::Pause, Some("speaker-b")),
+        )
+        .await;
+        assert_eq!(arrived_early, 1);
+        assert_eq!(observed.len(), 2);
+        assert!(
+            observed
+                .iter()
+                .any(|request| request_label(request) == "speaker-a")
+        );
+        assert!(observed.iter().any(|request| {
+            request.request_line == "PUT /v1/me/player/pause?device_id=speaker-b HTTP/1.1"
+        }));
+    }
+
+    #[tokio::test]
+    async fn blocked_transfer_reserves_its_aliases_without_blocking_other_devices() {
+        let server = DelayedResponses::start(4);
+        let replies = dispatch_for_transport_test(
+            authorized_gateway(server.port, true),
+            vec![
+                remote(RemoteAction::Play, Some("speaker-a")),
+                transfer("speaker-a"),
+                remote(RemoteAction::Pause, None),
+                remote(RemoteAction::Pause, Some("speaker-b")),
+            ],
+        );
+        let (observed, arrived_early) = server.observe().await;
+        assert_eq!(arrived_early, 1, "only speaker-b may bypass the wait");
+        assert_eq!(
+            observed.iter().map(request_label).collect::<Vec<_>>(),
+            [
+                "PUT /v1/me/player/play?device_id=speaker-a HTTP/1.1",
+                "PUT /v1/me/player/pause?device_id=speaker-b HTTP/1.1",
+                "speaker-a",
+                "PUT /v1/me/player/pause HTTP/1.1",
+            ]
+        );
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..4 {
+                assert!(matches!(
+                    replies.recv_timeout(Duration::from_secs(2)),
+                    Ok(Event::Api(_))
+                ));
+            }
+        })
+        .await
+        .expect("reply collector joins");
+    }
+
+    #[tokio::test]
+    async fn personal_replacement_retires_running_and_queued_mutations() {
+        let mut server = BlockedFirstServer::start();
+        let api = authorized_gateway(server.port, true);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+        dispatcher.dispatch(remote(RemoteAction::Play, Some("speaker")));
+        let first = server.first().await;
+        assert_eq!(
+            first.authorization.as_deref(),
+            Some("Bearer personal-token")
+        );
+        assert_eq!(dispatcher.counts(), (1, 1));
+
+        let generation = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-successor".into())
+        });
+        api.install(ApiSource::Personal, generation, AccountId::new("same"))
+            .expect("successor session");
+        dispatcher.retire_stale();
+        assert_eq!(dispatcher.counts(), (0, 0));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+
+        let second = server.second().await;
+        assert_eq!(
+            second.authorization.as_deref(),
+            Some("Bearer personal-successor")
+        );
+        assert_eq!(
+            second.request_line,
+            "PUT /v1/me/player/pause?device_id=speaker HTTP/1.1"
+        );
+        let replies = receive_one_api_reply(replies).await;
+        assert_eq!(
+            server.finish().await,
+            0,
+            "old queued work must be discarded"
+        );
+        assert!(matches!(
+            replies.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn signout_retires_shared_work_before_a_new_shared_session() {
+        let mut server = BlockedFirstServer::start();
+        let api = authorized_gateway(server.port, false);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+        dispatcher.dispatch(remote(RemoteAction::Play, Some("speaker")));
+        let first = server.first().await;
+        assert_eq!(first.authorization.as_deref(), Some("Bearer shared-token"));
+
+        api.clear_all();
+        dispatcher.retire_stale();
+        assert_eq!(dispatcher.counts(), (0, 0));
+        let generation = api.begin_verification(ApiSource::Shared, |_| {
+            TokenProvider::Fixed("shared-successor".into())
+        });
+        api.install(ApiSource::Shared, generation, AccountId::new("same"))
+            .expect("new shared session");
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+
+        let second = server.second().await;
+        assert_eq!(
+            second.authorization.as_deref(),
+            Some("Bearer shared-successor")
+        );
+        let replies = receive_one_api_reply(replies).await;
+        assert_eq!(server.finish().await, 0);
+        assert!(matches!(
+            replies.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn personal_install_retires_the_previous_shared_playback_route() {
+        let mut server = BlockedFirstServer::start();
+        let api = authorized_gateway(server.port, false);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+        dispatcher.dispatch(remote(RemoteAction::Play, Some("speaker")));
+        let first = server.first().await;
+        assert_eq!(first.authorization.as_deref(), Some("Bearer shared-token"));
+
+        let generation = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-successor".into())
+        });
+        api.install(ApiSource::Personal, generation, AccountId::new("same"))
+            .expect("personal session");
+        dispatcher.retire_stale();
+        assert_eq!(dispatcher.counts(), (0, 0));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+
+        let second = server.second().await;
+        assert_eq!(
+            second.authorization.as_deref(),
+            Some("Bearer personal-successor")
+        );
+        let replies = receive_one_api_reply(replies).await;
+        assert_eq!(server.finish().await, 0);
+        assert!(matches!(
+            replies.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        dispatcher.shutdown();
+    }
+
+    async fn assert_stale_completion_suppressed(status: &'static str, body: &'static str) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback API");
+        let port = listener.local_addr().expect("API address").port();
+        let (seen_tx, seen) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("old request");
+            let request = read_request(&stream);
+            seen_tx.send(request).expect("publish request");
+            release_rx.recv().expect("release old request");
+            write_response(stream, status, &[], body);
+            let _ = done_tx.send(());
+        });
+        let api = authorized_gateway(port, true);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        dispatcher.dispatch(remote(RemoteAction::Pause, Some("speaker")));
+        let old = seen.await.expect("old request arrives");
+        assert_eq!(old.authorization.as_deref(), Some("Bearer personal-token"));
+
+        let generation = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-successor".into())
+        });
+        api.install(ApiSource::Personal, generation, AccountId::new("same"))
+            .expect("successor session");
+        release_tx.send(()).expect("release response");
+        done.await.expect("server exits");
+        for _ in 0..100 {
+            if dispatcher.counts() == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(matches!(
+            replies.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(dispatcher.counts(), (0, 0));
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_success_and_ordinary_error_completions_are_both_suppressed() {
+        assert_stale_completion_suppressed("200 OK", "{}").await;
+        assert_stale_completion_suppressed(
+            "500 Internal Server Error",
+            r#"{"error":{"status":500,"message":"old failure"}}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn playback_queue_is_bounded_and_retains_the_latest_absolute_mutation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback API");
+        let port = listener.local_addr().expect("API address").port();
+        let (first_tx, first) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let (first_stream, _) = listener.accept().expect("first request");
+            let first_request = read_request(&first_stream);
+            first_tx.send(()).expect("first request arrived");
+            release_rx.recv().expect("release lane");
+            write_response(first_stream, "200 OK", &[], "{}");
+            let mut requests = vec![first_request];
+            while requests.len() < MAX_PENDING_PLAYBACK_MUTATIONS + 1 {
+                let (stream, _) = listener.accept().expect("queued request");
+                requests.push(read_request(&stream));
+                write_response(stream, "200 OK", &[], "{}");
+            }
+            observed_tx.send(requests).expect("publish requests");
+        });
+        let api = authorized_gateway(port, true);
+        let (dispatcher, replies) = TransportDispatcher::new(api);
+        let total = MAX_PENDING_PLAYBACK_MUTATIONS + 3;
+        for percent in 0..total {
+            dispatcher.dispatch(ApiRequest::Remote {
+                action: RemoteAction::Volume,
+                device_id: Some("speaker".into()),
+                play: None,
+                position_ms: 0,
+                percent: u8::try_from(percent).expect("test volume"),
+                flag: false,
+                repeat: String::new(),
+            });
+        }
+        first.await.expect("first request reaches transport");
+        assert_eq!(dispatcher.counts(), (1, MAX_PENDING_PLAYBACK_MUTATIONS));
+        release_tx.send(()).expect("release lane");
+        let observed = observed.await.expect("all retained requests finish");
+        assert_eq!(observed.len(), MAX_PENDING_PLAYBACK_MUTATIONS + 1);
+        assert_eq!(
+            observed.last().expect("latest request").request_line,
+            format!(
+                "PUT /v1/me/player/volume?device_id=speaker&volume_percent={} HTTP/1.1",
+                total - 1
+            )
+        );
+
+        let (errors, successes) = tokio::task::spawn_blocking(move || {
+            let mut errors = 0;
+            let mut successes = 0;
+            for _ in 0..total {
+                match replies
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("one response per submitted mutation")
+                {
+                    Event::Api(response) => match *response {
+                        ApiResponse::Remote {
+                            result: Err(ApiError::PlaybackBackpressure),
+                            ..
+                        } => errors += 1,
+                        ApiResponse::Remote { result: Ok(()), .. } => successes += 1,
+                        _ => panic!("unexpected bounded scheduler response"),
+                    },
+                    _ => panic!("unexpected bounded scheduler event"),
+                }
+            }
+            (errors, successes)
+        })
+        .await
+        .expect("reply collector joins");
+        assert_eq!(errors, 2);
+        assert_eq!(successes, MAX_PENDING_PLAYBACK_MUTATIONS + 1);
+        assert_eq!(dispatcher.counts(), (0, 0));
+        dispatcher.shutdown();
+    }
 }
 
 /// Spotify's transcription of the track, when the local session can ask for

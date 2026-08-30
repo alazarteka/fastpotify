@@ -5769,8 +5769,8 @@ mod tests {
             playback: Playback::Playing,
             track: Some(crate::player::LocalTrack {
                 uri: "spotify:track:t1".to_owned(),
-                title: "Go\tNow\n\u{1b}[31m\u{7}".to_owned(),
-                artists: vec!["The\u{0} Band".to_owned()],
+                title: "Café 東京 👩‍💻 e\u{301}\t\n\u{1b}\u{009b}\u{202e}\u{2066}".to_owned(),
+                artists: vec!["The\u{0}\u{2067} Band".to_owned()],
                 album: "First".to_owned(),
                 art_url: Some("https://i.scdn.co/image/abc".to_owned()),
                 duration_ms: 200_000,
@@ -5785,9 +5785,9 @@ mod tests {
         app.saved.insert("spotify:track:t1".to_owned(), true);
         app.devices = vec![
             Device {
-                id: Some("abc\u{009b}123".to_owned()),
-                name: "Kitchen\tspeaker\u{009b}".to_owned(),
-                kind: "Speak\u{009b}er".to_owned(),
+                id: Some("abc\u{009b}\u{202e}123".to_owned()),
+                name: "Kitchen\tspeaker\u{061c}".to_owned(),
+                kind: "Speak\u{2066}er".to_owned(),
                 is_active: true,
                 is_restricted: true,
                 supports_volume: Some(false),
@@ -5814,8 +5814,8 @@ mod tests {
             fields,
             [
                 "playing",
-                "Go Now  [31m ",
-                "The  Band",
+                "Café 東京 👩‍💻 e\u{301}      ",
+                "The   Band",
                 "First",
                 "20000",
                 "200000",
@@ -5835,7 +5835,7 @@ mod tests {
                 .all(|character| !character.is_control())
         );
         assert_eq!(devices.as_array().map(Vec::len), Some(2));
-        assert_eq!(devices[0]["id"], "abc 123");
+        assert_eq!(devices[0]["id"], "abc  123");
         assert_eq!(devices[0]["name"], "Kitchen speaker ");
         assert_eq!(devices[0]["kind"], "Speak er");
         assert_eq!(devices[0]["active"], true);
