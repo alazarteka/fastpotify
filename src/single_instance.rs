@@ -29,8 +29,10 @@
 //! `fastpotify next` (or a Raycast script running it) connects, sends one
 //! `fastpotify:<verb>` line, and reads one reply line. Playback verbs are
 //! acknowledged with `fastpotify:ok` and land in the same action queue the
-//! tray and the media keys feed; `nowplaying` is answered from a snapshot
-//! the app keeps fresh, so the listener thread never touches app state.
+//! tray and the media keys feed; `nowplaying` and `devices` are answered from
+//! snapshots the app keeps fresh, so the listener thread never touches app
+//! state. Free-text arguments are bounded and validated before they enter
+//! that queue.
 //! Linux needs none of this: MPRIS already gives `playerctl` the same verbs,
 //! so the D-Bus name stays a pure instance guard there.
 
@@ -68,6 +70,18 @@ pub enum ControlCommand {
     ToggleMute,
     ToggleShuffle,
     CycleRepeat,
+    SetShuffle(bool),
+    SetRepeat(crate::player::RepeatMode),
+    /// Absolute position, in milliseconds.
+    SeekTo(u32),
+    /// Save the playing music track to the library, or take it back out.
+    ToggleSaved,
+    /// Play a validated music `spotify:` URI.
+    PlayUri(String),
+    /// Move playback to a Spotify Connect device, by id.
+    Transfer(String),
+    /// Refresh the device list after a control client reads its snapshot.
+    RefreshDevices,
 }
 
 /// Holds whatever marks this process as the running instance. Dropping it
@@ -81,6 +95,8 @@ pub struct Guard {
     /// One line about the current track, kept fresh by the app so the
     /// listener can answer `nowplaying` without touching app state.
     now_playing: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The last Spotify Connect device response, encoded as JSON.
+    devices: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Guard {
@@ -93,11 +109,18 @@ impl Guard {
     pub fn now_playing_slot(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
         std::sync::Arc::clone(&self.now_playing)
     }
+
+    pub fn devices_slot(&self) -> std::sync::Arc<std::sync::Mutex<String>> {
+        std::sync::Arc::clone(&self.devices)
+    }
 }
 
 /// What the app writes into the snapshot slot before anything plays, and
 /// what `nowplaying` reports when nothing does.
 pub const NOTHING_PLAYING: &str = "stopped";
+
+/// A stable JSON shape before Spotify has returned any devices.
+pub const NO_DEVICES: &str = "[]";
 
 /// Loopback port that marks a running instance on platforms without a bus.
 /// Registered to nothing; chosen high and out of the ephemeral range.
@@ -106,22 +129,30 @@ const INSTANCE_PORT: u16 = 47_113;
 
 /// Every request and reply starts with this, so a foreign program that
 /// happens to hold the port is never mistaken for Fastpotify.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 const PREFIX: &str = "fastpotify:";
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 const OK_REPLY: &str = "fastpotify:ok";
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 const NOW_REPLY: &str = "fastpotify:now ";
+#[cfg(any(test, not(target_os = "linux")))]
+const DEVICES_REPLY: &str = "fastpotify:devices ";
+#[cfg(any(test, not(target_os = "linux")))]
+const MAX_CONTROL_LINE_BYTES: usize = 256;
+#[cfg(any(test, not(target_os = "linux")))]
+const MAX_CONTROL_REPLY_BYTES: u64 = 64 * 1024;
 
 /// What the running instance said back.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 pub enum Reply {
     /// The command was accepted.
     Ok,
     /// The `nowplaying` snapshot: [`NOTHING_PLAYING`], or tab-separated
     /// `state, title, artists, album, position_ms, duration_ms, volume,
-    /// shuffle, repeat`.
+    /// shuffle, repeat, art_url, saved, device`.
     NowPlaying(String),
+    /// A JSON array of device objects.
+    Devices(String),
 }
 
 /// Sends one verb to the running instance and reads its reply.
@@ -130,12 +161,18 @@ pub fn send(verb: &str) -> std::io::Result<Reply> {
     send_to(INSTANCE_PORT, verb)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn send_to(port: u16, verb: &str) -> std::io::Result<Reply> {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpStream};
     use std::time::Duration;
 
+    if PREFIX.len() + verb.len() + 1 > MAX_CONTROL_LINE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the Fastpotify control request is too long",
+        ));
+    }
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(format!("{PREFIX}{verb}\n").as_bytes())?;
@@ -143,12 +180,22 @@ fn send_to(port: u16, verb: &str) -> std::io::Result<Reply> {
     // line. An instance predating the control channel ignores unknown verbs
     // without replying; the read times out and that surfaces as an error.
     let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
+    stream
+        .take(MAX_CONTROL_REPLY_BYTES + 1)
+        .read_to_string(&mut reply)?;
+    if reply.len() as u64 > MAX_CONTROL_REPLY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the Fastpotify control reply is too long",
+        ));
+    }
     let line = reply.lines().next().unwrap_or("");
     if line == OK_REPLY {
         Ok(Reply::Ok)
     } else if let Some(snapshot) = line.strip_prefix(NOW_REPLY) {
         Ok(Reply::NowPlaying(snapshot.to_owned()))
+    } else if let Some(snapshot) = line.strip_prefix(DEVICES_REPLY) {
+        Ok(Reply::Devices(snapshot.to_owned()))
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -165,6 +212,7 @@ pub fn acquire(waker: &crate::backend::Waker) -> Outcome {
     let unguarded = || Guard {
         commands: Default::default(),
         now_playing: Arc::new(Mutex::new(NOTHING_PLAYING.to_owned())),
+        devices: Arc::new(Mutex::new(NO_DEVICES.to_owned())),
     };
 
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
@@ -184,10 +232,11 @@ pub fn acquire(waker: &crate::backend::Waker) -> Outcome {
     let guard = unguarded();
     let commands = Arc::clone(&guard.commands);
     let now_playing = Arc::clone(&guard.now_playing);
+    let devices = Arc::clone(&guard.devices);
     let waker = waker.clone();
     let spawned = std::thread::Builder::new()
         .name("fastpotify-instance".to_owned())
-        .spawn(move || serve(listener, &commands, &now_playing, &waker));
+        .spawn(move || serve(listener, &commands, &now_playing, &devices, &waker));
     if let Err(error) = spawned {
         log::warn!("cannot listen for other launches: {error}");
     }
@@ -196,15 +245,24 @@ pub fn acquire(waker: &crate::backend::Waker) -> Outcome {
 
 /// Answers control clients until the listener closes. One request line and
 /// one reply line per connection.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn serve(
     listener: std::net::TcpListener,
     commands: &std::sync::Mutex<Vec<ControlCommand>>,
     now_playing: &std::sync::Mutex<String>,
+    devices: &std::sync::Mutex<String>,
     waker: &crate::backend::Waker,
 ) {
     use std::io::Write;
     use std::time::Duration;
+
+    let queue = |command| {
+        commands
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(command);
+        waker.wake();
+    };
 
     for mut stream in listener.incoming().flatten() {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -214,11 +272,7 @@ fn serve(
         match parse(&line) {
             Some(Request::Command(command)) => {
                 let _ = stream.write_all(format!("{OK_REPLY}\n").as_bytes());
-                commands
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(command);
-                waker.wake();
+                queue(command);
             }
             Some(Request::NowPlaying) => {
                 let snapshot = now_playing
@@ -226,6 +280,14 @@ fn serve(
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 let _ = stream.write_all(format!("{NOW_REPLY}{snapshot}\n").as_bytes());
+            }
+            Some(Request::Devices) => {
+                let snapshot = devices
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
+                let _ = stream.write_all(format!("{DEVICES_REPLY}{snapshot}\n").as_bytes());
+                queue(ControlCommand::RefreshDevices);
             }
             // Not our client; say nothing and hang up.
             None => {}
@@ -235,13 +297,14 @@ fn serve(
 
 /// A parsed request line: a command for the app, or a read the listener
 /// answers itself.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 enum Request {
     Command(ControlCommand),
     NowPlaying,
+    Devices,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn parse(line: &str) -> Option<Request> {
     let verb = line.trim_end().strip_prefix(PREFIX)?;
     let (verb, argument) = match verb.split_once(' ') {
@@ -256,23 +319,68 @@ fn parse(line: &str) -> Option<Request> {
         ("next", None) => ControlCommand::Next,
         ("previous", None) => ControlCommand::Previous,
         ("seek-by", Some(ms)) => ControlCommand::SeekBy(ms.parse().ok()?),
+        ("seek-to", Some(ms)) => ControlCommand::SeekTo(ms.parse().ok()?),
         ("volume-by", Some(delta)) => ControlCommand::VolumeBy(delta.parse().ok()?),
         ("volume-set", Some(volume)) => ControlCommand::SetVolume(volume.parse().ok()?),
         ("mute", None) => ControlCommand::ToggleMute,
         ("shuffle", None) => ControlCommand::ToggleShuffle,
+        ("shuffle-set", Some("on")) => ControlCommand::SetShuffle(true),
+        ("shuffle-set", Some("off")) => ControlCommand::SetShuffle(false),
         ("repeat", None) => ControlCommand::CycleRepeat,
+        ("repeat-set", Some("off")) => ControlCommand::SetRepeat(crate::player::RepeatMode::Off),
+        ("repeat-set", Some("context")) => {
+            ControlCommand::SetRepeat(crate::player::RepeatMode::Context)
+        }
+        ("repeat-set", Some("track")) => {
+            ControlCommand::SetRepeat(crate::player::RepeatMode::Track)
+        }
+        ("save-toggle", None) => ControlCommand::ToggleSaved,
+        ("play-uri", Some(uri)) => ControlCommand::PlayUri(spotify_music_uri(uri)?),
+        ("transfer", Some(id)) => ControlCommand::Transfer(device_id(id)?),
         ("nowplaying", None) => return Some(Request::NowPlaying),
+        ("devices", None) => return Some(Request::Devices),
         _ => return None,
     };
     Some(Request::Command(command))
 }
 
+/// Only music contexts cross the local control socket; podcast and audiobook
+/// playback are not part of this protocol.
+#[cfg(any(test, not(target_os = "linux")))]
+fn spotify_music_uri(text: &str) -> Option<String> {
+    let mut parts = text.split(':');
+    let shaped = matches!(parts.next(), Some("spotify"))
+        && matches!(
+            parts.next(),
+            Some("track" | "album" | "playlist" | "artist")
+        );
+    let id = parts.next()?;
+    let valid_id = !id.is_empty()
+        && parts.next().is_none()
+        && text.len() <= 128
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '%' | '+')
+        });
+    (shaped && valid_id).then(|| text.to_owned())
+}
+
+/// Spotify Connect device ids are opaque, bounded tokens supplied by the API.
+#[cfg(any(test, not(target_os = "linux")))]
+fn device_id(text: &str) -> Option<String> {
+    let shaped = !text.is_empty()
+        && text.len() <= 64
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    shaped.then(|| text.to_owned())
+}
+
 /// Reads up to the first newline. A line too long to be one of ours, or any
 /// read error, disqualifies the client.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn read_line(stream: &mut std::net::TcpStream) -> Option<String> {
     use std::io::Read;
-    let mut buffer = [0u8; 256];
+    let mut buffer = [0u8; MAX_CONTROL_LINE_BYTES];
     let mut filled = 0;
     loop {
         if filled == buffer.len() {
@@ -302,6 +410,7 @@ pub fn acquire(_waker: &crate::backend::Waker) -> Outcome {
         _connection: connection,
         commands: Default::default(),
         now_playing: std::sync::Arc::new(std::sync::Mutex::new(NOTHING_PLAYING.to_owned())),
+        devices: std::sync::Arc::new(std::sync::Mutex::new(NO_DEVICES.to_owned())),
     };
 
     let connection = match Connection::session() {
@@ -357,9 +466,10 @@ fn raise_running_instance(connection: &mpris_server::zbus::blocking::Connection)
     false
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::RepeatMode;
 
     fn command(line: &str) -> Option<ControlCommand> {
         match parse(line) {
@@ -404,9 +514,51 @@ mod tests {
             command("fastpotify:repeat"),
             Some(ControlCommand::CycleRepeat)
         );
+        assert_eq!(
+            command("fastpotify:seek-to 90000"),
+            Some(ControlCommand::SeekTo(90_000))
+        );
+        assert_eq!(
+            command("fastpotify:shuffle-set on"),
+            Some(ControlCommand::SetShuffle(true))
+        );
+        assert_eq!(
+            command("fastpotify:shuffle-set off"),
+            Some(ControlCommand::SetShuffle(false))
+        );
+        assert_eq!(
+            command("fastpotify:repeat-set track"),
+            Some(ControlCommand::SetRepeat(RepeatMode::Track))
+        );
+        assert_eq!(
+            command("fastpotify:repeat-set context"),
+            Some(ControlCommand::SetRepeat(RepeatMode::Context))
+        );
+        assert_eq!(
+            command("fastpotify:repeat-set off"),
+            Some(ControlCommand::SetRepeat(RepeatMode::Off))
+        );
+        assert_eq!(
+            command("fastpotify:save-toggle"),
+            Some(ControlCommand::ToggleSaved)
+        );
+        assert_eq!(
+            command("fastpotify:play-uri spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),
+            Some(ControlCommand::PlayUri(
+                "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M".to_owned()
+            ))
+        );
+        assert_eq!(
+            command("fastpotify:transfer a1b2c3d4e5"),
+            Some(ControlCommand::Transfer("a1b2c3d4e5".to_owned()))
+        );
         assert!(matches!(
             parse("fastpotify:nowplaying"),
             Some(Request::NowPlaying)
+        ));
+        assert!(matches!(
+            parse("fastpotify:devices"),
+            Some(Request::Devices)
         ));
     }
 
@@ -417,12 +569,50 @@ mod tests {
         assert!(parse("fastpotify:seek-by soon").is_none());
         assert!(parse("fastpotify:volume-set 999").is_none());
         assert!(parse("fastpotify:next please").is_none());
+        assert!(parse("fastpotify:shuffle-set maybe").is_none());
+        assert!(parse("fastpotify:repeat-set all").is_none());
+        assert!(parse("fastpotify:play-uri https://open.spotify.com/track/x").is_none());
+        assert!(parse("fastpotify:play-uri spotify:show:x").is_none());
+        assert!(parse("fastpotify:play-uri spotify:episode:x").is_none());
+        assert!(parse("fastpotify:play-uri spotify:audiobook:x").is_none());
+        assert!(parse("fastpotify:play-uri spotify:collection:tracks").is_none());
+        assert!(parse("fastpotify:play-uri spotify:track:x:extra").is_none());
+        assert!(parse("fastpotify:transfer ../speaker").is_none());
         assert!(parse("").is_none());
     }
 
-    /// The whole channel over a real socket: what `fastpotify next` sends is
-    /// what the app finds in its queue, and `nowplaying` reads back the
-    /// snapshot the app published.
+    #[test]
+    fn a_control_client_bounds_requests_and_replies() {
+        use std::io::Write as _;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let request_error = send_to(0, &"x".repeat(256))
+            .err()
+            .expect("an oversized request is rejected before connecting");
+        assert_eq!(request_error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one client");
+            let _ = stream.write_all(
+                format!(
+                    "{NOW_REPLY}{}\n",
+                    "x".repeat(MAX_CONTROL_REPLY_BYTES as usize)
+                )
+                .as_bytes(),
+            );
+        });
+
+        let reply_error = send_to(port, "nowplaying")
+            .err()
+            .expect("an oversized reply is rejected");
+        assert_eq!(reply_error.kind(), std::io::ErrorKind::InvalidData);
+        server.join().expect("server exits");
+    }
+
+    /// The whole channel over a real socket: commands reach the app queue and
+    /// read verbs return the snapshots the app published.
     #[test]
     fn a_client_reaches_the_command_queue_and_the_snapshot() {
         use std::net::{Ipv4Addr, TcpListener};
@@ -433,17 +623,20 @@ mod tests {
         let port = listener.local_addr().expect("a bound address").port();
         let commands: Arc<Mutex<Vec<ControlCommand>>> = Default::default();
         let now_playing = Arc::new(Mutex::new("playing\tGo\tThe Band".to_owned()));
+        let devices = Arc::new(Mutex::new(r#"[{"id":"speaker"}]"#.to_owned()));
         let served = {
             let commands = Arc::clone(&commands);
             let now_playing = Arc::clone(&now_playing);
+            let devices = Arc::clone(&devices);
             let waker = crate::backend::Waker::default();
-            std::thread::spawn(move || serve(listener, &commands, &now_playing, &waker))
+            std::thread::spawn(move || serve(listener, &commands, &now_playing, &devices, &waker))
         };
 
         // #when
         let accepted = send_to(port, "next").expect("a reply");
         let volume = send_to(port, "volume-by -5").expect("a reply");
         let snapshot = send_to(port, "nowplaying").expect("a reply");
+        let device_snapshot = send_to(port, "devices").expect("a reply");
         let refused = send_to(port, "frobnicate");
 
         // #then
@@ -451,14 +644,26 @@ mod tests {
         assert!(matches!(volume, Reply::Ok));
         match snapshot {
             Reply::NowPlaying(line) => assert_eq!(line, "playing\tGo\tThe Band"),
-            Reply::Ok => panic!("nowplaying answered with an acknowledgement"),
+            Reply::Ok | Reply::Devices(_) => {
+                panic!("nowplaying answered with the wrong reply type")
+            }
+        }
+        match device_snapshot {
+            Reply::Devices(json) => assert_eq!(json, r#"[{"id":"speaker"}]"#),
+            Reply::Ok | Reply::NowPlaying(_) => {
+                panic!("devices answered with the wrong reply type")
+            }
         }
         // An unknown verb gets no reply at all, so the client sees a closed
         // connection rather than a command it never sent being obeyed.
         assert!(refused.is_err());
         assert_eq!(
             *commands.lock().expect("the queue"),
-            vec![ControlCommand::Next, ControlCommand::VolumeBy(-5)]
+            vec![
+                ControlCommand::Next,
+                ControlCommand::VolumeBy(-5),
+                ControlCommand::RefreshDevices,
+            ]
         );
 
         drop(served);

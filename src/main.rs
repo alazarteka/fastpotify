@@ -72,6 +72,8 @@ enum Control {
         #[arg(allow_negative_numbers = true)]
         seconds: i64,
     },
+    /// Seek to a position, in seconds from the start
+    SeekTo { seconds: u32 },
     /// Set the volume to a percentage
     Volume {
         #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
@@ -89,14 +91,27 @@ enum Control {
     },
     /// Toggle mute
     Mute,
-    /// Toggle shuffle
-    Shuffle,
-    /// Cycle the repeat mode
-    Repeat,
+    /// Toggle shuffle, or set it outright
+    Shuffle { state: Option<OnOff> },
+    /// Cycle the repeat mode, or set it outright
+    Repeat { mode: Option<Repeat> },
+    /// Save the playing music track to your library, or take it back out
+    Like,
+    /// Play a Spotify music URI: a track, album, playlist, or artist
+    PlayUri { uri: String },
+    /// List the Spotify Connect devices
+    Devices {
+        /// Print the JSON the running instance sent instead.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Move playback to a device, by the id `devices` prints
+    Transfer { device_id: String },
     /// Print the playing track
     NowPlaying {
         /// Print the fields tab-separated instead: state, title, artists,
-        /// album, position_ms, duration_ms, volume, shuffle, repeat.
+        /// album, position_ms, duration_ms, volume, shuffle, repeat,
+        /// art_url, saved, device.
         #[arg(long)]
         raw: bool,
     },
@@ -104,11 +119,28 @@ enum Control {
     Show,
 }
 
-/// Sends one control verb to the running instance. Speaks over the
-/// single-instance loopback socket, which Linux does not have.
-#[cfg(not(target_os = "linux"))]
-fn run_control(control: Control) -> i32 {
-    let raw = matches!(control, Control::NowPlaying { raw: true });
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Repeat {
+    /// Play through and stop
+    Off,
+    /// Repeat the album, playlist, or queue
+    Context,
+    /// Repeat this track
+    Track,
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn control_request(control: &Control) -> (String, bool) {
+    let raw = matches!(
+        control,
+        Control::NowPlaying { raw: true } | Control::Devices { raw: true }
+    );
     let verb = match control {
         Control::PlayPause => "playpause".to_owned(),
         Control::Play => "play".to_owned(),
@@ -116,15 +148,43 @@ fn run_control(control: Control) -> i32 {
         Control::Next => "next".to_owned(),
         Control::Previous => "previous".to_owned(),
         Control::Seek { seconds } => format!("seek-by {}", seconds.saturating_mul(1000)),
+        Control::SeekTo { seconds } => format!("seek-to {}", seconds.saturating_mul(1000)),
         Control::Volume { percent } => format!("volume-set {percent}"),
         Control::VolumeUp { percent } => format!("volume-by {percent}"),
         Control::VolumeDown { percent } => format!("volume-by -{percent}"),
         Control::Mute => "mute".to_owned(),
-        Control::Shuffle => "shuffle".to_owned(),
-        Control::Repeat => "repeat".to_owned(),
+        Control::Shuffle { state: None } => "shuffle".to_owned(),
+        Control::Shuffle { state: Some(state) } => format!(
+            "shuffle-set {}",
+            match state {
+                OnOff::On => "on",
+                OnOff::Off => "off",
+            }
+        ),
+        Control::Repeat { mode: None } => "repeat".to_owned(),
+        Control::Repeat { mode: Some(mode) } => format!(
+            "repeat-set {}",
+            match mode {
+                Repeat::Off => "off",
+                Repeat::Context => "context",
+                Repeat::Track => "track",
+            }
+        ),
+        Control::Like => "save-toggle".to_owned(),
+        Control::PlayUri { uri } => format!("play-uri {uri}"),
+        Control::Devices { .. } => "devices".to_owned(),
+        Control::Transfer { device_id } => format!("transfer {device_id}"),
         Control::NowPlaying { .. } => "nowplaying".to_owned(),
         Control::Show => "show".to_owned(),
     };
+    (verb, raw)
+}
+
+/// Sends one control verb to the running instance. Speaks over the
+/// single-instance loopback socket, which Linux does not have.
+#[cfg(not(target_os = "linux"))]
+fn run_control(control: Control) -> i32 {
+    let (verb, raw) = control_request(&control);
     match single_instance::send(&verb) {
         Ok(single_instance::Reply::Ok) => 0,
         Ok(single_instance::Reply::NowPlaying(snapshot)) => {
@@ -132,6 +192,20 @@ fn run_control(control: Control) -> i32 {
                 println!("{snapshot}");
             } else {
                 println!("{}", format_now_playing(&snapshot));
+            }
+            0
+        }
+        Ok(single_instance::Reply::Devices(snapshot)) => {
+            if raw {
+                println!("{snapshot}");
+            } else {
+                match format_devices(&snapshot) {
+                    Ok(devices) => print!("{devices}"),
+                    Err(error) => {
+                        eprintln!("The running Fastpotify sent an invalid device list: {error}");
+                        return 1;
+                    }
+                }
             }
             0
         }
@@ -152,7 +226,7 @@ fn run_control(_control: Control) -> i32 {
 }
 
 /// The `nowplaying` snapshot as one human-readable line.
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn format_now_playing(snapshot: &str) -> String {
     let mut fields = snapshot.split('\t');
     let state = fields.next().unwrap_or_default();
@@ -172,6 +246,126 @@ fn format_now_playing(snapshot: &str) -> String {
             )
         }
         _ => "Nothing playing".to_owned(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[cfg(any(test, not(target_os = "linux")))]
+struct ControlDeviceSnapshot {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    restricted: bool,
+    #[serde(default)]
+    supports_volume: Option<bool>,
+}
+
+/// The `devices` snapshot as one line per device, the active one marked.
+/// The id comes first because `fastpotify transfer` is what it is for.
+#[cfg(any(test, not(target_os = "linux")))]
+fn format_devices(snapshot: &str) -> Result<String, serde_json::Error> {
+    let devices: Vec<ControlDeviceSnapshot> = serde_json::from_str(snapshot)?;
+    let clean = |field: &str| {
+        field
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+    };
+    Ok(devices
+        .iter()
+        .map(|device| {
+            let limitation = if device.restricted {
+                "restricted"
+            } else if device.supports_volume == Some(false) {
+                "fixed volume"
+            } else {
+                ""
+            };
+            format!(
+                "{}{}\t{}\t{}\t{limitation}\n",
+                if device.active { "* " } else { "  " },
+                clean(&device.id),
+                clean(&device.name),
+                clean(&device.kind),
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    fn request(arguments: &[&str]) -> (String, bool) {
+        let mut argv = vec!["fastpotify"];
+        argv.extend_from_slice(arguments);
+        let cli = Cli::try_parse_from(argv).expect("valid control arguments");
+        control_request(&cli.control.expect("a control command"))
+    }
+
+    #[test]
+    fn expanded_cli_controls_map_to_the_socket_protocol() {
+        assert_eq!(request(&["seek-to", "90"]), ("seek-to 90000".into(), false));
+        assert_eq!(request(&["shuffle"]), ("shuffle".into(), false));
+        assert_eq!(
+            request(&["shuffle", "off"]),
+            ("shuffle-set off".into(), false)
+        );
+        assert_eq!(
+            request(&["repeat", "track"]),
+            ("repeat-set track".into(), false)
+        );
+        assert_eq!(request(&["like"]), ("save-toggle".into(), false));
+        assert_eq!(
+            request(&["play-uri", "spotify:track:one"]),
+            ("play-uri spotify:track:one".into(), false)
+        );
+        assert_eq!(
+            request(&["transfer", "speaker"]),
+            ("transfer speaker".into(), false)
+        );
+        assert_eq!(request(&["devices", "--raw"]), ("devices".into(), true));
+        assert_eq!(
+            request(&["now-playing", "--raw"]),
+            ("nowplaying".into(), true)
+        );
+    }
+
+    #[test]
+    fn device_output_marks_capabilities_and_sanitizes_terminal_fields() {
+        let snapshot = r#"[
+            {"id":"a","name":"Kitchen\tspeaker","kind":"Speaker","active":true,
+             "restricted":true,"supports_volume":false},
+            {"id":"b","name":"Phone\nupstairs","kind":"Smartphone","active":false,
+             "restricted":false,"supports_volume":false}
+        ]"#;
+
+        assert_eq!(
+            format_devices(snapshot).expect("device JSON"),
+            "* a\tKitchen speaker\tSpeaker\trestricted\n  b\tPhone upstairs\tSmartphone\tfixed volume\n"
+        );
+        assert!(format_devices("not JSON").is_err());
+    }
+
+    #[test]
+    fn now_playing_output_keeps_the_existing_human_shape() {
+        assert_eq!(
+            format_now_playing("playing\tGo\tThe Band\tFirst\t65000\t180000"),
+            "▶ Go — The Band  [1:05 / 3:00]"
+        );
+        assert_eq!(format_now_playing("stopped"), "Nothing playing");
     }
 }
 

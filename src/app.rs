@@ -256,6 +256,10 @@ pub struct App {
     /// Where the now-playing snapshot goes for the control channel's
     /// `nowplaying` verb to answer from.
     control_now_playing: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    /// Where the last device response goes for the control channel's
+    /// `devices` verb to answer from.
+    control_devices: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    control_devices_stale: bool,
     /// Sample data is loaded and nothing is asked of Spotify.
     pub offline: bool,
     pub palette: Palette,
@@ -456,6 +460,8 @@ impl App {
             wants_show: false,
             control_commands: None,
             control_now_playing: None,
+            control_devices: None,
+            control_devices_stale: true,
             offline: false,
             palette: Palette::dark(),
             applied_dark: None,
@@ -554,6 +560,7 @@ impl App {
     pub fn set_remote_control(&mut self, guard: &crate::single_instance::Guard) {
         self.control_commands = Some(guard.commands());
         self.control_now_playing = Some(guard.now_playing_slot());
+        self.control_devices = Some(guard.devices_slot());
     }
 
     /// Per-window setup: fonts, icons, loaders, theme. Called every time a
@@ -1118,6 +1125,7 @@ impl App {
         self.saved_pending.clear();
         self.queue = Loadable::NotLoaded;
         self.devices.clear();
+        self.control_devices_stale = true;
         self.devices_fetched_at = None;
         self.search.results = Loadable::NotLoaded;
         self.search.committed.clear();
@@ -1471,6 +1479,30 @@ impl App {
                 ControlCommand::ToggleMute => Some(Action::ToggleMute),
                 ControlCommand::ToggleShuffle => Some(Action::ToggleShuffle),
                 ControlCommand::CycleRepeat => Some(Action::CycleRepeat),
+                ControlCommand::SetShuffle(shuffle) => Some(Action::SetShuffle(shuffle)),
+                ControlCommand::SetRepeat(mode) => Some(Action::SetRepeat(mode)),
+                ControlCommand::SeekTo(position_ms) => Some(Action::Seek(position_ms)),
+                ControlCommand::ToggleSaved => match self.now_playing() {
+                    Some(now) if now.is_episode => {
+                        self.toast("The external like control supports music tracks only");
+                        None
+                    }
+                    Some(now) => Some(Action::ToggleSaved(now.uri)),
+                    None => None,
+                },
+                ControlCommand::PlayUri(uri) if util::uri_kind(&uri) == Some("track") => {
+                    Some(Action::PlayUris {
+                        uris: vec![uri],
+                        index: 0,
+                    })
+                }
+                ControlCommand::PlayUri(uri) => Some(Action::PlayContext {
+                    uri,
+                    offset_uri: None,
+                    offset_index: None,
+                }),
+                ControlCommand::Transfer(device_id) => Some(Action::Transfer(device_id)),
+                ControlCommand::RefreshDevices => Some(Action::RefreshDevices),
             };
             if let Some(action) = action {
                 self.actions.push(action);
@@ -1562,25 +1594,39 @@ impl App {
             let snapshot = self.control_snapshot();
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
         }
+        if self.control_devices_stale
+            && let Some(slot) = self.control_devices.clone()
+        {
+            let snapshot = self.control_devices_snapshot();
+            *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = snapshot;
+            self.control_devices_stale = false;
+        }
     }
 
     /// One line for the control channel's `nowplaying` verb: tab-separated
     /// `state, title, artists, album, position_ms, duration_ms, volume,
-    /// shuffle, repeat`, or [`crate::single_instance::NOTHING_PLAYING`].
+    /// shuffle, repeat, art_url, saved, device`, or
+    /// [`crate::single_instance::NOTHING_PLAYING`]. The original nine fields
+    /// stay in place for existing scripts.
     fn control_snapshot(&self) -> String {
         let Some(now) = self.now_playing() else {
             return crate::single_instance::NOTHING_PLAYING.to_owned();
         };
         let state = if now.playing { "playing" } else { "paused" };
-        let repeat = match now.repeat {
-            RepeatMode::Off => "off",
-            RepeatMode::Context => "context",
-            RepeatMode::Track => "track",
+        let saved = match self.is_saved(&now.uri) {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        };
+        let device = match (now.device_name.as_deref(), now.local) {
+            (Some(name), _) => name,
+            (None, true) => self.settings.device_name.as_str(),
+            (None, false) => "",
         };
         // Tabs separate the fields, so a tab inside one would shift the rest.
-        let clean = |text: &str| text.replace('\t', " ");
+        let clean = |text: &str| text.replace(['\t', '\r', '\n'], " ");
         format!(
-            "{state}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{repeat}",
+            "{state}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{saved}\t{}",
             clean(&now.title),
             clean(&now.subtitle),
             clean(&now.album_name),
@@ -1588,7 +1634,29 @@ impl App {
             now.duration_ms,
             now.volume_percent,
             if now.shuffle { "on" } else { "off" },
+            now.repeat.api_name(),
+            clean(now.art_url.as_deref().unwrap_or_default()),
+            clean(device),
         )
+    }
+
+    fn control_devices_snapshot(&self) -> String {
+        let devices: Vec<_> = self
+            .devices
+            .iter()
+            .filter_map(|device| {
+                Some(serde_json::json!({
+                    "id": device.id.as_deref()?,
+                    "name": device.name,
+                    "kind": device.kind,
+                    "active": device.is_active,
+                    "restricted": device.is_restricted,
+                    "supports_volume": device.supports_volume,
+                }))
+            })
+            .collect();
+        serde_json::to_string(&devices)
+            .unwrap_or_else(|_| crate::single_instance::NO_DEVICES.to_owned())
     }
 
     // ---- loading ---------------------------------------------------------------
@@ -1972,6 +2040,7 @@ impl App {
                 match result {
                     Ok(devices) => {
                         self.devices = devices;
+                        self.control_devices_stale = true;
                         if let Some(selected) = &self.selected_device
                             && !self
                                 .devices
@@ -5509,6 +5578,210 @@ mod tests {
             app.actions
         );
         assert!(queue.lock().expect("the queue").is_empty());
+    }
+
+    #[test]
+    fn expanded_control_commands_reuse_music_and_device_actions() {
+        let mut app = headless_app();
+        let active = active_local_snapshot(&app, false, Playback::Playing);
+        app.handle_local(active);
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        app.control_commands = Some(std::sync::Arc::clone(&queue));
+
+        queue.lock().expect("the queue").extend([
+            ControlCommand::SetShuffle(true),
+            ControlCommand::SetRepeat(RepeatMode::Track),
+            ControlCommand::SeekTo(90_000),
+            ControlCommand::ToggleSaved,
+            ControlCommand::PlayUri("spotify:track:one".to_owned()),
+            ControlCommand::PlayUri("spotify:album:many".to_owned()),
+            ControlCommand::Transfer("speaker".to_owned()),
+            ControlCommand::RefreshDevices,
+        ]);
+        app.handle_control_commands();
+
+        assert!(
+            matches!(
+                app.actions.as_slice(),
+                [
+                    Action::SetShuffle(true),
+                    Action::SetRepeat(RepeatMode::Track),
+                    Action::Seek(90_000),
+                    Action::ToggleSaved(uri),
+                    Action::PlayUris { uris, index: 0 },
+                    Action::PlayContext {
+                        uri: context,
+                        offset_uri: None,
+                        offset_index: None,
+                    },
+                    Action::Transfer(device),
+                    Action::RefreshDevices,
+                ] if uri == "spotify:track:active"
+                    && uris == &["spotify:track:one"]
+                    && context == "spotify:album:many"
+                    && device == "speaker"
+            ),
+            "{:?}",
+            app.actions
+        );
+        assert!(queue.lock().expect("the queue").is_empty());
+    }
+
+    #[test]
+    fn expanded_controls_cannot_bypass_a_restricted_remote_device() {
+        let mut app = headless_app();
+        app.local_ready = false;
+        let mut state = active_api_snapshot_on(false, "restricted");
+        state.device.as_mut().expect("remote device").is_restricted = true;
+        deliver_remote_snapshot(&mut app, state);
+        app.selected_device = Some("restricted".to_owned());
+        app.backend.take_api_requests();
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        queue.lock().expect("the queue").extend([
+            ControlCommand::SeekTo(90_000),
+            ControlCommand::SetShuffle(true),
+            ControlCommand::SetRepeat(RepeatMode::Track),
+            ControlCommand::PlayUri("spotify:track:one".to_owned()),
+            ControlCommand::Transfer("restricted".to_owned()),
+        ]);
+        app.control_commands = Some(queue);
+
+        app.handle_control_commands();
+        app.apply_actions(&egui::Context::default());
+
+        assert!(app.backend.take_api_requests().is_empty());
+        assert!(!app.shuffle_wanted);
+        assert!(app.actions.is_empty());
+        assert!(
+            app.toasts
+                .iter()
+                .all(|toast| toast.message.contains("restricted"))
+        );
+    }
+
+    #[test]
+    fn external_like_refuses_an_episode_honestly() {
+        let mut app = headless_app();
+        app.handle_local(LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:episode:not-music".to_owned(),
+                is_episode: true,
+                ..crate::player::LocalTrack::default()
+            }),
+            ..LocalState::default()
+        });
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        queue
+            .lock()
+            .expect("the queue")
+            .push(ControlCommand::ToggleSaved);
+        app.control_commands = Some(queue);
+
+        app.handle_control_commands();
+
+        assert!(app.actions.is_empty());
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("The external like control supports music tracks only")
+        );
+    }
+
+    #[test]
+    fn control_snapshots_append_state_and_publish_device_capabilities() {
+        let mut app = headless_app();
+        app.handle_local(LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:t1".to_owned(),
+                title: "Go\tNow\n".to_owned(),
+                artists: vec!["The Band".to_owned()],
+                album: "First".to_owned(),
+                art_url: Some("https://i.scdn.co/image/abc".to_owned()),
+                duration_ms: 200_000,
+                ..crate::player::LocalTrack::default()
+            }),
+            position_ms: 20_000,
+            volume: percent_to_volume(35),
+            shuffle: true,
+            repeat: RepeatMode::Track,
+            ..LocalState::default()
+        });
+        app.saved.insert("spotify:track:t1".to_owned(), true);
+        app.devices = vec![
+            Device {
+                id: Some("abc123".to_owned()),
+                name: "Kitchen\tspeaker".to_owned(),
+                kind: "Speaker".to_owned(),
+                is_active: true,
+                is_restricted: true,
+                supports_volume: Some(false),
+                ..Device::default()
+            },
+            Device {
+                id: None,
+                name: "Unaddressable".to_owned(),
+                ..Device::default()
+            },
+        ];
+
+        let fields: Vec<_> = app
+            .control_snapshot()
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        let devices: serde_json::Value =
+            serde_json::from_str(&app.control_devices_snapshot()).expect("device JSON");
+
+        assert_eq!(
+            fields,
+            [
+                "playing",
+                "Go Now ",
+                "The Band",
+                "First",
+                "20000",
+                "200000",
+                "35",
+                "on",
+                "track",
+                "https://i.scdn.co/image/abc",
+                "yes",
+                "Fastpotify",
+            ]
+        );
+        assert_eq!(devices.as_array().map(Vec::len), Some(1));
+        assert_eq!(devices[0]["id"], "abc123");
+        assert_eq!(devices[0]["name"], "Kitchen\tspeaker");
+        assert_eq!(devices[0]["active"], true);
+        assert_eq!(devices[0]["restricted"], true);
+        assert_eq!(devices[0]["supports_volume"], false);
+    }
+
+    #[test]
+    fn a_device_response_reaches_the_control_snapshot_once() {
+        let mut app = headless_app();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::single_instance::NO_DEVICES.to_owned(),
+        ));
+        app.control_devices = Some(std::sync::Arc::clone(&slot));
+        app.control_devices_stale = false;
+
+        app.handle_api(ApiResponse::Devices(Ok(vec![Device {
+            id: Some("abc123".to_owned()),
+            name: "Kitchen".to_owned(),
+            kind: "Speaker".to_owned(),
+            is_active: true,
+            ..Device::default()
+        }])));
+        app.sync_media_controls();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&slot.lock().expect("the slot")).expect("device JSON");
+        assert_eq!(written[0]["id"], "abc123");
+        assert!(!app.control_devices_stale);
     }
 
     /// `play` and `pause` say what state to end in, so the one that would

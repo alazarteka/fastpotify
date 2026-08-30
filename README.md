@@ -170,16 +170,33 @@ fastpotify play-pause          fastpotify volume 40
 fastpotify play                fastpotify volume-up [percent]
 fastpotify pause               fastpotify volume-down [percent]
 fastpotify next                fastpotify mute
-fastpotify previous            fastpotify shuffle
-fastpotify seek 15             fastpotify repeat
-fastpotify seek -- -15         fastpotify show
-fastpotify now-playing [--raw]
+fastpotify previous            fastpotify shuffle [on|off]
+fastpotify seek 15             fastpotify repeat [off|context|track]
+fastpotify seek -- -15         fastpotify like
+fastpotify seek-to 90          fastpotify play-uri spotify:playlist:37i9…
+fastpotify show                fastpotify transfer <device-id>
+fastpotify now-playing [--raw] fastpotify devices [--raw]
 ```
+
+`shuffle` and `repeat` toggle without an argument and set an explicit state
+with one. `like` changes the saved state of the playing music track;
+`play-uri` accepts music track, album, playlist, and artist URIs only.
 
 `now-playing` prints one readable line; `--raw` prints the fields
 tab-separated — state, title, artists, album, position_ms, duration_ms,
-volume, shuffle, repeat — for a script that wants one of them. A verb exits
-non-zero when Fastpotify is not running.
+volume, shuffle, repeat, art_url, saved, device — for a script that wants one
+of them. The final three fields are appended so scripts written for the
+original nine retain their field positions. `saved` is `yes`, `no`, or
+`unknown` while Spotify's answer is pending.
+
+`devices` lists Spotify Connect devices with the id first and the active one
+marked `*`; its final column says `restricted` when Spotify disallows remote
+control or `fixed volume` when only volume is unavailable. `--raw` emits JSON,
+including those capability flags. Reading the list also requests a refresh,
+so a cold first read can be empty and the next one current. Unsupported target
+controls are refused by the running app with a visible warning instead of
+being sent to the wrong device. A verb exits non-zero when Fastpotify is not
+running or the control reply is invalid.
 
 That is enough for a launcher such as Raycast or Alfred to drive playback
 through its own script commands.
