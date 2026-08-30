@@ -208,7 +208,7 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     // on screen this puts equal breathing room above and beneath the
     // cluster.
     let cy = region.center().y - 8.0;
-    let enabled = now.is_some_and(|now| now.can_control) || app.is_connected();
+    let enabled = app.target_can_control() && (now.is_some() || app.is_connected());
     let playing = now.is_some_and(|now| now.playing);
     let loading = now.is_some_and(|now| now.loading);
     let shuffle = now.is_some_and(|now| now.shuffle);
@@ -230,11 +230,13 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
         rect
     };
     let centered = |ui: &mut egui::Ui, rect: Rect| {
-        ui.new_child(
-            UiBuilder::new()
-                .max_rect(rect)
-                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
-        )
+        let mut builder = UiBuilder::new()
+            .max_rect(rect)
+            .layout(Layout::centered_and_justified(egui::Direction::LeftToRight));
+        if !enabled {
+            builder = builder.disabled();
+        }
+        ui.new_child(builder)
     };
 
     let shuffle_color = if shuffle { palette.accent } else { dim };
@@ -366,11 +368,13 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     );
     let slider_rect =
         Rect::from_center_size(pos2(region.center().x, row_cy), vec2(slider_width, 16.0));
-    let mut slider_ui = ui.new_child(
-        UiBuilder::new()
-            .max_rect(slider_rect)
-            .layout(Layout::left_to_right(Align::Center)),
-    );
+    let mut slider_builder = UiBuilder::new()
+        .max_rect(slider_rect)
+        .layout(Layout::left_to_right(Align::Center));
+    if !enabled {
+        slider_builder = slider_builder.disabled();
+    }
+    let mut slider_ui = ui.new_child(slider_builder);
     let fraction = if duration > 0 {
         position as f32 / duration as f32
     } else {
@@ -413,46 +417,54 @@ fn extras(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>) {
         Some(fraction) => (fraction * 100.0).round() as u8,
         None => volume,
     };
-    match thin_slider(
-        ui,
-        &palette,
-        egui::Id::new("volume-slider"),
-        shown as f32 / 100.0,
-        92.0,
-        palette.accent,
-    ) {
-        SliderEvent::Dragging(value) => {
-            app.volume_preview = Some(value);
-            // Local volume is cheap to apply continuously; remote goes on release.
-            if now.is_none_or(|now| now.local) {
-                app.actions
-                    .push(Action::PreviewVolume((value * 100.0).round() as u8));
+    let volume_enabled = app.target_can_set_volume() && (now.is_some() || app.is_connected());
+    let volume_controls = ui.add_enabled_ui(volume_enabled, |ui| {
+        match thin_slider(
+            ui,
+            &palette,
+            egui::Id::new("volume-slider"),
+            shown as f32 / 100.0,
+            92.0,
+            palette.accent,
+        ) {
+            SliderEvent::Dragging(value) => {
+                app.volume_preview = Some(value);
+                // Local volume is cheap to apply continuously; remote goes on release.
+                if now.is_none_or(|now| now.local) {
+                    app.actions
+                        .push(Action::PreviewVolume((value * 100.0).round() as u8));
+                }
             }
+            SliderEvent::Committed(value) => {
+                app.volume_preview = None;
+                app.actions
+                    .push(Action::SetVolume((value * 100.0).round() as u8));
+            }
+            SliderEvent::None => {}
         }
-        SliderEvent::Committed(value) => {
-            app.volume_preview = None;
-            app.actions
-                .push(Action::SetVolume((value * 100.0).round() as u8));
+        let volume_icon = match shown {
+            0 => Icon::VolumeX,
+            1..=33 => Icon::Volume,
+            34..=66 => Icon::Volume1,
+            _ => Icon::Volume2,
+        };
+        if theme::icon_button(
+            ui,
+            volume_icon,
+            18.0,
+            palette.secondary,
+            palette.text,
+            if shown == 0 { "Unmute" } else { "Mute" },
+        )
+        .clicked()
+        {
+            app.actions.push(Action::ToggleMute);
         }
-        SliderEvent::None => {}
-    }
-    let volume_icon = match shown {
-        0 => Icon::VolumeX,
-        1..=33 => Icon::Volume,
-        34..=66 => Icon::Volume1,
-        _ => Icon::Volume2,
-    };
-    if theme::icon_button(
-        ui,
-        volume_icon,
-        18.0,
-        palette.secondary,
-        palette.text,
-        if shown == 0 { "Unmute" } else { "Mute" },
-    )
-    .clicked()
-    {
-        app.actions.push(Action::ToggleMute);
+    });
+    if !volume_enabled {
+        volume_controls
+            .response
+            .on_disabled_hover_text("Volume control is unavailable on this device");
     }
     ui.add_space(4.0);
     let remote = now.is_some_and(|now| !now.local);

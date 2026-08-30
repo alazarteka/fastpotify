@@ -894,6 +894,8 @@ pub struct Backend {
     activity: Arc<NetActivity>,
     thread: Option<std::thread::JoinHandle<()>>,
     offline: bool,
+    #[cfg(test)]
+    api_requests: std::sync::Mutex<Vec<ApiRequest>>,
 }
 
 impl Backend {
@@ -952,6 +954,8 @@ impl Backend {
             activity,
             thread: Some(thread),
             offline: false,
+            #[cfg(test)]
+            api_requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -975,7 +979,22 @@ impl Backend {
     }
 
     pub fn api(&self, request: ApiRequest) {
+        #[cfg(test)]
+        self.api_requests
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(request.clone());
         self.send(Command::Api(request));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_api_requests(&self) -> Vec<ApiRequest> {
+        std::mem::take(
+            &mut *self
+                .api_requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
     }
 
     pub fn player(&self, command: PlayerCommand) {

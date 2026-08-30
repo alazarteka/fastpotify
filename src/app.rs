@@ -184,10 +184,33 @@ enum PlaybackOwner {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteCommand {
+    Action(RemoteAction),
+    AddToQueue,
+    Transfer,
+}
+
+fn remote_command_issue(device: Option<&Device>, command: RemoteCommand) -> Option<&'static str> {
+    let device = device?;
+    if device.is_restricted {
+        return Some(
+            "Spotify marks this device as restricted, so it cannot accept remote controls",
+        );
+    }
+    if command == RemoteCommand::Action(RemoteAction::Volume)
+        && device.supports_volume == Some(false)
+    {
+        return Some("This device does not expose volume control to Spotify apps");
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShuffleDispatch {
     Deferred,
     Local,
     Remote,
+    Unsupported,
 }
 
 /// How the application is being started.
@@ -312,8 +335,7 @@ pub struct App {
     last_window_pos: Option<[f32; 2]>,
     last_eviction: Instant,
     pub sign_in_url: Option<String>,
-    /// The Web API application the current sign-in belongs to, so Settings
-    /// can say whether the one named there is in use yet.
+    /// The optional personal Web API application currently ready for routing.
     pub web_app: Option<String>,
     pending_remote_position: Option<(u32, Instant)>,
     pending_remote_volume: Option<(u8, Instant)>,
@@ -618,6 +640,72 @@ impl App {
             PlaybackOwner::Local
         } else {
             PlaybackOwner::Remote
+        }
+    }
+
+    fn known_remote_device(&self, device_id: Option<&str>) -> Option<&Device> {
+        let active = self
+            .remote_fresh()
+            .and_then(|remote| remote.state.device.as_ref());
+        match device_id {
+            None => active,
+            Some(device_id) => active
+                .filter(|device| device.id.as_deref() == Some(device_id))
+                .or_else(|| {
+                    self.devices
+                        .iter()
+                        .find(|device| device.id.as_deref() == Some(device_id))
+                }),
+        }
+    }
+
+    fn remote_issue(
+        &self,
+        command: RemoteCommand,
+        device_id: Option<&str>,
+    ) -> Option<&'static str> {
+        remote_command_issue(self.known_remote_device(device_id), command)
+    }
+
+    fn allow_remote_command(&mut self, command: RemoteCommand, device_id: Option<&str>) -> bool {
+        if device_id.is_none() && self.remote_fresh().is_none() {
+            self.toast("Choose an active device first");
+            return false;
+        }
+        let Some(message) = self.remote_issue(command, device_id) else {
+            return true;
+        };
+        self.toast(message);
+        false
+    }
+
+    pub(crate) fn target_can_control(&self) -> bool {
+        match self.target() {
+            Target::Local => true,
+            Target::Remote(device_id) => {
+                (device_id.is_some() || self.remote_fresh().is_some())
+                    && self
+                        .remote_issue(
+                            RemoteCommand::Action(RemoteAction::Play),
+                            device_id.as_deref(),
+                        )
+                        .is_none()
+            }
+        }
+    }
+
+    pub(crate) fn target_can_set_volume(&self) -> bool {
+        match self.target() {
+            Target::Local => true,
+            Target::Remote(device_id) => {
+                (device_id.is_some() || self.remote_fresh().is_some())
+                    && self
+                        .remote_issue(
+                            RemoteCommand::Action(RemoteAction::Volume),
+                            device_id.as_deref(),
+                        )
+                        .is_none()
+            }
         }
     }
 
@@ -2688,12 +2776,18 @@ impl App {
 
     // ---- playback --------------------------------------------------------------
 
-    fn remote(&mut self, action: RemoteAction, device_id: Option<String>) {
+    fn remote(&mut self, action: RemoteAction, device_id: Option<String>) -> bool {
         if device_id.is_none() && self.remote_fresh().is_none() {
             // Spotify would only answer "no active device found".
             self.clear_play_pending();
             self.toast("Nothing is playing. Pick something first");
-            return;
+            return false;
+        }
+        if !self.allow_remote_command(RemoteCommand::Action(action), device_id.as_deref()) {
+            if matches!(action, RemoteAction::Play | RemoteAction::Pause) {
+                self.clear_play_pending();
+            }
+            return false;
         }
         self.backend.api(ApiRequest::Remote {
             action,
@@ -2704,6 +2798,7 @@ impl App {
             flag: false,
             repeat: String::new(),
         });
+        true
     }
 
     /// Remembers `uri` as the most recently played context, for the
@@ -2827,6 +2922,16 @@ impl App {
 
     /// Apply the listener's shuffle mode and start one ordered play request.
     fn play_request(&mut self, mut request: PlayRequest, enable_shuffle: bool) {
+        let target = self.target();
+        if let Target::Remote(device_id) = &target
+            && (device_id.is_some() || self.remote_fresh().is_some())
+            && !self.allow_remote_command(
+                RemoteCommand::Action(RemoteAction::Play),
+                device_id.as_deref(),
+            )
+        {
+            return;
+        }
         if enable_shuffle && !self.shuffle_wanted {
             self.shuffle_wanted = true;
             self.mark_session_dirty();
@@ -2864,7 +2969,7 @@ impl App {
             // state takes a poll or two to say the same thing.
             self.assume_context(context);
         }
-        match self.target() {
+        match target {
             Target::Local if !self.local.connected => {
                 self.queued_play = Some(QueuedPlay {
                     request: queued_request,
@@ -2885,7 +2990,7 @@ impl App {
                 }));
                 self.optimistic_playing = Some((true, Instant::now()));
             }
-            Target::Remote(Some(device_id)) => {
+            Target::Remote(device_id) if device_id.is_some() || self.remote_fresh().is_some() => {
                 self.queued_play = None;
                 self.pending_local_shuffle = None;
                 self.shuffle_set_at = Some(Instant::now());
@@ -2896,12 +3001,12 @@ impl App {
                             .device
                             .as_ref()
                             .and_then(|device| device.id.as_deref())
-                            == Some(device_id.as_str())
+                            == device_id.as_deref()
                 });
                 if shuffle_matches {
                     self.backend.api(ApiRequest::Remote {
                         action: RemoteAction::Play,
-                        device_id: Some(device_id),
+                        device_id,
                         play: Some(request),
                         position_ms: 0,
                         percent: 0,
@@ -2910,14 +3015,14 @@ impl App {
                     });
                 } else {
                     self.backend.api(ApiRequest::PlayWithShuffle {
-                        device_id: Some(device_id),
+                        device_id,
                         play: request,
                         shuffle,
                     });
                 }
                 self.optimistic_playing = Some((true, Instant::now()));
             }
-            Target::Remote(None) => {
+            Target::Remote(_) => {
                 // No remote device is active, and this computer's player is
                 // not ready. Never ask Spotify to play "nowhere": either
                 // wait for the connecting engine or ask for a device.
@@ -3081,10 +3186,13 @@ impl App {
                     return;
                 }
                 self.set_play_pending(vec!["::toggle".into()]);
-                if playing == Some(true) {
-                    self.remote(RemoteAction::Pause, device_id);
+                let sent = if playing == Some(true) {
+                    self.remote(RemoteAction::Pause, device_id)
                 } else {
-                    self.remote(RemoteAction::Play, device_id);
+                    self.remote(RemoteAction::Play, device_id)
+                };
+                if !sent {
+                    return;
                 }
             }
         }
@@ -3097,6 +3205,12 @@ impl App {
         match self.target() {
             Target::Local => self.backend.player(PlayerCommand::Seek(position_ms)),
             Target::Remote(device_id) => {
+                if !self.allow_remote_command(
+                    RemoteCommand::Action(RemoteAction::Seek),
+                    device_id.as_deref(),
+                ) {
+                    return;
+                }
                 self.pending_remote_position = Some((position_ms, Instant::now()));
                 self.backend.api(ApiRequest::Remote {
                     action: RemoteAction::Seek,
@@ -3149,6 +3263,12 @@ impl App {
             }
             Target::Remote(_) if !settle => {}
             Target::Remote(device_id) => {
+                if !self.allow_remote_command(
+                    RemoteCommand::Action(RemoteAction::Volume),
+                    device_id.as_deref(),
+                ) {
+                    return;
+                }
                 self.pending_remote_volume = Some((percent, Instant::now()));
                 self.backend.api(ApiRequest::Remote {
                     action: RemoteAction::Volume,
@@ -3198,9 +3318,19 @@ impl App {
     }
 
     fn set_shuffle(&mut self, shuffle: bool) -> ShuffleDispatch {
+        let target = self.target();
+        if let Target::Remote(device_id) = &target
+            && (device_id.is_some() || self.remote_fresh().is_some())
+            && !self.allow_remote_command(
+                RemoteCommand::Action(RemoteAction::Shuffle),
+                device_id.as_deref(),
+            )
+        {
+            return ShuffleDispatch::Unsupported;
+        }
         self.adopt_external_shuffle(shuffle);
         self.shuffle_set_at = Some(Instant::now());
-        match self.target() {
+        match target {
             Target::Local => {
                 if !self.local_ready || !self.local.connected || self.queued_play.is_some() {
                     self.pending_local_shuffle = Some(shuffle);
@@ -3211,7 +3341,7 @@ impl App {
                 self.backend.player(PlayerCommand::Shuffle(shuffle));
                 ShuffleDispatch::Local
             }
-            Target::Remote(None) => {
+            Target::Remote(None) if self.remote_fresh().is_none() => {
                 self.pending_local_shuffle = (self.queued_play.is_some()
                     || matches!(
                         self.local_playback,
@@ -3220,14 +3350,14 @@ impl App {
                 .then_some(shuffle);
                 ShuffleDispatch::Deferred
             }
-            Target::Remote(Some(device_id)) => {
+            Target::Remote(device_id) => {
                 self.pending_local_shuffle = None;
                 if let Some(remote) = self.remote.as_mut() {
                     remote.state.shuffle_state = shuffle;
                 }
                 self.backend.api(ApiRequest::Remote {
                     action: RemoteAction::Shuffle,
-                    device_id: Some(device_id),
+                    device_id,
                     play: None,
                     position_ms: 0,
                     percent: 0,
@@ -3246,6 +3376,12 @@ impl App {
                 self.backend.player(PlayerCommand::Repeat(mode));
             }
             Target::Remote(device_id) => {
+                if !self.allow_remote_command(
+                    RemoteCommand::Action(RemoteAction::Repeat),
+                    device_id.as_deref(),
+                ) {
+                    return;
+                }
                 if let Some(remote) = self.remote.as_mut() {
                     remote.state.repeat_state = mode.api_name().to_string();
                 }
@@ -3301,16 +3437,29 @@ impl App {
             self.dispatch_ready_local_work();
             return;
         }
+        if !self.allow_remote_command(RemoteCommand::Transfer, Some(&device_id)) {
+            return;
+        }
         let play = self.now_playing().is_some_and(|now| now.playing);
         self.pending_local_shuffle = None;
-        self.selected_device = Some(device_id.clone());
         self.backend.api(ApiRequest::Transfer { device_id, play });
     }
 
     fn add_to_queue(&mut self, uri: String, label: String) {
         let device_id = match self.target() {
             Target::Local => self.local_device_id.clone(),
-            Target::Remote(device_id) => device_id,
+            Target::Remote(device_id) => {
+                if device_id.is_none() && self.remote_fresh().is_none() {
+                    self.toast("Choose a device before adding to the queue");
+                    self.show_devices = true;
+                    self.refresh_devices();
+                    return;
+                }
+                if !self.allow_remote_command(RemoteCommand::AddToQueue, device_id.as_deref()) {
+                    return;
+                }
+                device_id
+            }
         };
         self.backend.api(ApiRequest::AddToQueue {
             uri,
@@ -3422,11 +3571,15 @@ impl App {
             Action::TogglePlay => self.toggle_play(),
             Action::Next => match self.target() {
                 Target::Local => self.backend.player(PlayerCommand::Next),
-                Target::Remote(device_id) => self.remote(RemoteAction::Next, device_id),
+                Target::Remote(device_id) => {
+                    self.remote(RemoteAction::Next, device_id);
+                }
             },
             Action::Previous => match self.target() {
                 Target::Local => self.backend.player(PlayerCommand::Previous),
-                Target::Remote(device_id) => self.remote(RemoteAction::Previous, device_id),
+                Target::Remote(device_id) => {
+                    self.remote(RemoteAction::Previous, device_id);
+                }
             },
             Action::Seek(position_ms) => self.seek(position_ms),
             Action::SeekBy(offset) => {
@@ -4292,6 +4445,155 @@ mod tests {
 
     fn deliver_remote_snapshot(app: &mut App, state: PlaybackState) {
         deliver_remote_state(app, Some(state));
+    }
+
+    #[test]
+    fn remote_device_capabilities_have_one_conservative_policy() {
+        let restricted = Device {
+            is_restricted: true,
+            supports_volume: Some(true),
+            ..Device::default()
+        };
+        for command in [
+            RemoteCommand::Action(RemoteAction::Play),
+            RemoteCommand::Action(RemoteAction::Seek),
+            RemoteCommand::Action(RemoteAction::Volume),
+            RemoteCommand::Action(RemoteAction::Shuffle),
+            RemoteCommand::Action(RemoteAction::Repeat),
+            RemoteCommand::AddToQueue,
+            RemoteCommand::Transfer,
+        ] {
+            assert!(remote_command_issue(Some(&restricted), command).is_some());
+        }
+
+        let fixed_volume = Device {
+            supports_volume: Some(false),
+            ..Device::default()
+        };
+        assert!(
+            remote_command_issue(
+                Some(&fixed_volume),
+                RemoteCommand::Action(RemoteAction::Volume),
+            )
+            .is_some()
+        );
+        assert!(
+            remote_command_issue(
+                Some(&fixed_volume),
+                RemoteCommand::Action(RemoteAction::Play),
+            )
+            .is_none()
+        );
+        assert!(remote_command_issue(None, RemoteCommand::Transfer).is_none());
+    }
+
+    #[test]
+    fn unsupported_remote_controls_never_reach_the_backend() {
+        let mut app = headless_app();
+        let mut state = active_api_snapshot_on(false, "restricted");
+        let device = state.device.as_mut().expect("remote device");
+        device.is_restricted = true;
+        device.supports_volume = Some(false);
+        deliver_remote_snapshot(&mut app, state);
+        app.selected_device = Some("restricted".into());
+        app.backend.take_api_requests();
+
+        assert!(!app.remote(RemoteAction::Next, Some("restricted".into())));
+        app.seek(20_000);
+        app.set_volume(80, true);
+        assert_eq!(app.set_shuffle(true), ShuffleDispatch::Unsupported);
+        app.set_repeat(RepeatMode::Track);
+        app.add_to_queue("spotify:track:queued".into(), "Queued".into());
+        app.play_request(
+            PlayRequest::tracks(vec!["spotify:track:play".into()]),
+            false,
+        );
+
+        assert!(app.backend.take_api_requests().is_empty());
+        assert!(app.pending_remote_position.is_none());
+        assert!(app.pending_remote_volume.is_none());
+        assert!(app.optimistic_playing.is_none());
+        assert!(!app.shuffle_wanted);
+        assert!(!app.remote.as_ref().unwrap().state.shuffle_state);
+    }
+
+    #[test]
+    fn fixed_volume_devices_keep_their_other_controls() {
+        let mut app = headless_app();
+        let mut state = active_api_snapshot_on(false, "speaker");
+        state
+            .device
+            .as_mut()
+            .expect("remote device")
+            .supports_volume = Some(false);
+        deliver_remote_snapshot(&mut app, state);
+        app.selected_device = Some("speaker".into());
+        app.backend.take_api_requests();
+
+        app.set_volume(80, true);
+        assert!(app.backend.take_api_requests().is_empty());
+        assert!(app.remote(RemoteAction::Next, Some("speaker".into())));
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::Remote {
+                action: RemoteAction::Next,
+                device_id: Some(device_id),
+                ..
+            }] if device_id == "speaker"
+        ));
+    }
+
+    #[test]
+    fn active_idless_device_is_routed_without_guessing_an_id() {
+        let mut app = headless_app();
+        app.local_ready = false;
+        let mut state = active_remote_snapshot(false);
+        state.device = Some(Device {
+            id: None,
+            is_active: true,
+            ..Device::default()
+        });
+        deliver_remote_snapshot(&mut app, state);
+        app.backend.take_api_requests();
+
+        app.play_request(
+            PlayRequest::tracks(vec!["spotify:track:play".into()]),
+            false,
+        );
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::Remote {
+                action: RemoteAction::Play,
+                device_id: None,
+                ..
+            }]
+        ));
+        assert_eq!(app.set_shuffle(true), ShuffleDispatch::Remote);
+        assert!(matches!(
+            app.backend.take_api_requests().as_slice(),
+            [ApiRequest::Remote {
+                action: RemoteAction::Shuffle,
+                device_id: None,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn restricted_transfer_does_not_replace_the_selected_target() {
+        let mut app = headless_app();
+        app.selected_device = Some("current".into());
+        app.devices.push(Device {
+            id: Some("blocked".into()),
+            is_restricted: true,
+            ..Device::default()
+        });
+        app.backend.take_api_requests();
+
+        app.transfer("blocked".into());
+
+        assert_eq!(app.selected_device.as_deref(), Some("current"));
+        assert!(app.backend.take_api_requests().is_empty());
     }
 
     #[test]

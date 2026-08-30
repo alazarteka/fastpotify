@@ -175,9 +175,15 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                     } else {
                         device.name.clone()
                     };
+                    let selectable = !active && !device.is_restricted && device.id.is_some();
+                    let sense = if selectable {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    };
                     let (rect, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
-                    if response.hovered() {
+                        ui.allocate_exact_size(vec2(ui.available_width(), 52.0), sense);
+                    if response.hovered() && selectable {
                         ui.painter().rect_filled(
                             rect,
                             CornerRadius::same(6),
@@ -225,12 +231,18 @@ pub fn popup(app: &mut App, ctx: &egui::Context) {
                         ui.painter().circle_filled(dot, 4.0, palette.accent);
                     }
                     if response.clicked()
-                        && !active
+                        && selectable
                         && let Some(id) = &device.id
                     {
                         app.actions.push(Action::Transfer(id.clone()));
                     }
-                    response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if selectable {
+                        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    } else if device.is_restricted {
+                        response.on_hover_text(
+                            "Spotify marks this device as unavailable to remote controls",
+                        );
+                    }
                 }
             });
         });
