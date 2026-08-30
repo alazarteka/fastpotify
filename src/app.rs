@@ -60,6 +60,35 @@ struct AssumedContext {
     at: Instant,
 }
 
+struct QueuedPlay {
+    request: PlayRequest,
+    shuffle_first: bool,
+}
+
+#[derive(Default)]
+struct UnavailableRecovery {
+    recent: Vec<Instant>,
+    last_reconnect: Option<Instant>,
+}
+
+impl UnavailableRecovery {
+    fn record(&mut self, now: Instant) -> bool {
+        self.recent
+            .retain(|at| now.duration_since(*at) < Duration::from_secs(20));
+        self.recent.push(now);
+        if self.recent.len() < 3
+            || self
+                .last_reconnect
+                .is_some_and(|at| now.duration_since(at) <= Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.recent.clear();
+        self.last_reconnect = Some(now);
+        true
+    }
+}
+
 /// The playing item as the interface sees it, whichever device plays it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NowPlaying {
@@ -196,9 +225,9 @@ pub struct App {
     /// (context and track URIs) whose play buttons show a spinner.
     pending_play_keys: Vec<String>,
     pending_play_at: Option<Instant>,
-    /// A play request made while the local engine was still connecting; it
-    /// starts the moment the engine reports ready.
-    queued_play: Option<PlayRequest>,
+    /// A play request made while the local engine was connecting or
+    /// reconnecting; it starts the moment the engine reports ready.
+    queued_play: Option<QueuedPlay>,
     /// When to take a confirming look at remote playback after a command.
     remote_recheck_at: Option<Instant>,
     pub seek_preview: Option<f32>,
@@ -215,6 +244,7 @@ pub struct App {
     /// every second, so a snapshot must not undo the change on its way past.
     pending_local_volume: Option<(u16, Instant)>,
     optimistic_playing: Option<(bool, Instant)>,
+    unavailable_recovery: UnavailableRecovery,
     /// The context the interface just started, shown as playing until
     /// Spotify's own state says the same thing.
     assumed_context: Option<AssumedContext>,
@@ -368,6 +398,7 @@ impl App {
             pending_remote_volume: None,
             pending_local_volume: None,
             optimistic_playing: None,
+            unavailable_recovery: UnavailableRecovery::default(),
             assumed_context: None,
             last_now_playing_uri: None,
             playlist_busy: false,
@@ -785,6 +816,9 @@ impl App {
                 self.sign_in_url = None;
                 self.web_app = None;
                 self.user = None;
+                if self.queued_play.take().is_some() {
+                    self.clear_play_pending();
+                }
                 self.local = LocalState::default();
                 self.local_ready = false;
                 self.local_device_id = None;
@@ -806,13 +840,14 @@ impl App {
             LocalPlayback::Ready { device_id } => {
                 self.local_device_id = Some(device_id.clone());
                 self.local_ready = true;
-                if let Some(request) = self.queued_play.take() {
-                    self.play_request(request, false);
-                }
+                self.start_queued_play_if_ready();
             }
             LocalPlayback::Unavailable => {
                 self.local_ready = false;
                 self.local_device_id = None;
+                if self.queued_play.take().is_some() {
+                    self.clear_play_pending();
+                }
             }
             LocalPlayback::Failed(message) => {
                 self.local_ready = false;
@@ -821,7 +856,9 @@ impl App {
                 }
                 self.toast_error(format!("Local playback: {message}"));
             }
-            LocalPlayback::Authorizing | LocalPlayback::Connecting => {}
+            LocalPlayback::Authorizing | LocalPlayback::Connecting => {
+                self.local_ready = false;
+            }
         }
         self.local_playback = status;
     }
@@ -844,6 +881,7 @@ impl App {
 
     fn handle_local(&mut self, state: LocalState) {
         let track_changed = state.track != self.local.track;
+        let reconnected = state.connected && !self.local.connected;
         if state.playback != self.local.playback {
             self.optimistic_playing = None;
             if matches!(state.playback, Playback::Playing | Playback::Loading) {
@@ -867,6 +905,12 @@ impl App {
             && self.local.error.as_deref() != Some(error.as_str())
         {
             self.toast_error(error.clone());
+            if error.starts_with("This item isn't available")
+                && self.unavailable_recovery.record(Instant::now())
+            {
+                self.backend.send(Command::Reconnect);
+                self.toast("Spotify's audio service faltered; reconnecting local playback");
+            }
         }
         self.local = state;
         if let Some(volume) = held_volume {
@@ -874,6 +918,9 @@ impl App {
         }
         if track_changed {
             self.on_now_playing_changed();
+        }
+        if reconnected {
+            self.start_queued_play_if_ready();
         }
     }
 
@@ -885,6 +932,9 @@ impl App {
             return;
         }
         self.last_now_playing_uri = Some(now.uri.clone());
+        self.resume_context = self.playing_context_uri();
+        self.resume_track = Some(now.uri.clone());
+        self.resume_position_ms = 0;
         if now.local
             && !now.is_episode
             && let Some(id) = &now.id
@@ -2418,6 +2468,12 @@ impl App {
             });
         }
         match self.target() {
+            Target::Local if !self.local.connected => {
+                self.queued_play = Some(QueuedPlay {
+                    request,
+                    shuffle_first,
+                });
+            }
             Target::Local => {
                 self.queued_play = None;
                 self.backend.player(PlayerCommand::Load(LoadSpec {
@@ -2459,7 +2515,10 @@ impl App {
                     self.local_playback,
                     LocalPlayback::Connecting | LocalPlayback::Authorizing
                 ) {
-                    self.queued_play = Some(request);
+                    self.queued_play = Some(QueuedPlay {
+                        request,
+                        shuffle_first,
+                    });
                 } else {
                     self.clear_play_pending();
                     self.queued_play = None;
@@ -2468,6 +2527,19 @@ impl App {
                     self.refresh_devices();
                 }
             }
+        }
+    }
+
+    fn start_queued_play_if_ready(&mut self) {
+        if !self.local_ready || !self.local.connected {
+            return;
+        }
+        if let Some(QueuedPlay {
+            request,
+            shuffle_first,
+        }) = self.queued_play.take()
+        {
+            self.play_request(request, shuffle_first);
         }
     }
 
@@ -3542,6 +3614,58 @@ mod tests {
         app.handle_local(snapshot_at(35));
         assert_eq!(volume_to_percent(app.local.volume), 35);
         assert_eq!(volume_to_percent(app.settings.volume), 35);
+    }
+
+    #[test]
+    fn a_local_play_waits_for_reconnect_without_losing_shuffle() {
+        let mut app = headless_app();
+        app.local_ready = true;
+        app.local.connected = false;
+        app.handle_playback(LocalPlayback::Connecting);
+        app.play_request(PlayRequest::context("spotify:album:x"), true);
+
+        let queued = app.queued_play.as_ref().expect("queued while disconnected");
+        assert_eq!(
+            queued.request.context_uri.as_deref(),
+            Some("spotify:album:x")
+        );
+        assert!(queued.shuffle_first);
+
+        app.handle_local(LocalState {
+            connected: true,
+            volume: app.local.volume,
+            ..LocalState::default()
+        });
+
+        assert!(app.queued_play.is_some());
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+        });
+
+        assert!(app.queued_play.is_none());
+        assert_eq!(
+            app.assumed_context
+                .as_ref()
+                .and_then(|context| context.shuffle),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unavailable_items_trigger_one_bounded_reconnect() {
+        let start = Instant::now();
+        let mut recovery = UnavailableRecovery::default();
+        assert!(!recovery.record(start));
+        assert!(!recovery.record(start + Duration::from_secs(1)));
+        assert!(recovery.record(start + Duration::from_secs(2)));
+
+        assert!(!recovery.record(start + Duration::from_secs(30)));
+        assert!(!recovery.record(start + Duration::from_secs(31)));
+        assert!(!recovery.record(start + Duration::from_secs(32)));
+
+        assert!(!recovery.record(start + Duration::from_secs(63)));
+        assert!(!recovery.record(start + Duration::from_secs(64)));
+        assert!(recovery.record(start + Duration::from_secs(65)));
     }
 
     /// What a Raycast script sends becomes the same action a menu pick or a

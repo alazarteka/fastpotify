@@ -17,7 +17,7 @@ use crate::api::models::*;
 use crate::api::{ApiClient, ApiError, NetActivity, PlayRequest, TokenProvider, WebTokens};
 use crate::images::{ArtLoader, accent_color};
 use crate::paths::AppDirs;
-use crate::player::{Engine, EngineConfig, EngineEvent, LocalState, PlayerCommand};
+use crate::player::{Engine, EngineConfig, EngineEvent, LoadSpec, LocalState, PlayerCommand};
 use crate::secrets::{PrivateFileStore, SecretId, SecretStore};
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -753,6 +753,7 @@ struct Worker {
     premium: Option<bool>,
     authorization: AuthorizationLifecycle,
     reconnects: Vec<Instant>,
+    pending_resume: Option<LoadSpec>,
     /// Invalidates browser flows that finish after cancellation by sign-out
     /// or application switching.
     auth_epoch: u64,
@@ -792,6 +793,7 @@ impl Worker {
             premium: None,
             authorization: AuthorizationLifecycle::default(),
             reconnects: Vec::new(),
+            pending_resume: None,
             auth_epoch: 0,
             credential_epoch: 0,
         }
@@ -810,9 +812,13 @@ impl Worker {
                 Command::SignIn => self.sign_in(),
                 Command::CancelSignIn => self.authorization.cancel(),
                 Command::SignOut => self.sign_out(),
-                Command::AuthorizePlayback => self.authorize_playback(),
+                Command::AuthorizePlayback => {
+                    self.reconnects.clear();
+                    self.authorize_playback();
+                }
                 Command::RestartEngine(config) => {
                     self.engine_config = config;
+                    self.reconnects.clear();
                     self.reconnect_engine();
                 }
                 Command::Player(command) => match &self.engine {
@@ -1066,6 +1072,7 @@ impl Worker {
                 self.auth_epoch = self.auth_epoch.wrapping_add(1);
                 self.credential_epoch = self.credential_epoch.wrapping_add(1);
                 self.engine_busy = false;
+                self.pending_resume = None;
                 if let Some(engine) = self.engine.take() {
                     engine.shutdown();
                 }
@@ -1140,18 +1147,26 @@ impl Worker {
         )
     }
 
-    /// Reconnect the engine after its session dropped or audio settings changed.
+    /// Reconnect the engine after its session dropped or audio settings
+    /// changed, restoring an interrupted track on the replacement session.
     fn reconnect_engine(&mut self) {
         if !self.signed_in {
             return;
         }
         if let Some(engine) = self.engine.take() {
+            self.pending_resume = engine.interrupted().map(|interrupted| LoadSpec {
+                uris: vec![interrupted.uri],
+                position_ms: interrupted.position_ms,
+                play: interrupted.playing,
+                ..LoadSpec::default()
+            });
             engine.shutdown();
         }
         let now = Instant::now();
         self.reconnects
             .retain(|attempt| now.duration_since(*attempt) < Duration::from_secs(600));
         if self.reconnects.len() >= 6 {
+            self.pending_resume = None;
             self.emit(Event::Playback(LocalPlayback::Failed(
                 "Local playback keeps dropping. Re-enable it from Settings.".into(),
             )));
@@ -1320,6 +1335,7 @@ impl Worker {
                     SecretId::Playback,
                     &credential,
                 ) {
+                    self.pending_resume = None;
                     engine.shutdown();
                     self.emit(Event::Playback(LocalPlayback::Failed(format!(
                         "Spotify connected, but its playback credential could not be stored safely: {error}"
@@ -1327,15 +1343,22 @@ impl Worker {
                     return;
                 }
                 let device_id = engine.device_id().to_string();
-                self.engine = Some(Arc::new(engine));
-                self.reconnects.clear();
+                let engine = Arc::new(engine);
+                if let Some(spec) = self.pending_resume.take()
+                    && let Err(error) = engine.command(PlayerCommand::Load(spec))
+                {
+                    log::warn!("unable to resume playback after reconnecting: {error}");
+                }
+                self.engine = Some(engine);
                 self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
             }
             (None, _) => {
+                self.pending_resume = None;
                 let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
                 self.emit(Event::Playback(LocalPlayback::Failed(message)));
             }
             (Some(engine), None) => {
+                self.pending_resume = None;
                 engine.shutdown();
                 self.emit(Event::Playback(LocalPlayback::Failed(
                     "Spotify did not return a reusable playback credential".into(),
@@ -1352,6 +1375,7 @@ impl Worker {
     fn on_account_checked(&mut self, premium: Option<bool>) {
         self.premium = premium;
         if premium == Some(false) {
+            self.pending_resume = None;
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
             }

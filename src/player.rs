@@ -164,7 +164,26 @@ pub struct LocalState {
     pub seek_sequence: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Interrupted {
+    pub uri: String,
+    pub position_ms: u32,
+    pub playing: bool,
+}
+
 impl LocalState {
+    pub fn interrupted(&self) -> Option<Interrupted> {
+        let track = self.track.as_ref()?;
+        if self.playback == Playback::Stopped {
+            return None;
+        }
+        Some(Interrupted {
+            uri: track.uri.clone(),
+            position_ms: self.position_now(),
+            playing: matches!(self.playback, Playback::Playing | Playback::Loading),
+        })
+    }
+
     /// The position now, interpolated from the last report while playing.
     pub fn position_now(&self) -> u32 {
         match (self.playback, self.position_at) {
@@ -228,6 +247,8 @@ pub struct Engine {
     session: Session,
     mixer: Arc<dyn Mixer>,
     device_id: String,
+    state: Arc<Mutex<LocalState>>,
+    interrupted: Arc<Mutex<Option<Interrupted>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -317,13 +338,17 @@ impl Engine {
         }
 
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
         let ended_flag = Arc::clone(&shutting_down);
         let ended_notify = Arc::clone(&notify);
         let ended_state = Arc::clone(&state);
+        let ended_interrupted = Arc::clone(&interrupted);
         tokio::spawn(async move {
             spirc_task.await;
             {
                 let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
+                *ended_interrupted.lock().unwrap_or_else(|p| p.into_inner()) =
+                    current.interrupted();
                 current.connected = false;
                 current.playback = Playback::Stopped;
                 current.position_at = None;
@@ -341,10 +366,29 @@ impl Engine {
                 session,
                 mixer,
                 device_id,
+                state,
+                interrupted,
                 shutting_down,
             },
             reusable,
         ))
+    }
+
+    /// Playback to restore after this engine is replaced. A session that
+    /// ended has already frozen its last state; a deliberate restart reads
+    /// the live state instead.
+    pub fn interrupted(&self) -> Option<Interrupted> {
+        let ended = self
+            .interrupted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        ended.or_else(|| {
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupted()
+        })
     }
 
     pub fn device_id(&self) -> &str {
@@ -693,6 +737,34 @@ mod tests {
         assert_eq!(state.position_now(), 5_000);
         state.playback = Playback::Playing;
         assert!(state.position_now() >= 7_000);
+    }
+
+    #[test]
+    fn interrupted_playback_keeps_track_position_and_state() {
+        let mut state = LocalState {
+            track: Some(LocalTrack {
+                uri: "spotify:track:x".into(),
+                duration_ms: 200_000,
+                ..LocalTrack::default()
+            }),
+            playback: Playback::Playing,
+            position_ms: 10_000,
+            position_at: Some(Instant::now()),
+            ..LocalState::default()
+        };
+
+        let interrupted = state.interrupted().expect("playing track");
+        assert_eq!(interrupted.uri, "spotify:track:x");
+        assert!(interrupted.position_ms >= 10_000);
+        assert!(interrupted.playing);
+
+        state.playback = Playback::Paused;
+        assert!(!state.interrupted().expect("paused track").playing);
+        state.playback = Playback::Stopped;
+        assert!(state.interrupted().is_none());
+        state.playback = Playback::Playing;
+        state.track = None;
+        assert!(state.interrupted().is_none());
     }
 
     #[test]
