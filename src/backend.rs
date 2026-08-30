@@ -7,6 +7,7 @@
 //! idle when nothing is happening.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2695,6 +2696,7 @@ type RoutedClient = Result<(ApiSource, Arc<ApiClient>), ApiError>;
 
 const MAX_RUNNING_PLAYBACK_MUTATIONS: usize = 6;
 const MAX_PENDING_PLAYBACK_MUTATIONS: usize = 32;
+const MAX_RUNNING_PLAYLIST_MUTATIONS: usize = 6;
 
 /// Resources whose mutations can alias at Spotify's player endpoint. The
 /// active-device lane is global, while an explicit device lane remains
@@ -2808,8 +2810,6 @@ impl PlaybackSessionQueue {
 
 struct RunningPlaylistMutation {
     scheduler_id: u64,
-    operation: Operation,
-    route: ApiRoute,
     abort: tokio::task::AbortHandle,
 }
 
@@ -2823,6 +2823,40 @@ struct ApiMutationSchedulerState {
 #[derive(Default)]
 struct ApiMutationScheduler {
     state: Mutex<ApiMutationSchedulerState>,
+}
+
+struct PlaylistTaskCompletion {
+    scheduler: Arc<ApiMutationScheduler>,
+    data: Option<PlaylistTaskCompletionData>,
+    interrupted: Option<ApiResponse>,
+}
+
+struct PlaylistTaskCompletionData {
+    playlist_id: String,
+    scheduler_id: u64,
+    operation: Operation,
+    route: ApiRoute,
+    context: ApiDispatchContext,
+}
+
+impl PlaylistTaskCompletion {
+    fn complete(mut self, response: ApiResponse) {
+        self.interrupted = None;
+        if let Some(data) = self.data.take() {
+            self.scheduler.finish_playlist(data, response);
+        }
+    }
+}
+
+impl Drop for PlaylistTaskCompletion {
+    fn drop(&mut self) {
+        let Some(response) = self.interrupted.take() else {
+            return;
+        };
+        if let Some(data) = self.data.take() {
+            self.scheduler.finish_playlist(data, response);
+        }
+    }
 }
 
 impl ApiMutationScheduler {
@@ -2931,12 +2965,27 @@ impl ApiMutationScheduler {
         }
     }
 
-    /// Playlist item writes are single-flight per playlist. The HTTP client
-    /// bounds each flight, and a replaced API generation cannot publish its
-    /// completion even though the lane stays reserved until the wire attempt
-    /// has actually ended.
+    /// Playlist item writes are single-flight per playlist and globally
+    /// bounded before task creation. A replaced API generation cannot publish
+    /// its completion even though the keyed lane stays reserved until the
+    /// bounded wire attempt has actually ended.
     fn enqueue_playlist(self: &Arc<Self>, context: ApiDispatchContext, request: ApiRequest) {
-        let Some((playlist_id, _)) = request.playlist_mutation() else {
+        self.enqueue_playlist_with(context, request, |request, route| async move {
+            let selected = Ok((route.source, Arc::clone(&route.client)));
+            handle_routed(request, selected).await
+        });
+    }
+
+    fn enqueue_playlist_with<Execute, Pending>(
+        self: &Arc<Self>,
+        context: ApiDispatchContext,
+        request: ApiRequest,
+        execute: Execute,
+    ) where
+        Execute: FnOnce(ApiRequest, ApiRoute) -> Pending + Send + 'static,
+        Pending: Future<Output = ApiResponse> + Send + 'static,
+    {
+        let Some((playlist_id, mutation_id)) = request.playlist_mutation() else {
             return;
         };
         let playlist_id = playlist_id.to_owned();
@@ -2960,8 +3009,19 @@ impl ApiMutationScheduler {
                 break (state, route);
             }
         };
-        if state.playlists.contains_key(&playlist_id) {
-            publish_api_response(&context, playlist_mutation_pending_response(request));
+        let rejected = if state.playlists.contains_key(&playlist_id) {
+            Some(ApiError::PlaylistMutationPending)
+        } else if state.playlists.len() >= MAX_RUNNING_PLAYLIST_MUTATIONS {
+            Some(ApiError::PlaylistMutationBackpressure)
+        } else {
+            None
+        };
+        if let Some(error) = rejected {
+            drop(state);
+            let response = playlist_mutation_error_response(playlist_id, mutation_id, error);
+            context.api.with_current_route(operation, &route, || {
+                publish_api_response(&context, response);
+            });
             return;
         }
 
@@ -2970,53 +3030,57 @@ impl ApiMutationScheduler {
             .checked_add(1)
             .expect("API mutation scheduler id exhausted");
         let scheduler_id = state.next_id;
-        let scheduler = Arc::clone(self);
-        let task_context = context.clone();
-        let task_playlist_id = playlist_id.clone();
-        let task_route = route.clone();
+        let execution_route = route.clone();
+        let completion = PlaylistTaskCompletion {
+            scheduler: Arc::clone(self),
+            data: Some(PlaylistTaskCompletionData {
+                playlist_id: playlist_id.clone(),
+                scheduler_id,
+                operation,
+                route,
+                context,
+            }),
+            interrupted: Some(playlist_mutation_error_response(
+                playlist_id.clone(),
+                mutation_id,
+                ApiError::PlaylistMutationInterrupted,
+            )),
+        };
         let task = tokio::spawn(async move {
-            let selected = Ok((task_route.source, Arc::clone(&task_route.client)));
-            let response = handle_routed(request, selected).await;
-            scheduler.complete_playlist(task_playlist_id, scheduler_id, task_context, response);
+            let response = execute(request, execution_route).await;
+            completion.complete(response);
         });
         state.playlists.insert(
             playlist_id,
             RunningPlaylistMutation {
                 scheduler_id,
-                operation,
-                route,
                 abort: task.abort_handle(),
             },
         );
     }
 
-    fn complete_playlist(
-        &self,
-        playlist_id: String,
-        scheduler_id: u64,
-        context: ApiDispatchContext,
-        response: ApiResponse,
-    ) {
+    fn finish_playlist(&self, data: PlaylistTaskCompletionData, response: ApiResponse) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if !state
             .playlists
-            .get(&playlist_id)
-            .is_some_and(|running| running.scheduler_id == scheduler_id)
+            .get(&data.playlist_id)
+            .is_some_and(|running| running.scheduler_id == data.scheduler_id)
         {
             return;
         }
-        let running = state
+        state
             .playlists
-            .remove(&playlist_id)
+            .remove(&data.playlist_id)
             .expect("matching playlist mutation exists");
-        context
+        drop(state);
+        data.context
             .api
-            .with_current_route(running.operation, &running.route, || {
-                observe_playlists(&context.api, &response);
-                publish_api_response(&context, response);
+            .with_current_route(data.operation, &data.route, || {
+                observe_playlists(&data.context.api, &response);
+                publish_api_response(&data.context, response);
             });
     }
 
@@ -3135,6 +3199,23 @@ impl ApiMutationScheduler {
             .playlists
             .len()
     }
+
+    #[cfg(test)]
+    fn abort_playlist(&self, playlist_id: &str) -> bool {
+        let abort = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .playlists
+            .get(playlist_id)
+            .map(|running| running.abort.clone());
+        if let Some(abort) = abort {
+            abort.abort();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn dispatch_api(
@@ -3223,30 +3304,16 @@ fn playback_backpressure_response(request: ApiRequest) -> ApiResponse {
     }
 }
 
-fn playlist_mutation_pending_response(request: ApiRequest) -> ApiResponse {
-    let error = ApiError::PlaylistMutationPending;
-    match request {
-        ApiRequest::AddToPlaylist {
-            mutation_id,
-            playlist_id,
-            ..
-        }
-        | ApiRequest::RemoveFromPlaylist {
-            mutation_id,
-            playlist_id,
-            ..
-        }
-        | ApiRequest::ReorderPlaylist {
-            mutation_id,
-            playlist_id,
-            ..
-        } => ApiResponse::PlaylistItemsChanged {
-            mutation_id,
-            id: playlist_id,
-            message: String::new(),
-            result: Err(error),
-        },
-        _ => unreachable!("only playlist item mutations enter this gate"),
+fn playlist_mutation_error_response(
+    playlist_id: String,
+    mutation_id: u64,
+    error: ApiError,
+) -> ApiResponse {
+    ApiResponse::PlaylistItemsChanged {
+        mutation_id,
+        id: playlist_id,
+        message: String::new(),
+        result: Err(error),
     }
 }
 
@@ -3681,6 +3748,26 @@ impl TransportDispatcher {
         dispatch_api(self.context.clone(), &self.api_mutations, request);
     }
 
+    pub(crate) fn dispatch_panicking_playlist(&self, request: ApiRequest) {
+        self.api_mutations.enqueue_playlist_with(
+            self.context.clone(),
+            request,
+            |_request, _route| async move { panic!("injected playlist task panic") },
+        );
+    }
+
+    pub(crate) fn dispatch_pending_playlist(&self, request: ApiRequest) {
+        self.api_mutations.enqueue_playlist_with(
+            self.context.clone(),
+            request,
+            |_request, _route| std::future::pending(),
+        );
+    }
+
+    pub(crate) fn abort_playlist(&self, playlist_id: &str) -> bool {
+        self.api_mutations.abort_playlist(playlist_id)
+    }
+
     pub(crate) fn retire_stale(&self) {
         self.api_mutations.retire_stale(&self.context.api);
     }
@@ -3814,6 +3901,21 @@ mod playback_scheduler_tests {
         observed
     }
 
+    async fn next_reply(replies: &std::sync::mpsc::Receiver<Event>) -> Event {
+        for _ in 0..200 {
+            match replies.try_recv() {
+                Ok(event) => return event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("playlist reply channel disconnected")
+                }
+            }
+        }
+        panic!("playlist reply did not arrive")
+    }
+
     #[tokio::test]
     async fn playlist_mutations_are_single_flight_per_playlist_at_the_wire() {
         let server = DelayedResponses::start(1);
@@ -3898,6 +4000,145 @@ mod playback_scheduler_tests {
         })
         .await
         .expect("reply collector joins");
+    }
+
+    #[tokio::test]
+    async fn distinct_playlist_mutations_are_globally_bounded_before_task_spawn() {
+        let server = DelayedResponses::start(MAX_RUNNING_PLAYLIST_MUTATIONS);
+        let api = authorized_gateway(server.port, true);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        for index in 0..=MAX_RUNNING_PLAYLIST_MUTATIONS {
+            let playlist_id = format!("mix-{index}");
+            observe_owned_playlist(&api, &playlist_id);
+            dispatcher.dispatch(add_to_playlist(&playlist_id, index as u64 + 1));
+        }
+        assert_eq!(dispatcher.playlist_count(), MAX_RUNNING_PLAYLIST_MUTATIONS);
+
+        assert!(matches!(
+            next_reply(&replies).await,
+            Event::Api(response)
+                if matches!(
+                    response.as_ref(),
+                    ApiResponse::PlaylistItemsChanged {
+                        mutation_id,
+                        id,
+                        result: Err(ApiError::PlaylistMutationBackpressure),
+                        ..
+                    } if *mutation_id == MAX_RUNNING_PLAYLIST_MUTATIONS as u64 + 1
+                        && id == &format!("mix-{MAX_RUNNING_PLAYLIST_MUTATIONS}")
+                )
+        ));
+
+        let (observed, arrived_early) = server.observe().await;
+        assert_eq!(observed.len(), MAX_RUNNING_PLAYLIST_MUTATIONS);
+        assert_eq!(arrived_early + 1, MAX_RUNNING_PLAYLIST_MUTATIONS);
+        assert!(observed.iter().all(|request| {
+            request.authorization.as_deref() == Some("Bearer personal-token")
+                && !request
+                    .request_line
+                    .contains(&format!("mix-{MAX_RUNNING_PLAYLIST_MUTATIONS}"))
+        }));
+        for _ in 0..MAX_RUNNING_PLAYLIST_MUTATIONS {
+            assert!(matches!(
+                next_reply(&replies).await,
+                Event::Api(response)
+                    if matches!(
+                        response.as_ref(),
+                        ApiResponse::PlaylistItemsChanged { result: Ok(_), .. }
+                    )
+            ));
+        }
+        assert_eq!(dispatcher.playlist_count(), 0);
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn panic_and_abort_retire_playlist_gates_before_successful_retry() {
+        let server = DelayedResponses::start(2);
+        let api = authorized_gateway(server.port, true);
+        observe_owned_playlist(&api, "panic-mix");
+        observe_owned_playlist(&api, "abort-mix");
+        let (dispatcher, replies) = TransportDispatcher::new(api);
+
+        dispatcher.dispatch_panicking_playlist(add_to_playlist("panic-mix", 1));
+        assert!(matches!(
+            next_reply(&replies).await,
+            Event::Api(response)
+                if matches!(
+                    response.as_ref(),
+                    ApiResponse::PlaylistItemsChanged {
+                        mutation_id: 1,
+                        id,
+                        result: Err(ApiError::PlaylistMutationInterrupted),
+                        ..
+                    } if id == "panic-mix"
+                )
+        ));
+        assert_eq!(dispatcher.playlist_count(), 0);
+
+        dispatcher.dispatch_pending_playlist(add_to_playlist("abort-mix", 2));
+        assert_eq!(dispatcher.playlist_count(), 1);
+        assert!(dispatcher.abort_playlist("abort-mix"));
+        assert!(matches!(
+            next_reply(&replies).await,
+            Event::Api(response)
+                if matches!(
+                    response.as_ref(),
+                    ApiResponse::PlaylistItemsChanged {
+                        mutation_id: 2,
+                        id,
+                        result: Err(ApiError::PlaylistMutationInterrupted),
+                        ..
+                    } if id == "abort-mix"
+                )
+        ));
+        assert_eq!(dispatcher.playlist_count(), 0);
+
+        dispatcher.dispatch(add_to_playlist("panic-mix", 3));
+        dispatcher.dispatch(add_to_playlist("abort-mix", 4));
+        let (observed, arrived_early) = server.observe().await;
+        assert_eq!(observed.len(), 2);
+        assert_eq!(arrived_early, 1);
+        let mut completed = Vec::new();
+        for _ in 0..2 {
+            let Event::Api(response) = next_reply(&replies).await else {
+                panic!("playlist retry produced a non-API event");
+            };
+            let ApiResponse::PlaylistItemsChanged {
+                mutation_id,
+                result: Ok(_),
+                ..
+            } = response.as_ref()
+            else {
+                panic!("playlist retry failed: {response:?}");
+            };
+            completed.push(*mutation_id);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, [3, 4]);
+        assert_eq!(dispatcher.playlist_count(), 0);
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_retires_every_supervised_playlist_task() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback API");
+        let api = authorized_gateway(listener.local_addr().expect("API address").port(), true);
+        let (dispatcher, replies) = TransportDispatcher::new(Arc::clone(&api));
+        for index in 0..MAX_RUNNING_PLAYLIST_MUTATIONS {
+            let playlist_id = format!("pending-{index}");
+            observe_owned_playlist(&api, &playlist_id);
+            dispatcher.dispatch_pending_playlist(add_to_playlist(&playlist_id, index as u64));
+        }
+        assert_eq!(dispatcher.playlist_count(), MAX_RUNNING_PLAYLIST_MUTATIONS);
+
+        dispatcher.shutdown();
+        assert_eq!(dispatcher.playlist_count(), 0);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            replies.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -38,8 +38,12 @@ pub enum ApiError {
     QuotaExhausted,
     #[error("too many playback commands are waiting; try again")]
     PlaybackBackpressure,
+    #[error("too many playlist changes are in progress; try again")]
+    PlaylistMutationBackpressure,
     #[error("another change to this playlist is still finishing; try again")]
     PlaylistMutationPending,
+    #[error("the playlist change stopped before finishing; refresh and try again")]
+    PlaylistMutationInterrupted,
     #[error("your {api_source} Spotify sign-in expired; please authorize it again")]
     SignInExpired {
         api_source: ApiSource,
