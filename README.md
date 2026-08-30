@@ -190,13 +190,15 @@ original nine retain their field positions. `saved` is `yes`, `no`, or
 `unknown` while Spotify's answer is pending.
 
 `devices` lists Spotify Connect devices with the id first and the active one
-marked `*`; its final column says `restricted` when Spotify disallows remote
-control or `fixed volume` when only volume is unavailable. `--raw` emits JSON,
-including those capability flags. Reading the list also requests a refresh,
-so a cold first read can be empty and the next one current. Unsupported target
-controls are refused by the running app with a visible warning instead of
-being sent to the wrong device. A verb exits non-zero when Fastpotify is not
-running or the control reply is invalid.
+marked `*`. When Spotify supplies no id, that column is blank and an otherwise
+unrestricted row says `not transferable`; the device remains visible and can
+still be marked active. The final column says `restricted` when Spotify
+disallows remote control or `fixed volume` when only volume is unavailable.
+`--raw` emits JSON, including the optional id and capability flags. Reading the
+list also requests a refresh, so a cold first read can be empty and the next
+one current. Unsupported target controls are refused by the running app with a
+visible warning instead of being sent to the wrong device. A verb exits
+non-zero when Fastpotify is not running or the control reply is invalid.
 
 That is enough for a launcher such as Raycast or Alfred to drive playback
 through its own script commands.

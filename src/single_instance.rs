@@ -34,7 +34,10 @@
 //! tray and the media keys feed; `nowplaying` and `devices` are answered from
 //! snapshots the app keeps fresh, so the listener thread never touches app
 //! state. Free-text arguments are bounded and validated before they enter
-//! that queue.
+//! that queue. During startup, bind and authenticated activation are retried
+//! together for a short handoff window. A port owner that remains
+//! unauthenticated, or a token/listener setup failure, blocks a second full
+//! application instead of falling back to an uncontrolled instance.
 //! Linux needs none of this: MPRIS already gives `playerctl` the same verbs,
 //! so the D-Bus name stays a pure instance guard there.
 
@@ -51,6 +54,9 @@ pub enum Outcome {
     Only(Guard),
     /// Another instance is running and has been asked to show its window.
     Surfaced,
+    /// Exclusivity or authenticated control could not be established, so a
+    /// competing full application must not start.
+    Blocked(std::io::Error),
 }
 
 /// What a control client asked the running instance to do.
@@ -177,6 +183,10 @@ const MAX_CONTROL_REPLY_BYTES: u64 = 64 * 1024;
 const CONTROL_TOKEN_BYTES: usize = 32;
 #[cfg(any(test, not(target_os = "linux")))]
 const CONTROL_TOKEN_HEX_BYTES: usize = CONTROL_TOKEN_BYTES * 2;
+#[cfg(not(target_os = "linux"))]
+const ACQUIRE_ATTEMPTS: usize = 10;
+#[cfg(any(test, not(target_os = "linux")))]
+const ACQUIRE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Removes only the token this primary instance wrote. The Spotify sign-out
 /// path intentionally does not own this lease.
@@ -269,9 +279,18 @@ pub fn send(dirs: &crate::paths::AppDirs, verb: &str) -> std::io::Result<Reply> 
 
 #[cfg(any(test, not(target_os = "linux")))]
 fn send_to(port: u16, token: &str, verb: &str) -> std::io::Result<Reply> {
+    send_to_with_timeout(port, token, verb, std::time::Duration::from_secs(2))
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn send_to_with_timeout(
+    port: u16,
+    token: &str,
+    verb: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<Reply> {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpStream};
-    use std::time::Duration;
 
     if PREFIX.len() + token.len() + 1 + verb.len() + 1 > MAX_CONTROL_LINE_BYTES {
         return Err(std::io::Error::new(
@@ -280,7 +299,7 @@ fn send_to(port: u16, token: &str, verb: &str) -> std::io::Result<Reply> {
         ));
     }
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(timeout))?;
     stream.write_all(format!("{PREFIX}{token}:{verb}\n").as_bytes())?;
     // The listener writes one line and closes, so read to end and keep the
     // line. An instance predating the authenticated protocol ignores this
@@ -310,59 +329,155 @@ fn send_to(port: u16, token: &str, verb: &str) -> std::io::Result<Reply> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn acquire(dirs: &crate::paths::AppDirs, waker: &crate::backend::Waker) -> Outcome {
+#[cfg(any(test, not(target_os = "linux")))]
+enum PortClaim {
+    Primary(std::net::TcpListener),
+    Surfaced,
+}
+
+/// Recheck both ownership and authenticated activation during the bounded
+/// handoff window. A missing or stale token may be ordinary publication or
+/// shutdown timing, but an owner that remains unauthenticated is never a
+/// reason to start a competing application.
+#[cfg(any(test, not(target_os = "linux")))]
+fn claim_port_with(
+    dirs: &crate::paths::AppDirs,
+    port: u16,
+    attempts: usize,
+    mut wait: impl FnMut(),
+) -> std::io::Result<PortClaim> {
     use std::net::{Ipv4Addr, TcpListener};
+
+    let mut activation_error = None;
+    for attempt in 0..attempts.max(1) {
+        match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => return Ok(PortClaim::Primary(listener)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot claim the Fastpotify control port {port}: {error}"),
+                ));
+            }
+        }
+
+        let activated = load_control_token(dirs)
+            .and_then(|token| send_to_with_timeout(port, &token, "show", ACQUIRE_REPLY_TIMEOUT));
+        match activated {
+            Ok(Reply::Ok) => return Ok(PortClaim::Surfaced),
+            Ok(Reply::NowPlaying(_) | Reply::Devices(_)) => {
+                activation_error = Some("the owner returned the wrong control reply".to_owned());
+            }
+            Err(error) => activation_error = Some(error.to_string()),
+        }
+        if attempt + 1 < attempts.max(1) {
+            wait();
+        }
+    }
+
+    let detail = activation_error.unwrap_or_else(|| "the owner did not answer".to_owned());
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "Fastpotify control port {port} remains occupied, but its owner could not be authenticated ({detail}); refusing to start a second instance"
+        ),
+    ))
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn start_primary_with<F>(
+    dirs: &crate::paths::AppDirs,
+    waker: &crate::backend::Waker,
+    listener: std::net::TcpListener,
+    spawn: F,
+) -> std::io::Result<Guard>
+where
+    F: FnOnce(
+        std::net::TcpListener,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        crate::backend::Waker,
+    ) -> std::io::Result<()>,
+{
     use std::sync::{Arc, Mutex};
 
-    let unguarded = || Guard {
-        _control_token: None,
+    // The token is durable before the listener can answer. Any setup error
+    // drops both the bound listener and this matching-token lease.
+    let lease = ControlTokenLease::issue(dirs)?;
+    let token = lease.token.clone();
+    let guard = Guard {
+        #[cfg(target_os = "linux")]
+        _connection: None,
+        _control_token: Some(lease),
         commands: Default::default(),
         now_playing: Arc::new(Mutex::new(NOTHING_PLAYING.to_owned())),
         devices: Arc::new(Mutex::new(NO_DEVICES.to_owned())),
     };
-
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
-        Ok(listener) => listener,
-        Err(_) => {
-            // Someone holds the port. Ask them to show themselves, and only
-            // stand down if they answer as Fastpotify.
-            let answered = (0..10).any(|attempt| {
-                if attempt > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                send(dirs, "show").is_ok_and(|reply| matches!(reply, Reply::Ok))
-            });
-            if answered {
-                return Outcome::Surfaced;
-            }
-            log::warn!("port {INSTANCE_PORT} is busy but not with Fastpotify; running unguarded");
-            return Outcome::Only(unguarded());
-        }
-    };
-
-    let lease = match ControlTokenLease::issue(dirs) {
-        Ok(lease) => lease,
-        Err(error) => {
-            log::warn!("cannot secure the control socket: {error}; running unguarded");
-            return Outcome::Only(unguarded());
-        }
-    };
-    let token = lease.token.clone();
-    let mut guard = unguarded();
-    guard._control_token = Some(lease);
     let commands = Arc::clone(&guard.commands);
     let now_playing = Arc::clone(&guard.now_playing);
     let devices = Arc::clone(&guard.devices);
-    let waker = waker.clone();
-    let spawned = std::thread::Builder::new()
-        .name("fastpotify-instance".to_owned())
-        .spawn(move || serve(listener, &token, &commands, &now_playing, &devices, &waker));
-    if let Err(error) = spawned {
-        log::warn!("cannot listen for other launches: {error}");
-        guard._control_token = None;
+    spawn(
+        listener,
+        token,
+        commands,
+        now_playing,
+        devices,
+        waker.clone(),
+    )?;
+    Ok(guard)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn acquire_with<F>(
+    dirs: &crate::paths::AppDirs,
+    waker: &crate::backend::Waker,
+    port: u16,
+    attempts: usize,
+    wait: impl FnMut(),
+    spawn: F,
+) -> Outcome
+where
+    F: FnOnce(
+        std::net::TcpListener,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        std::sync::Arc<std::sync::Mutex<String>>,
+        crate::backend::Waker,
+    ) -> std::io::Result<()>,
+{
+    match claim_port_with(dirs, port, attempts, wait) {
+        Ok(PortClaim::Surfaced) => Outcome::Surfaced,
+        Ok(PortClaim::Primary(listener)) => {
+            match start_primary_with(dirs, waker, listener, spawn) {
+                Ok(guard) => Outcome::Only(guard),
+                Err(error) => Outcome::Blocked(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot establish authenticated Fastpotify control: {error}"),
+                )),
+            }
+        }
+        Err(error) => Outcome::Blocked(error),
     }
-    Outcome::Only(guard)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn acquire(dirs: &crate::paths::AppDirs, waker: &crate::backend::Waker) -> Outcome {
+    acquire_with(
+        dirs,
+        waker,
+        INSTANCE_PORT,
+        ACQUIRE_ATTEMPTS,
+        || std::thread::sleep(std::time::Duration::from_millis(50)),
+        |listener, token, commands, now_playing, devices, waker| {
+            std::thread::Builder::new()
+                .name("fastpotify-instance".to_owned())
+                .spawn(move || serve(listener, &token, &commands, &now_playing, &devices, &waker))
+                .map(|_| ())
+        },
+    )
 }
 
 /// Answers control clients until the listener closes. One request line and
@@ -861,6 +976,220 @@ mod tests {
         );
 
         drop(served);
+    }
+
+    #[test]
+    fn acquire_surfaces_an_authenticated_current_primary() {
+        use std::io::Write as _;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-current");
+        let token = "a".repeat(CONTROL_TOKEN_HEX_BYTES);
+        crate::secrets::write_private_atomic(&dirs.control_token_file(), token.as_bytes()).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = token.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("activation client");
+            let line = read_line(&mut stream).expect("authenticated activation frame");
+            assert_eq!(authenticate(&line, &expected), Some("show"));
+            stream
+                .write_all(format!("{OK_REPLY}\n").as_bytes())
+                .expect("activation reply");
+        });
+
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |_, _, _, _, _, _| panic!("an authenticated primary must be surfaced"),
+        );
+
+        assert!(matches!(outcome, Outcome::Surfaced));
+        server.join().expect("primary exits");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_blocks_on_an_occupied_foreign_or_old_port() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-foreign");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |_, _, _, _, _, _| panic!("an occupied port must not become primary"),
+        );
+
+        let Outcome::Blocked(error) = outcome else {
+            panic!("an unauthenticated owner must fail closed");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to start a second instance")
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_blocks_when_an_old_protocol_owner_rejects_the_authenticated_frame() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-old");
+        let token = "b".repeat(CONTROL_TOKEN_HEX_BYTES);
+        crate::secrets::write_private_atomic(&dirs.control_token_file(), token.as_bytes()).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mixed-version client");
+            read_line(&mut stream).expect("new authenticated frame");
+            // An older owner does not understand the token-bearing verb and
+            // closes without the authenticated acknowledgement.
+        });
+
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |_, _, _, _, _, _| panic!("an old owner must not permit a rival"),
+        );
+
+        assert!(matches!(outcome, Outcome::Blocked(_)));
+        server.join().expect("old owner exits");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_retries_bind_and_wins_a_shutdown_handoff_after_token_read_failure() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-handoff");
+        let mut previous = Some(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
+        let port = previous.as_ref().unwrap().local_addr().unwrap().port();
+        let published = std::cell::Cell::new(false);
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            2,
+            || drop(previous.take()),
+            |listener, token, _, _, _, _| {
+                assert_eq!(listener.local_addr()?.port(), port);
+                assert_eq!(load_control_token(&dirs)?, token);
+                published.set(true);
+                drop(listener);
+                Ok(())
+            },
+        );
+
+        let Outcome::Only(guard) = outcome else {
+            panic!("the released port must be reclaimed");
+        };
+        assert!(published.get(), "the token precedes listener startup");
+        assert!(load_control_token(&dirs).is_ok());
+        drop(guard);
+        assert_eq!(
+            load_control_token(&dirs).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_reports_invalid_owner_token_without_starting() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-invalid-token");
+        crate::secrets::write_private_atomic(&dirs.control_token_file(), b"not-a-token").unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |_, _, _, _, _, _| panic!("invalid owner token must fail closed"),
+        );
+
+        let Outcome::Blocked(error) = outcome else {
+            panic!("invalid owner token must block startup");
+        };
+        assert!(error.to_string().contains("control token is invalid"));
+        drop(listener);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn primary_setup_failure_releases_port_and_matching_token() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-listener-failure");
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |listener, token, _, _, _, _| {
+                assert_eq!(load_control_token(&dirs)?, token);
+                drop(listener);
+                Err(std::io::Error::other("injected listener setup failure"))
+            },
+        );
+
+        let Outcome::Blocked(error) = outcome else {
+            panic!("listener setup failure must block startup");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected listener setup failure")
+        );
+        assert_eq!(
+            load_control_token(&dirs).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        drop(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("port was released"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn token_publication_failure_releases_the_won_port() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let (dirs, root) = test_dirs("acquire-token-failure");
+        std::fs::create_dir(dirs.control_token_file()).expect("block token publication");
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let outcome = acquire_with(
+            &dirs,
+            &crate::backend::Waker::default(),
+            port,
+            1,
+            || {},
+            |_, _, _, _, _, _| panic!("listener cannot start before token publication"),
+        );
+
+        assert!(matches!(outcome, Outcome::Blocked(_)));
+        drop(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).expect("port was released"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

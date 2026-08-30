@@ -3268,8 +3268,11 @@ impl App {
     }
 
     fn set_playing(&mut self, wanted: bool) {
-        if !wanted && self.queued_play.take().is_some() {
-            self.clear_play_pending();
+        if self.queued_play.is_some() {
+            if !wanted {
+                self.queued_play = None;
+                self.clear_play_pending();
+            }
             return;
         }
         if self.believed_playing() == wanted {
@@ -3581,6 +3584,7 @@ impl App {
     fn apply_actions(&mut self, ctx: &egui::Context) {
         let mut actions = std::mem::take(&mut self.actions);
         while !actions.is_empty() {
+            coalesce_playback_state_actions(&mut actions, self.believed_playing());
             for action in actions.drain(..) {
                 self.apply(action, ctx);
             }
@@ -4385,6 +4389,45 @@ fn cap_uris(uris: Vec<String>, index: u32) -> (Vec<String>, u32) {
     let start = (index as usize).min(uris.len() - 1);
     let end = (start + MAX_PLAY_URIS).min(uris.len());
     (uris[start..end].to_vec(), 0)
+}
+
+/// A drained frame can contain commands from both the control socket and the
+/// platform media service. Reduce their playback-state mutations to the one
+/// final absolute state before the backend can spawn concurrent Web requests.
+/// Other actions retain their order, and the final state stays at the last
+/// playback mutation's position relative to them.
+fn coalesce_playback_state_actions(actions: &mut Vec<Action>, initially_playing: bool) {
+    let mut projected = initially_playing;
+    let mut count = 0;
+    let mut last = 0;
+    for (index, action) in actions.iter().enumerate() {
+        match action {
+            Action::TogglePlay => {
+                projected = !projected;
+                count += 1;
+                last = index;
+            }
+            Action::SetPlaying(playing) => {
+                projected = *playing;
+                count += 1;
+                last = index;
+            }
+            _ => {}
+        }
+    }
+    if count < 2 {
+        return;
+    }
+
+    *actions = std::mem::take(actions)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, action)| match action {
+            Action::TogglePlay | Action::SetPlaying(_) if index != last => None,
+            Action::TogglePlay | Action::SetPlaying(_) => Some(Action::SetPlaying(projected)),
+            _ => Some(action),
+        })
+        .collect();
 }
 
 #[cfg(test)]
@@ -5827,7 +5870,7 @@ mod tests {
                 false,
                 [ControlCommand::Play, ControlCommand::Pause],
                 false,
-                &[RemoteAction::Play, RemoteAction::Pause][..],
+                &[][..],
             ),
             (
                 false,
@@ -5845,7 +5888,7 @@ mod tests {
                 true,
                 [ControlCommand::Pause, ControlCommand::Play],
                 true,
-                &[RemoteAction::Pause, RemoteAction::Play][..],
+                &[][..],
             ),
         ];
         for (started_playing, commands, expected, expected_remote) in cases {
@@ -5909,10 +5952,160 @@ mod tests {
     }
 
     #[test]
+    fn playback_batch_projection_keeps_non_playback_actions_in_order() {
+        let mut actions = vec![
+            Action::SetPlaying(true),
+            Action::Next,
+            Action::TogglePlay,
+            Action::Previous,
+            Action::SetPlaying(true),
+            Action::RefreshDevices,
+        ];
+
+        coalesce_playback_state_actions(&mut actions, false);
+
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(actions[0], Action::Next));
+        assert!(matches!(actions[1], Action::Previous));
+        assert!(matches!(actions[2], Action::SetPlaying(true)));
+        assert!(matches!(actions[3], Action::RefreshDevices));
+    }
+
+    #[tokio::test]
+    async fn coalesced_absolute_batch_sends_only_its_final_state_over_delayed_transport() {
+        use crate::api::ApiSource;
+        use crate::api::client::{NetActivity, TokenProvider};
+        use crate::api::gateway::{AccountId, ApiGateway};
+        use crate::api::test_support::{read_request, write_response};
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback API");
+        let port = listener.local_addr().expect("API address").port();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (first_seen_tx, first_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (first_stream, _) = listener.accept().expect("first playback mutation");
+            let first = read_request(&first_stream);
+            first_seen_tx.send(()).expect("first request arrived");
+            release_rx.recv().expect("inspect while first is delayed");
+
+            listener.set_nonblocking(true).expect("nonblocking probe");
+            let mut second = None;
+            for _ in 0..200 {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let request = read_request(&stream);
+                        second = Some((stream, request));
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("probe for a reordered request: {error}"),
+                }
+            }
+
+            let mut observed = vec![first];
+            if let Some((stream, request)) = second {
+                observed.push(request);
+                write_response(stream, "200 OK", &[], "{}");
+            }
+            write_response(first_stream, "200 OK", &[], "{}");
+            observed_tx.send(observed).expect("publish wire requests");
+        });
+
+        let mut app = headless_app();
+        app.local_ready = false;
+        let mut state = active_api_snapshot_on(false, "speaker");
+        state.is_playing = true;
+        deliver_remote_snapshot(&mut app, state);
+        app.selected_device = Some("speaker".into());
+        app.backend.take_api_requests();
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        queue
+            .lock()
+            .expect("the queue")
+            .extend([ControlCommand::Play, ControlCommand::Pause]);
+        app.control_commands = Some(queue);
+        app.handle_control_commands();
+        app.apply_actions(&egui::Context::default());
+        let requests = app.backend.take_api_requests();
+        assert!(!requests.is_empty(), "the final Pause must be dispatched");
+
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client");
+        let api = Arc::new(ApiGateway::new_at(
+            http,
+            Arc::new(NetActivity::default()),
+            &format!("http://127.0.0.1:{port}/v1"),
+        ));
+        let shared = api.begin_verification(ApiSource::Shared, |_| {
+            TokenProvider::Fixed("shared-token".into())
+        });
+        api.install(ApiSource::Shared, shared, AccountId::new("same"))
+            .unwrap();
+        let personal = api.begin_verification(ApiSource::Personal, |_| {
+            TokenProvider::Fixed("personal-token".into())
+        });
+        api.install(ApiSource::Personal, personal, AccountId::new("same"))
+            .unwrap();
+
+        let dispatches: Vec<_> = requests
+            .into_iter()
+            .map(|request| {
+                let dispatch_api = Arc::clone(&api);
+                tokio::spawn(async move {
+                    crate::backend::handle_for_transport_test(&dispatch_api, request).await
+                })
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || first_seen_rx.recv())
+            .await
+            .expect("first-request observer joins")
+            .expect("first wire request arrives");
+        assert!(
+            dispatches.iter().all(|dispatch| !dispatch.is_finished()),
+            "the first wire request remains delayed"
+        );
+        release_tx.send(()).expect("probe for a second request");
+        let observed = tokio::task::spawn_blocking(move || observed_rx.recv())
+            .await
+            .expect("wire observer joins")
+            .expect("wire requests arrive");
+        assert_eq!(
+            observed.len(),
+            1,
+            "no earlier absolute state may race the final state at the wire"
+        );
+        assert_eq!(
+            observed[0].request_line,
+            "PUT /v1/me/player/pause?device_id=speaker HTTP/1.1"
+        );
+        assert_eq!(
+            observed[0].authorization.as_deref(),
+            Some("Bearer personal-token")
+        );
+        for dispatch in dispatches {
+            assert!(matches!(
+                dispatch.await.expect("dispatch joins"),
+                ApiResponse::Remote {
+                    action: RemoteAction::Pause,
+                    result: Ok(())
+                }
+            ));
+        }
+        server.join().expect("API server exits");
+    }
+
+    #[test]
     fn absolute_play_pause_batch_preserves_state_when_target_rejects_it() {
         for (started_playing, commands) in [
-            (false, [ControlCommand::Play, ControlCommand::Pause]),
-            (true, [ControlCommand::Pause, ControlCommand::Play]),
+            (false, [ControlCommand::Pause, ControlCommand::Play]),
+            (true, [ControlCommand::Play, ControlCommand::Pause]),
         ] {
             let mut app = headless_app();
             app.local_ready = false;
@@ -5940,17 +6133,34 @@ mod tests {
     }
 
     #[test]
-    fn absolute_pause_cancels_a_play_queued_during_reconnect() {
-        let mut app = play_queued_during_reconnect();
-        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
-        queue.lock().expect("the queue").push(ControlCommand::Pause);
-        app.control_commands = Some(queue);
+    fn absolute_batches_preserve_or_cancel_a_play_queued_during_reconnect() {
+        for (commands, keeps_request) in [
+            ([ControlCommand::Play, ControlCommand::Pause], false),
+            ([ControlCommand::Pause, ControlCommand::Play], true),
+        ] {
+            let mut app = play_queued_during_reconnect();
+            app.resume_track = Some("spotify:track:saved-state".into());
+            let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+            queue.lock().expect("the queue").extend(commands);
+            app.control_commands = Some(queue);
 
-        app.handle_control_commands();
-        app.apply_actions(&egui::Context::default());
+            app.handle_control_commands();
+            app.apply_actions(&egui::Context::default());
 
-        assert!(app.queued_play.is_none());
-        assert!(!app.any_play_pending());
-        assert!(app.backend.take_player_commands().is_empty());
+            assert_eq!(app.queued_play.is_some(), keeps_request);
+            assert_eq!(app.any_play_pending(), keeps_request);
+            if let Some(queued) = &app.queued_play {
+                assert_eq!(
+                    queued.request.context_uri.as_deref(),
+                    Some("spotify:album:x")
+                );
+            }
+            assert_eq!(
+                app.resume_track.as_deref(),
+                Some("spotify:track:saved-state")
+            );
+            assert!(app.backend.take_player_commands().is_empty());
+            assert!(app.backend.take_api_requests().is_empty());
+        }
     }
 }

@@ -24,6 +24,8 @@ use thiserror::Error;
 const STORE_VERSION: u32 = 1;
 const MAX_SECRET_BYTES: usize = 512 * 1024;
 const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+const PRIVATE_MUTATION_LOCK: &str = ".private-state.lock";
+const PRIVATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, SecretError>;
@@ -56,6 +58,28 @@ fn io(action: &'static str, path: &Path, source: std::io::Error) -> SecretError 
         action,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+/// Advisory locks are released by the operating system on process death. The
+/// stable lock pathname is never removed, so recovery never guesses whether a
+/// lock owner is stale.
+fn lock_bounded(file: &File, path: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + PRIVATE_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(io(
+                    "acquire the private-state mutation lock at",
+                    path,
+                    error.into(),
+                ));
+            }
+        }
     }
 }
 
@@ -112,6 +136,39 @@ struct Envelope {
     version: u32,
     kind: String,
     payload: String,
+}
+
+fn decode_envelope(id: SecretId, bytes: &[u8]) -> Result<Vec<u8>> {
+    let envelope: Envelope =
+        serde_json::from_slice(bytes).map_err(|error| SecretError::Corrupt {
+            kind: id.label(),
+            reason: error.to_string(),
+        })?;
+    if envelope.version != STORE_VERSION {
+        return Err(SecretError::Corrupt {
+            kind: id.label(),
+            reason: format!("unsupported store version {}", envelope.version),
+        });
+    }
+    if envelope.kind != id.envelope_name() {
+        return Err(SecretError::Corrupt {
+            kind: id.label(),
+            reason: "credential type does not match its filename".into(),
+        });
+    }
+    let payload = STANDARD_NO_PAD
+        .decode(envelope.payload.as_bytes())
+        .map_err(|error| SecretError::Corrupt {
+            kind: id.label(),
+            reason: format!("invalid payload encoding: {error}"),
+        })?;
+    if payload.is_empty() || payload.len() > MAX_SECRET_BYTES {
+        return Err(SecretError::Corrupt {
+            kind: id.label(),
+            reason: "payload is empty or exceeds the credential size limit".into(),
+        });
+    }
+    Ok(payload)
 }
 
 /// Version-one private files. The contents are encoded, not encrypted: the
@@ -181,36 +238,7 @@ impl SecretStore for PrivateFileStore {
         let Some(bytes) = read_private_file(&path, MAX_ENVELOPE_BYTES, true)? else {
             return Ok(None);
         };
-        let envelope: Envelope =
-            serde_json::from_slice(&bytes).map_err(|error| SecretError::Corrupt {
-                kind: id.label(),
-                reason: error.to_string(),
-            })?;
-        if envelope.version != STORE_VERSION {
-            return Err(SecretError::Corrupt {
-                kind: id.label(),
-                reason: format!("unsupported store version {}", envelope.version),
-            });
-        }
-        if envelope.kind != id.envelope_name() {
-            return Err(SecretError::Corrupt {
-                kind: id.label(),
-                reason: "credential type does not match its filename".into(),
-            });
-        }
-        let payload = STANDARD_NO_PAD
-            .decode(envelope.payload.as_bytes())
-            .map_err(|error| SecretError::Corrupt {
-                kind: id.label(),
-                reason: format!("invalid payload encoding: {error}"),
-            })?;
-        if payload.is_empty() || payload.len() > MAX_SECRET_BYTES {
-            return Err(SecretError::Corrupt {
-                kind: id.label(),
-                reason: "payload is empty or exceeds the credential size limit".into(),
-            });
-        }
-        Ok(Some(payload))
+        decode_envelope(id, &bytes).map(Some)
     }
 
     fn store(&self, id: SecretId, secret: &[u8]) -> Result<()> {
@@ -245,7 +273,10 @@ impl SecretStore for PrivateFileStore {
             atomic_replace(&file, &temporary, &destination)?;
             drop(file);
             sync_parent(&self.root)?;
-            match self.load(id)? {
+            let read_back = read_private_file_locked(&destination, MAX_ENVELOPE_BYTES, true)?
+                .map(|bytes| decode_envelope(id, &bytes))
+                .transpose()?;
+            match read_back {
                 Some(read_back) if read_back == secret => Ok(()),
                 _ => Err(SecretError::Verification { kind: id.label() }),
             }
@@ -515,10 +546,19 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 /// Atomically replaces any application-private file with owner-only mode.
 /// This is also used for privacy-sensitive settings, caches, and logs.
 pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    write_private_atomic_inner(path, contents, || {})
+}
+
+fn write_private_atomic_inner(
+    path: &Path,
+    contents: &[u8],
+    before_lock: impl FnOnce(),
+) -> Result<()> {
     let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
         path: path.to_path_buf(),
         reason: "private file has no parent directory".into(),
     })?;
+    before_lock();
     ensure_private_dir(parent)?;
     let _parent_guard = platform_file::lock_directory(parent)?;
     if destination_exists(path)? {
@@ -566,7 +606,7 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         atomic_replace(&file, &temporary, path)?;
         drop(file);
         sync_parent(parent)?;
-        match read_private_file(path, contents.len(), true)? {
+        match read_private_file_locked(path, contents.len(), true)? {
             Some(read_back) if read_back == contents => Ok(()),
             _ => Err(SecretError::Verification {
                 kind: "private file",
@@ -630,6 +670,15 @@ pub fn read_private_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>
 /// expected bytes. A process-lifetime lease uses this to avoid removing a
 /// newer owner's replacement file during shutdown.
 pub fn delete_private_if_matches(path: &Path, expected: &[u8], limit: usize) -> Result<bool> {
+    delete_private_if_matches_inner(path, expected, limit, || {})
+}
+
+fn delete_private_if_matches_inner(
+    path: &Path,
+    expected: &[u8],
+    limit: usize,
+    after_compare: impl FnOnce(),
+) -> Result<bool> {
     let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
         path: path.to_path_buf(),
         reason: "private file has no parent directory".into(),
@@ -653,6 +702,7 @@ pub fn delete_private_if_matches(path: &Path, expected: &[u8], limit: usize) -> 
     if contents != expected {
         return Ok(false);
     }
+    after_compare();
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let stem = path
         .file_name()
@@ -827,6 +877,21 @@ fn validate_open_file(path: &Path, file: &File, strict_mode: bool) -> Result<()>
 }
 
 fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Option<Vec<u8>>> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "private file has no parent directory".into(),
+    })?;
+    let _parent_guard = platform_file::lock_directory(parent)?;
+    read_private_file_locked(path, limit, strict_mode)
+}
+
+/// Reads while the caller holds the parent mutation lock. This is also the
+/// durable write-back verification path, avoiding a recursive advisory lock.
+fn read_private_file_locked(
+    path: &Path,
+    limit: usize,
+    strict_mode: bool,
+) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_file_parent(path)?;
@@ -835,8 +900,6 @@ fn read_private_file(path: &Path, limit: usize, strict_mode: bool) -> Result<Opt
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io("inspect a credential file", path, error)),
     }
-    let parent = path.parent().expect("validated credential parent");
-    let _parent_guard = platform_file::lock_directory(parent)?;
     let mut options = OpenOptions::new();
     options.read(true);
     platform_file::configure_regular(&mut options);
@@ -853,7 +916,7 @@ struct PreparedLegacyFile {
     file: File,
     bytes: Vec<u8>,
     limit: usize,
-    _parent_guard: Option<File>,
+    _parent_guard: platform_file::DirectoryLock,
 }
 
 impl PreparedLegacy for PreparedLegacyFile {
@@ -880,17 +943,23 @@ fn prepare_legacy_private_file(
     migration: PathBuf,
     limit: usize,
 ) -> Result<Option<PreparedLegacyFile>> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "legacy credential has no parent directory".into(),
+    })?;
+    if matches!(
+        std::fs::symlink_metadata(parent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(None);
+    }
+    ensure_private_dir(parent)?;
+    let parent_guard = platform_file::lock_directory(parent)?;
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io("inspect a legacy credential file", path, error)),
     };
-    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
-        path: path.to_path_buf(),
-        reason: "legacy credential has no parent directory".into(),
-    })?;
-    ensure_private_dir(parent)?;
-    let parent_guard = platform_file::lock_directory(parent)?;
     validate_file_metadata(path, &metadata, false)?;
 
     let mut options = OpenOptions::new();
@@ -942,6 +1011,17 @@ fn verify_open_contents(path: &Path, file: &mut File, expected: &[u8], limit: us
 }
 
 fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| SecretError::UnsafePath {
+        path: path.to_path_buf(),
+        reason: "credential file has no parent directory".into(),
+    })?;
+    if matches!(
+        std::fs::symlink_metadata(parent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(());
+    }
+    let _parent_guard = platform_file::lock_directory(parent)?;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_file_parent(path)?;
@@ -950,8 +1030,6 @@ fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io("inspect a credential before deletion", path, error)),
     }
-    let parent = path.parent().expect("validated credential parent");
-    let _parent_guard = platform_file::lock_directory(parent)?;
     validate_path_as_private_file(path, strict_mode)?;
     std::fs::remove_file(path).map_err(|error| io("delete a credential file", path, error))
 }
@@ -960,14 +1038,30 @@ fn delete_private_file(path: &Path, strict_mode: bool) -> Result<()> {
 mod platform_file {
     use super::*;
 
+    pub struct DirectoryLock {
+        _lock: File,
+    }
+
     pub fn configure_regular(_options: &mut OpenOptions) {}
 
     pub fn configure_legacy(_options: &mut OpenOptions) {}
 
     pub fn configure_temporary(_options: &mut OpenOptions) {}
 
-    pub fn lock_directory(_path: &Path) -> Result<Option<File>> {
-        Ok(None)
+    pub fn lock_directory(path: &Path) -> Result<DirectoryLock> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let lock_path = path.join(PRIVATE_MUTATION_LOCK);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|error| io("open the private-state mutation lock at", &lock_path, error))?;
+        validate_open_file(&lock_path, &file, false)?;
+        harden(&file, &lock_path)?;
+        validate_open_file(&lock_path, &file, true)?;
+        lock_bounded(&file, &lock_path)?;
+        Ok(DirectoryLock { _lock: file })
     }
 
     pub fn validate_path(_path: &Path) -> Result<()> {
@@ -1075,6 +1169,11 @@ mod platform_file {
         links: u32,
     }
 
+    pub struct DirectoryLock {
+        _directory: File,
+        _lock: File,
+    }
+
     pub fn configure_regular(options: &mut OpenOptions) {
         options
             .share_mode(FILE_SHARE_READ)
@@ -1095,7 +1194,7 @@ mod platform_file {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
-    pub fn lock_directory(path: &Path) -> Result<Option<File>> {
+    pub fn lock_directory(path: &Path) -> Result<DirectoryLock> {
         let mut options = OpenOptions::new();
         options
             .access_mode(0)
@@ -1127,7 +1226,23 @@ mod platform_file {
                 reason: "private directory changed while it was being opened".into(),
             });
         }
-        Ok(Some(directory))
+        let lock_path = path.join(PRIVATE_MUTATION_LOCK);
+        let mut lock_options = OpenOptions::new();
+        lock_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let lock = lock_options
+            .open(&lock_path)
+            .map_err(|error| io("open the private-state mutation lock at", &lock_path, error))?;
+        validate_open_file(&lock_path, &lock, true)?;
+        lock_bounded(&lock, &lock_path)?;
+        Ok(DirectoryLock {
+            _directory: directory,
+            _lock: lock,
+        })
     }
 
     pub fn validate_path(path: &Path) -> Result<()> {
@@ -1325,11 +1440,13 @@ mod platform_file {
 mod platform_file {
     use super::*;
 
+    pub struct DirectoryLock;
+
     pub fn configure_regular(_options: &mut OpenOptions) {}
     pub fn configure_legacy(_options: &mut OpenOptions) {}
     pub fn configure_temporary(_options: &mut OpenOptions) {}
-    pub fn lock_directory(_path: &Path) -> Result<Option<File>> {
-        Ok(None)
+    pub fn lock_directory(_path: &Path) -> Result<DirectoryLock> {
+        Ok(DirectoryLock)
     }
     pub fn validate_path(_path: &Path) -> Result<()> {
         Ok(())
@@ -1822,7 +1939,7 @@ mod tests {
                 .is_symlink()
         );
         let _ = std::fs::remove_file(file);
-        let _ = std::fs::remove_dir(root);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -1853,7 +1970,50 @@ mod tests {
         let _ = std::fs::remove_file(log);
         let _ = std::fs::remove_file(victim);
         let _ = std::fs::remove_file(settings);
-        let _ = std::fs::remove_dir(root);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_delete_serializes_a_successor_started_after_comparison() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-private-delete-race-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("control-ipc.secret");
+        let original = b"original-owner";
+        let successor = b"successor-owner";
+        write_private_atomic(&path, original).unwrap();
+
+        let (start_writer, writer_started) = std::sync::mpsc::channel();
+        let (at_lock, writer_at_lock) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            writer_started.recv().expect("comparison completed");
+            write_private_atomic_inner(&writer_path, successor, || {
+                at_lock.send(()).expect("announce successor write");
+            })
+            .expect("successor write");
+        });
+
+        let deleted = delete_private_if_matches_inner(&path, original, original.len(), || {
+            start_writer
+                .send(())
+                .expect("start successor after compare");
+            writer_at_lock
+                .recv()
+                .expect("successor reached the serialized mutation boundary");
+        })
+        .expect("matching owner delete");
+
+        writer.join().expect("successor writer exits");
+        assert!(deleted);
+        assert_eq!(
+            read_private_bounded(&path, successor.len()).unwrap(),
+            Some(successor.to_vec())
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

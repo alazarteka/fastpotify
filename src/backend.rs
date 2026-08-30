@@ -3028,6 +3028,14 @@ async fn handle(api: &ApiGateway, request: ApiRequest) -> ApiResponse {
     response
 }
 
+#[cfg(test)]
+pub(crate) async fn handle_for_transport_test(
+    api: &ApiGateway,
+    request: ApiRequest,
+) -> ApiResponse {
+    handle(api, request).await
+}
+
 /// Spotify's transcription of the track, when the local session can ask for
 /// one. Answers are cached like LRCLIB's, "none" included; `None` falls
 /// back to LRCLIB.

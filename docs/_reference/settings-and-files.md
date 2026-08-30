@@ -15,6 +15,7 @@ Fastpotify follows each platform's conventions. On Linux:
 | Personal Web API sign-in | `~/.local/state/fastpotify/secrets-v1/personal-web-api.secret` | Yes, you authorize your app again |
 | Playback credential | `~/.local/state/fastpotify/secrets-v1/playback.secret` | Yes, you approve playback again |
 | Last session | `~/.local/state/fastpotify/session.json` | Yes |
+| Control IPC token (macOS/Windows) | `<state>/control-ipc.secret` (not used on Linux) | Only while Fastpotify is stopped |
 | Audio cache | `~/.cache/fastpotify/audio/` | Always |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
 | Lyrics cache | `~/.cache/fastpotify/lyrics/` | Always |
@@ -39,6 +40,18 @@ value that was migrated.
 Signing out clears every live provider and the playback engine first, attempts
 to delete all new and legacy credential locations, and reports any partial
 failure. Removing a personal app clears only its provider and credential.
+
+On macOS and Windows, `control-ipc.secret` authenticates later command-line or
+application launches to the one primary process's loopback control socket. It
+is a random process-lifetime token, separate from Spotify credentials, so
+Spotify sign-out does not remove it or break activation of the still-running
+application. Each primary replaces it through the bounded owner-private atomic
+writer. On orderly shutdown, the process removes the pathname only when it
+still contains that process's token; a successor value is retained. Private
+state writers and conditional deletion share a bounded advisory mutation lock,
+which the operating system releases if a process exits. An abrupt exit may
+leave the token file itself, and the next primary replaces it after winning the
+control port.
 
 The Windows test suite exercises hard-link rejection, filename locking before
 truncation, and handle-based replacement. The remaining platform validation is

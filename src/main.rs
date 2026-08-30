@@ -418,6 +418,11 @@ fn main() -> eframe::Result<()> {
                 log::info!("Fastpotify is already running; asked it to show its window");
                 return Ok(());
             }
+            single_instance::Outcome::Blocked(error) => {
+                eprintln!("Fastpotify did not start: {error}");
+                log::error!("Fastpotify did not start: {error}");
+                return Err(eframe::Error::AppCreation(Box::new(error)));
+            }
         }
     } else {
         None
