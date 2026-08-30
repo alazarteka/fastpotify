@@ -652,7 +652,7 @@ mod tests {
     use super::*;
     use crate::app::AppOptions;
     use crate::backend::ApiRequest;
-    use crate::drag::{ContextPayload, PlaylistOrigin, TrackPayload};
+    use crate::drag::{ContextPayload, PlaylistAuthority, PlaylistOrigin, TrackPayload};
     use crate::paths::AppDirs;
     use crate::settings::Settings;
 
@@ -688,6 +688,28 @@ mod tests {
             }],
         );
         assert!(!egui::DragAndDrop::has_any_payload(ctx));
+    }
+
+    fn click(ctx: &egui::Context, app: &mut App, pos: egui::Pos2) {
+        frame_events(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
     }
 
     struct DemoApp {
@@ -760,6 +782,26 @@ mod tests {
 
     fn held_track(app: &App, origin: Option<PlaylistOrigin>) -> TrackPayload {
         held_track_uri(app, "spotify:track:trk1", origin)
+    }
+
+    fn captured_origin(
+        playlist_id: &str,
+        index: usize,
+        uri: &str,
+        loaded_extent: usize,
+    ) -> PlaylistOrigin {
+        let authority = PlaylistAuthority::new(
+            &format!("spotify:playlist:{playlist_id}"),
+            playlist_id,
+            Some("snap"),
+            loaded_extent,
+            Some(loaded_extent as u32),
+            true,
+            0,
+            0,
+        )
+        .expect("synthetic playlist authority");
+        PlaylistOrigin::capture(&authority, uri, index, 0).expect("synthetic playlist origin")
     }
 
     /// Every page, panel, and dialog lays out without panicking.
@@ -879,6 +921,7 @@ mod tests {
                 playlist_id,
                 playlist_name,
                 uris,
+                ..
             }) = request
             {
                 assert_eq!(playlist_id, "pl3");
@@ -890,15 +933,11 @@ mod tests {
         }
         let target = target.expect("no drop position reached the collaborative playlist");
 
-        // A playlist copy is intentionally not deduplicated client-side;
-        // Spotify remains authoritative about whether duplicates are allowed.
+        // The saved state is intentionally irrelevant to playlist copies, but
+        // another copy cannot race the one whose wire response is pending.
         egui::DragAndDrop::set_payload(&ctx, held_track(&app, None));
         release_payload(&ctx, &mut app, target);
-        assert!(matches!(
-            app.backend.take_api_requests().as_slice(),
-            [ApiRequest::AddToPlaylist { playlist_id, uris, .. }]
-                if playlist_id == "pl3" && uris == &["spotify:track:trk1"]
-        ));
+        assert!(app.backend.take_api_requests().is_empty());
 
         let invalid = egui::pos2(1260.0, 780.0);
         egui::DragAndDrop::set_payload(&ctx, held_track(&app, None));
@@ -946,6 +985,75 @@ mod tests {
     }
 
     #[test]
+    fn focus_loss_and_pointer_departure_retire_drag_before_reentry() {
+        let (ctx, mut app) = demo_app("drag-focus-loss-test");
+        let Loadable::Loaded(playlists) = &mut app.library.playlists else {
+            panic!("demo playlists are loaded");
+        };
+        for playlist in playlists.iter_mut() {
+            playlist.owner.id = Some("someone-else".into());
+            playlist.collaborative = false;
+        }
+        playlists[3].collaborative = true;
+        frame(&ctx, &mut app);
+        let target = crate::ui::sidebar::row_rect(&ctx, &Page::Playlist("pl3".into()))
+            .expect("collaborative row is rendered")
+            .center();
+        app.backend.take_api_requests();
+
+        egui::DragAndDrop::set_payload(&ctx, held_track(&app, None));
+        frame_events(&ctx, &mut app, vec![egui::Event::WindowFocused(false)]);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+        frame_events(&ctx, &mut app, vec![egui::Event::WindowFocused(true)]);
+        frame_events(
+            &ctx,
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(app.backend.take_api_requests().is_empty());
+
+        egui::DragAndDrop::set_payload(&ctx, held_track(&app, None));
+        frame_events(&ctx, &mut app, vec![egui::Event::PointerGone]);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+    }
+
+    #[test]
+    fn malformed_playlist_metadata_stays_navigable_but_is_not_a_drop_target() {
+        let (ctx, mut app) = demo_app("drop-playlist-metadata-test");
+        let Loadable::Loaded(playlists) = &mut app.library.playlists else {
+            panic!("demo playlists are loaded");
+        };
+        let playlist = playlists
+            .iter_mut()
+            .find(|playlist| playlist.id == "pl3")
+            .expect("demo playlist");
+        playlist.owner.id = Some("demo".into());
+        playlist.uri = "spotify:playlist:somewhere-else".into();
+        frame(&ctx, &mut app);
+        let target = crate::ui::sidebar::row_rect(&ctx, &Page::Playlist("pl3".into()))
+            .expect("malformed row is still rendered")
+            .center();
+        app.backend.take_api_requests();
+
+        egui::DragAndDrop::set_payload(&ctx, held_track(&app, None));
+        release_payload(&ctx, &mut app, target);
+        assert!(!app.backend.take_api_requests().iter().any(|request| {
+            matches!(request, ApiRequest::AddToPlaylist { playlist_id, .. } if playlist_id == "pl3")
+        }));
+
+        click(&ctx, &mut app, target);
+        assert_eq!(app.page(), &Page::Playlist("pl3".into()));
+    }
+
+    #[test]
     fn playlist_table_drop_requires_an_untransformed_exact_source() {
         let (ctx, mut app) = demo_app("drop-table-test");
         app.open(Page::Playlist("pl1".into()));
@@ -962,10 +1070,9 @@ mod tests {
         };
         let original = order(&app);
         let from = 5usize;
-        let origin = || {
-            PlaylistOrigin::from_context("spotify:playlist:pl1", "pl1", from)
-                .expect("editable demo playlist")
-        };
+        let origin = app
+            .playlist_origin("pl1", from, &original[from])
+            .expect("editable demo playlist");
         app.backend.take_api_requests();
 
         let mut target = None;
@@ -973,7 +1080,7 @@ mod tests {
             let pos = egui::pos2(700.0, 100.0 + step as f32 * 13.0);
             egui::DragAndDrop::set_payload(
                 &ctx,
-                held_track_uri(&app, &original[from], Some(origin())),
+                held_track_uri(&app, &original[from], Some(origin.clone())),
             );
             release_payload(&ctx, &mut app, pos);
             let requests = app.backend.take_api_requests();
@@ -982,6 +1089,7 @@ mod tests {
                 range_start,
                 insert_before,
                 snapshot_id,
+                ..
             }) = requests
                 .into_iter()
                 .find(|request| matches!(request, ApiRequest::ReorderPlaylist { .. }))
@@ -999,8 +1107,7 @@ mod tests {
         assert_ne!(order(&app), original);
 
         let after_move = order(&app);
-        let other = PlaylistOrigin::from_context("spotify:playlist:other", "other", 0)
-            .expect("other playlist");
+        let other = captured_origin("other", 0, &after_move[0], after_move.len());
         egui::DragAndDrop::set_payload(&ctx, held_track_uri(&app, &after_move[0], Some(other)));
         release_payload(&ctx, &mut app, target);
         assert!(app.backend.take_api_requests().is_empty());
@@ -1013,9 +1120,10 @@ mod tests {
                 ascending: true,
             },
         );
+        let transformed_origin = captured_origin("pl1", from, &after_move[from], after_move.len());
         egui::DragAndDrop::set_payload(
             &ctx,
-            held_track_uri(&app, &after_move[from], Some(origin())),
+            held_track_uri(&app, &after_move[from], Some(transformed_origin.clone())),
         );
         release_payload(&ctx, &mut app, target);
         assert!(app.backend.take_api_requests().is_empty());
@@ -1028,7 +1136,7 @@ mod tests {
             .filter = "Otomo".into();
         egui::DragAndDrop::set_payload(
             &ctx,
-            held_track_uri(&app, &after_move[from], Some(origin())),
+            held_track_uri(&app, &after_move[from], Some(transformed_origin)),
         );
         release_payload(&ctx, &mut app, target);
         assert!(app.backend.take_api_requests().is_empty());
@@ -1047,8 +1155,7 @@ mod tests {
             .insert(1, PlaylistItem::default());
         frame(&ctx, &mut app);
         let before_gap = order(&app);
-        let server_origin = PlaylistOrigin::from_context("spotify:playlist:pl1", "pl1", 0)
-            .expect("playlist origin");
+        let server_origin = captured_origin("pl1", 0, &before_gap[0], before_gap.len());
         egui::DragAndDrop::set_payload(
             &ctx,
             held_track_uri(&app, &before_gap[0], Some(server_origin)),
@@ -1056,6 +1163,48 @@ mod tests {
         release_payload(&ctx, &mut app, target);
         assert!(app.backend.take_api_requests().is_empty());
         assert_eq!(order(&app), before_gap);
+    }
+
+    #[test]
+    fn mid_drag_playlist_revision_change_fails_closed_on_real_release() {
+        let (ctx, mut app) = demo_app("drop-table-revision-test");
+        app.open(Page::Playlist("pl1".into()));
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+        let order = |app: &App| -> Vec<String> {
+            app.playlist_pages["pl1"]
+                .items
+                .items
+                .iter()
+                .filter_map(|item| item.playable().map(|item| item.uri().to_owned()))
+                .collect()
+        };
+        let before = order(&app);
+        let from = 5;
+        let origin = app
+            .playlist_origin("pl1", from, &before[from])
+            .expect("authoritative drag origin");
+        let first_row = crate::ui::widgets::track_row_rect(&ctx, &before[0])
+            .expect("first playlist row is rendered");
+        let target = egui::pos2(first_row.center().x, first_row.top() + 1.0);
+        egui::DragAndDrop::set_payload(&ctx, held_track_uri(&app, &before[from], Some(origin)));
+        let page = app.playlist_pages.get_mut("pl1").expect("playlist page");
+        page.playlist
+            .get_mut()
+            .expect("playlist metadata")
+            .snapshot_id = Some("changed-during-drag".into());
+        page.revise();
+        app.backend.take_api_requests();
+
+        release_payload(&ctx, &mut app, target);
+        assert!(
+            !app.backend
+                .take_api_requests()
+                .iter()
+                .any(|request| matches!(request, ApiRequest::ReorderPlaylist { .. }))
+        );
+        assert_eq!(order(&app), before);
     }
 
     #[test]

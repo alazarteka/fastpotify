@@ -4,7 +4,9 @@ use egui::{Align, Layout, Rect, Sense, Vec2, pos2, vec2};
 
 use crate::api::models::{Album, Copyright, PlayableItem, Playlist, pick_image};
 use crate::app::App;
-use crate::drag::{TrackPayload, playlist_move};
+use crate::drag::{
+    PlaylistAuthority, PlaylistOrigin, TrackPayload, playlist_move, valid_playlist_identity,
+};
 use crate::model::{Action, Dialog, Loadable, Page, PagedList, RowContext, SortColumn, TableSort};
 use crate::theme::{self, Icon, Palette};
 use crate::util;
@@ -262,6 +264,8 @@ pub struct Table<'a> {
     /// Null source entries make that mapping unsafe even though they are not
     /// rendered.
     pub playlist_positions_exact: bool,
+    /// Complete server revision from which reorder origins may be captured.
+    pub playlist_authority: Option<PlaylistAuthority>,
     pub show_album: bool,
     pub show_cover: bool,
     pub show_added: bool,
@@ -335,18 +339,14 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         table.context.clone()
     };
     let move_playlist = (!view_active && table.playlist_positions_exact)
-        .then(|| match &table.context {
-            RowContext::Context {
-                editable_playlist: Some((id, _)),
-                ..
-            } => Some(id.clone()),
-            _ => None,
-        })
+        .then(|| table.playlist_authority.clone())
         .flatten();
     let list_top = ui.cursor().top();
-    let move_slot = move_playlist.as_ref().and_then(|playlist_id| {
+    let move_slot = move_playlist.as_ref().and_then(|authority| {
         let track = egui::DragAndDrop::payload::<TrackPayload>(ui.ctx())?;
-        if !track.belongs_to(app.drag_scope()) || track.origin()?.playlist_id() != playlist_id {
+        if !track.belongs_to(app.drag_scope())
+            || track.origin()?.playlist_id() != authority.playlist_id()
+        {
             return None;
         }
         let pos = ui
@@ -360,6 +360,14 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
     widgets::virtual_rows(ui, visible.len(), theme::ROW_HEIGHT, |ui, row| {
         let index = visible[row];
         let (item, added_at, added_by) = &table.items[index];
+        let playlist_origin = move_playlist.as_ref().and_then(|authority| {
+            let occurrence = table.items[..=index]
+                .iter()
+                .filter(|(held, _, _)| held.uri() == item.uri())
+                .count()
+                .saturating_sub(1);
+            PlaylistOrigin::capture(authority, item.uri(), index, occurrence)
+        });
         let shift = ui.ctx().animate_value_with_time(
             ui.id().with(("table-move-shift", row)),
             match move_slot {
@@ -374,7 +382,7 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             app,
             TrackRow {
                 index: if view_active { row } else { index },
-                playlist_index: (!view_active && table.playlist_positions_exact).then_some(index),
+                playlist_origin,
                 number: Some(if sort.is_some() { row + 1 } else { index + 1 }),
                 item,
                 context: &context,
@@ -388,7 +396,7 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             },
         );
     });
-    if let (Some(slot), Some(playlist_id)) = (move_slot, move_playlist) {
+    if let (Some(slot), Some(authority)) = (move_slot, move_playlist) {
         let y = list_top + slot as f32 * theme::ROW_HEIGHT;
         ui.painter().hline(
             ui.max_rect().x_range().shrink(8.0),
@@ -397,13 +405,10 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         );
         if ui.input(|input| input.pointer.any_released())
             && let Some(track) = egui::DragAndDrop::take_payload::<TrackPayload>(ui.ctx())
-            && let Some(movement) = playlist_move(&track, app.drag_scope(), &playlist_id, slot)
+            && let Some(movement) =
+                playlist_move(&track, app.drag_scope(), authority.playlist_id(), slot)
         {
-            app.actions.push(Action::MoveInPlaylist {
-                playlist_id,
-                from: movement.from,
-                to: movement.insert_before,
-            });
+            app.actions.push(Action::MoveInPlaylist(movement));
         }
     }
     if table.loading {
@@ -612,6 +617,7 @@ pub fn top_songs(app: &mut App, ui: &mut egui::Ui) {
             items: &items,
             context: RowContext::Uris(uris),
             playlist_positions_exact: false,
+            playlist_authority: None,
             show_album: true,
             show_cover: true,
             show_added: false,
@@ -727,8 +733,27 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 },
                 Some(&mut page.filter),
             );
-            let editable = (owned || playlist.collaborative)
-                .then(|| (playlist.id.clone(), playlist.snapshot_id.clone()));
+            let positions_exact = items.len() == page.items.items.len();
+            let editable_target = (owned || playlist.collaborative)
+                && playlist.id == id
+                && valid_playlist_identity(&playlist.uri, &playlist.id);
+            let playlist_authority =
+                (editable_target && positions_exact && !app.playlist_mutation_pending(id))
+                    .then(|| {
+                        PlaylistAuthority::new(
+                            &playlist.uri,
+                            &playlist.id,
+                            playlist.snapshot_id.as_deref(),
+                            page.items.items.len(),
+                            page.items.total,
+                            page.items.is_complete(),
+                            page.revision,
+                            page.mutation_generation,
+                        )
+                    })
+                    .flatten();
+            let editable =
+                editable_target.then(|| (playlist.id.clone(), playlist.snapshot_id.clone()));
             table(
                 app,
                 ui,
@@ -738,7 +763,8 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         uri: playlist.uri.clone(),
                         editable_playlist: editable,
                     },
-                    playlist_positions_exact: items.len() == page.items.items.len(),
+                    playlist_positions_exact: positions_exact,
+                    playlist_authority,
                     show_album: true,
                     show_cover: true,
                     show_added: true,
@@ -821,6 +847,7 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         editable_playlist: None,
                     },
                     playlist_positions_exact: false,
+                    playlist_authority: None,
                     show_album: false,
                     show_cover: false,
                     show_added: false,
@@ -992,6 +1019,7 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
             items: &items,
             context,
             playlist_positions_exact: false,
+            playlist_authority: None,
             show_album: true,
             show_cover: true,
             show_added: true,

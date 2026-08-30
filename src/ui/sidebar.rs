@@ -6,7 +6,7 @@ use crate::api::models::pick_image;
 use crate::app::App;
 use crate::drag::{
     ContextPayload, TrackPayload, drop_pinned_context, drop_playlist_context,
-    playlist_sidebar_indices,
+    playlist_sidebar_indices, valid_playlist_identity,
 };
 use crate::model::{Action, Dialog, Loadable, Page};
 use crate::theme::{self, Icon, Palette};
@@ -280,7 +280,8 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             continue;
                         }
                         let owned = playlist.owned_by(&user_id);
-                        let editable = owned || playlist.collaborative;
+                        let editable = (owned || playlist.collaborative)
+                            && valid_playlist_identity(&playlist.uri, &playlist.id);
                         entries.push(Entry {
                             image: pick_image(&playlist.images, 64).map(str::to_string),
                             name: playlist.name.clone(),
@@ -501,6 +502,13 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     0.12,
                 );
                 let rect = rect.translate(vec2(0.0, shift));
+                #[cfg(test)]
+                ui.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new(("sidebar-row-test-rect", entry.page.clone())),
+                        rect,
+                    );
+                });
                 if ui.is_rect_visible(rect) {
                     if active {
                         ui.painter()
@@ -652,7 +660,6 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     } else if let Page::Playlist(id) = &entry.page {
                         app.actions.push(Action::AddToPlaylist {
                             playlist_id: id.clone(),
-                            playlist_name: entry.name.clone(),
                             uris: vec![track.uri().to_owned()],
                         });
                     }
@@ -780,6 +787,11 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 super::widgets::load_more_when_near_end(ui, app, page, true);
             }
         });
+}
+
+#[cfg(test)]
+pub(crate) fn row_rect(ctx: &egui::Context, page: &Page) -> Option<Rect> {
+    ctx.data(|data| data.get_temp(egui::Id::new(("sidebar-row-test-rect", page.clone()))))
 }
 
 /// Every loaded playlist in the order the complete, unfiltered shelf uses.

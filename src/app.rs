@@ -14,7 +14,12 @@ use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
     RemoteAction, Waker,
 };
-use crate::drag::{ContextPayload, Scope as DragScope, TrackPayload};
+#[cfg(test)]
+use crate::drag::PlaylistOrigin;
+use crate::drag::{
+    ContextPayload, PlaylistAuthority, PlaylistMove, Scope as DragScope, TrackPayload,
+    valid_playlist_identity,
+};
 use crate::media::{MediaCommand, MediaState, MediaTrack};
 use crate::media_controls::MediaService;
 use crate::model::*;
@@ -325,6 +330,9 @@ pub struct App {
     pub actions: Vec<Action>,
     /// Navigation/auth identity for any pointer payload currently in flight.
     drag_scope: DragScope,
+    /// One UI-issued item mutation may be in flight for each playlist.
+    pending_playlist_mutations: HashMap<String, u64>,
+    next_playlist_mutation_id: u64,
     volume_before_mute: Option<u8>,
     /// What was just asked to play, until Spotify visibly reacts: the keys
     /// (context and track URIs) whose play buttons show a spinner.
@@ -512,6 +520,8 @@ impl App {
             toasts: Vec::new(),
             actions: Vec::new(),
             drag_scope: DragScope::default(),
+            pending_playlist_mutations: HashMap::new(),
+            next_playlist_mutation_id: 0,
             volume_before_mute: None,
             pending_play_keys: Vec::new(),
             pending_play_at: None,
@@ -1035,6 +1045,7 @@ impl App {
                 }
                 Event::WebApp { client_id } => {
                     self.invalidate_drag_scope();
+                    self.retire_playlist_mutations_for_route_change();
                     self.web_app = client_id;
                 }
                 Event::UpdateAvailable { version, url } => {
@@ -1124,6 +1135,7 @@ impl App {
 
     fn reset_data(&mut self) {
         self.invalidate_drag_scope();
+        self.pending_playlist_mutations.clear();
         self.library = Library::default();
         self.home = HomeData::default();
         self.playlist_pages.clear();
@@ -1906,6 +1918,7 @@ impl App {
     }
 
     fn reload(&mut self, page: Page) {
+        self.invalidate_drag_scope();
         match &page {
             Page::Home => self.load_home(true),
             Page::TopSongs => self.load_top_songs(true),
@@ -2308,6 +2321,7 @@ impl App {
                 }
                 if let Some(page) = self.playlist_pages.get_mut(&id) {
                     page.playlist = Loadable::from_result(result);
+                    page.revise();
                 }
                 self.try_adopt_playlist_cache(&id);
             }
@@ -2335,6 +2349,7 @@ impl App {
                                 .collect();
                             page.contributors.extend(adders.iter().cloned());
                             page.items.absorb(offset, items);
+                            page.revise();
                             // The rows load from the top, and songs a friend
                             // added often sit at the end; look there once.
                             if !page.tail_checked {
@@ -2402,11 +2417,7 @@ impl App {
                         if let Some(Dialog::CreatePlaylist { add_uris, .. }) = self.dialog.take()
                             && !add_uris.is_empty()
                         {
-                            self.backend.api(ApiRequest::AddToPlaylist {
-                                playlist_id: playlist.id.clone(),
-                                playlist_name: playlist.name.clone(),
-                                uris: add_uris,
-                            });
+                            self.add_to_playlist(playlist.id.clone(), add_uris);
                         }
                         self.open(Page::Playlist(playlist.id));
                     }
@@ -2432,11 +2443,15 @@ impl App {
                 }
             }
             ApiResponse::PlaylistItemsChanged {
+                mutation_id,
                 id,
                 message,
                 result,
             } => {
-                self.playlist_busy = false;
+                if self.pending_playlist_mutations.get(&id).copied() != Some(mutation_id) {
+                    return;
+                }
+                self.pending_playlist_mutations.remove(&id);
                 match result {
                     Ok(snapshot) => {
                         if !message.is_empty() {
@@ -2453,6 +2468,7 @@ impl App {
                             page.tail_checked = false;
                             page.cache_complete = false;
                             page.pending_cache = None;
+                            page.revise();
                         }
                         if matches!(self.page(), Page::Playlist(current) if *current == id) {
                             self.ensure_loaded(Page::Playlist(id.clone()));
@@ -2472,6 +2488,7 @@ impl App {
                             page.tail_checked = false;
                             page.cache_complete = false;
                             page.pending_cache = None;
+                            page.revise();
                         }
                         self.ensure_loaded(Page::Playlist(id));
                     }
@@ -2834,16 +2851,216 @@ impl App {
         self.drag_scope
     }
 
+    pub(crate) fn playlist_mutation_pending(&self, playlist_id: &str) -> bool {
+        self.pending_playlist_mutations.contains_key(playlist_id)
+    }
+
+    fn editable_page_playlist(&self, playlist_id: &str) -> Option<(&PlaylistPage, &Playlist)> {
+        let user_id = self.user_id()?;
+        let page = self.playlist_pages.get(playlist_id)?;
+        let playlist = page.playlist.get()?;
+        ((playlist.owned_by(user_id) || playlist.collaborative)
+            && valid_playlist_identity(&playlist.uri, &playlist.id)
+            && playlist.id == playlist_id)
+            .then_some((page, playlist))
+    }
+
+    fn playlist_authority(&self, playlist_id: &str) -> Option<PlaylistAuthority> {
+        if self.playlist_mutation_pending(playlist_id) {
+            return None;
+        }
+        let (page, playlist) = self.editable_page_playlist(playlist_id)?;
+        PlaylistAuthority::new(
+            &playlist.uri,
+            &playlist.id,
+            playlist.snapshot_id.as_deref(),
+            page.items.items.len(),
+            page.items.total,
+            page.items.is_complete(),
+            page.revision,
+            page.mutation_generation,
+        )
+    }
+
+    fn playlist_occurrence(page: &PlaylistPage, index: usize, uri: &str) -> Option<usize> {
+        (page.items.items.get(index)?.playable()?.uri() == uri).then_some(
+            page.items.items[..=index]
+                .iter()
+                .filter_map(|item| item.playable())
+                .filter(|item| item.uri() == uri)
+                .count()
+                .saturating_sub(1),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn playlist_origin(
+        &self,
+        playlist_id: &str,
+        index: usize,
+        uri: &str,
+    ) -> Option<PlaylistOrigin> {
+        let authority = self.playlist_authority(playlist_id)?;
+        let page = self.playlist_pages.get(playlist_id)?;
+        let occurrence = Self::playlist_occurrence(page, index, uri)?;
+        PlaylistOrigin::capture(&authority, uri, index, occurrence)
+    }
+
+    fn playlist_move_is_current(&self, movement: &PlaylistMove) -> bool {
+        let Some(authority) = self.playlist_authority(movement.playlist_id()) else {
+            return false;
+        };
+        let Some(page) = self.playlist_pages.get(movement.playlist_id()) else {
+            return false;
+        };
+        let Ok(index) = usize::try_from(movement.from()) else {
+            return false;
+        };
+        let Some(occurrence) = Self::playlist_occurrence(page, index, movement.source_uri()) else {
+            return false;
+        };
+        movement.matches_current(&authority, movement.source_uri(), occurrence)
+    }
+
+    fn begin_playlist_mutation(&mut self, playlist_id: &str) -> Option<u64> {
+        if self.playlist_mutation_pending(playlist_id) {
+            self.toast_error("Another change to this playlist is still finishing");
+            return None;
+        }
+        self.next_playlist_mutation_id = self
+            .next_playlist_mutation_id
+            .checked_add(1)
+            .expect("playlist mutation id exhausted");
+        let mutation_id = self.next_playlist_mutation_id;
+        self.pending_playlist_mutations
+            .insert(playlist_id.to_owned(), mutation_id);
+        if let Some(page) = self.playlist_pages.get_mut(playlist_id) {
+            page.begin_mutation();
+        }
+        self.invalidate_drag_scope();
+        Some(mutation_id)
+    }
+
+    fn retire_playlist_mutations_for_route_change(&mut self) {
+        if self.pending_playlist_mutations.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_playlist_mutations);
+        let reload_current = match self.page() {
+            Page::Playlist(id) if pending.contains_key(id) => Some(id.clone()),
+            _ => None,
+        };
+        for playlist_id in pending.keys() {
+            self.playlist_pages.remove(playlist_id);
+        }
+        self.load_playlists();
+        if let Some(playlist_id) = reload_current {
+            self.ensure_loaded(Page::Playlist(playlist_id));
+        }
+    }
+
+    fn editable_library_playlist_name(&self, playlist_id: &str) -> Option<String> {
+        let user_id = self.user_id()?;
+        self.library
+            .playlists
+            .get()?
+            .iter()
+            .find(|playlist| {
+                playlist.id == playlist_id
+                    && valid_playlist_identity(&playlist.uri, &playlist.id)
+                    && (playlist.owned_by(user_id) || playlist.collaborative)
+            })
+            .map(|playlist| playlist.name.clone())
+    }
+
+    fn add_to_playlist(&mut self, playlist_id: String, uris: Vec<String>) {
+        let Some(playlist_name) = self.editable_library_playlist_name(&playlist_id) else {
+            return;
+        };
+        let Some(mutation_id) = self.begin_playlist_mutation(&playlist_id) else {
+            return;
+        };
+        self.backend.api(ApiRequest::AddToPlaylist {
+            mutation_id,
+            playlist_id,
+            playlist_name,
+            uris,
+        });
+    }
+
+    fn remove_from_playlist(&mut self, playlist_id: String, uris: Vec<String>) {
+        let Some(snapshot_id) = self
+            .editable_page_playlist(&playlist_id)
+            .map(|(_, playlist)| playlist.snapshot_id.clone())
+        else {
+            return;
+        };
+        let Some(mutation_id) = self.begin_playlist_mutation(&playlist_id) else {
+            return;
+        };
+        if let Some(page) = self.playlist_pages.get_mut(&playlist_id) {
+            page.items.items.retain(|item| {
+                item.playable()
+                    .is_none_or(|playable| !uris.iter().any(|uri| uri == playable.uri()))
+            });
+        }
+        self.backend.api(ApiRequest::RemoveFromPlaylist {
+            mutation_id,
+            playlist_id,
+            uris,
+            snapshot_id,
+        });
+    }
+
+    fn move_in_playlist(&mut self, movement: PlaylistMove) {
+        if !self.playlist_move_is_current(&movement) {
+            return;
+        }
+        let playlist_id = movement.playlist_id().to_owned();
+        let from = movement.from();
+        let to = movement.insert_before();
+        let snapshot_id = Some(movement.snapshot_id().to_owned());
+        let Some(mutation_id) = self.begin_playlist_mutation(&playlist_id) else {
+            return;
+        };
+        if let Some(page) = self.playlist_pages.get_mut(&playlist_id) {
+            let items = &mut page.items.items;
+            let item = items.remove(from as usize);
+            let insert_at = if to > from { to - 1 } else { to } as usize;
+            items.insert(insert_at.min(items.len()), item);
+        }
+        self.backend.api(ApiRequest::ReorderPlaylist {
+            mutation_id,
+            playlist_id,
+            range_start: from,
+            insert_before: to,
+            snapshot_id,
+        });
+    }
+
     fn invalidate_drag_scope(&mut self) {
         self.drag_scope = self.drag_scope.next();
     }
 
-    fn clear_stale_drag_payload(&self, ctx: &egui::Context) {
+    fn clear_stale_drag_payload(&self, ctx: &egui::Context, clear_released: bool) {
         let stale_track = egui::DragAndDrop::payload::<TrackPayload>(ctx)
             .is_some_and(|payload| !payload.belongs_to(self.drag_scope));
         let stale_context = egui::DragAndDrop::payload::<ContextPayload>(ctx)
             .is_some_and(|payload| !payload.belongs_to(self.drag_scope));
-        if stale_track || stale_context {
+        let cancelled = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::WindowFocused(false)
+                        | egui::Event::PointerGone
+                        | egui::Event::Touch {
+                            phase: egui::TouchPhase::Cancel,
+                            ..
+                        }
+                )
+            }) || clear_released && input.pointer.any_released()
+        });
+        if stale_track || stale_context || cancelled {
             egui::DragAndDrop::clear_payload(ctx);
         }
     }
@@ -3223,6 +3440,7 @@ impl App {
             page.items.loaded_once = true;
             page.items.error = None;
             page.cache_complete = true;
+            page.revise();
         }
         self.request_contains(uris);
         self.request_user_names(adders);
@@ -3770,63 +3988,11 @@ impl App {
                 let saved = self.saved.get(&uri).copied().unwrap_or(false);
                 self.set_saved(uri, !saved);
             }
-            Action::AddToPlaylist {
-                playlist_id,
-                playlist_name,
-                uris,
-            } => {
-                self.playlist_busy = true;
-                self.backend.api(ApiRequest::AddToPlaylist {
-                    playlist_id,
-                    playlist_name,
-                    uris,
-                });
-            }
+            Action::AddToPlaylist { playlist_id, uris } => self.add_to_playlist(playlist_id, uris),
             Action::RemoveFromPlaylist { playlist_id, uris } => {
-                let snapshot_id = self
-                    .playlist_pages
-                    .get(&playlist_id)
-                    .and_then(|page| page.playlist.get())
-                    .and_then(|playlist| playlist.snapshot_id.clone());
-                if let Some(page) = self.playlist_pages.get_mut(&playlist_id) {
-                    page.items.items.retain(|item| {
-                        item.playable()
-                            .is_none_or(|playable| !uris.iter().any(|uri| uri == playable.uri()))
-                    });
-                }
-                self.playlist_busy = true;
-                self.backend.api(ApiRequest::RemoveFromPlaylist {
-                    playlist_id,
-                    uris,
-                    snapshot_id,
-                });
+                self.remove_from_playlist(playlist_id, uris)
             }
-            Action::MoveInPlaylist {
-                playlist_id,
-                from,
-                to,
-            } => {
-                let snapshot_id = self
-                    .playlist_pages
-                    .get(&playlist_id)
-                    .and_then(|page| page.playlist.get())
-                    .and_then(|playlist| playlist.snapshot_id.clone());
-                if let Some(page) = self.playlist_pages.get_mut(&playlist_id) {
-                    let items = &mut page.items.items;
-                    if (from as usize) < items.len() && (to as usize) <= items.len() {
-                        let item = items.remove(from as usize);
-                        let insert_at = if to > from { to - 1 } else { to } as usize;
-                        items.insert(insert_at.min(items.len()), item);
-                    }
-                }
-                self.playlist_busy = true;
-                self.backend.api(ApiRequest::ReorderPlaylist {
-                    playlist_id,
-                    range_start: from,
-                    insert_before: to,
-                    snapshot_id,
-                });
-            }
+            Action::MoveInPlaylist(movement) => self.move_in_playlist(movement),
             Action::ShowDialog(dialog) => self.dialog = Some(dialog),
             Action::CloseDialog => self.dialog = None,
             Action::CreatePlaylist {
@@ -4091,7 +4257,10 @@ impl App {
             .map(|playlists| {
                 playlists
                     .iter()
-                    .filter(|playlist| playlist.owned_by(user_id) || playlist.collaborative)
+                    .filter(|playlist| {
+                        (playlist.owned_by(user_id) || playlist.collaborative)
+                            && valid_playlist_identity(&playlist.uri, &playlist.id)
+                    })
                     .map(|playlist| (playlist.id.clone(), playlist.name.clone()))
                     .collect()
             })
@@ -4111,19 +4280,19 @@ impl App {
         self.handle_tray();
         self.tick(ctx);
         self.apply_actions(ctx);
-        self.clear_stale_drag_payload(ctx);
+        self.clear_stale_drag_payload(ctx, true);
         self.sync_media_controls();
     }
 
     pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        self.clear_stale_drag_payload(ctx);
+        self.clear_stale_drag_payload(ctx, false);
         self.apply_theme(ctx);
         self.lock_scroll_axis(ctx);
         crate::ui::show(self, ui);
         self.apply_actions(ctx);
-        self.clear_stale_drag_payload(ctx);
+        self.clear_stale_drag_payload(ctx, true);
         self.sync_media_controls();
 
         let mut geometry_dirty = false;
@@ -4564,6 +4733,95 @@ mod tests {
         HeadlessApp { app, root }
     }
 
+    fn loaded_playlist_page(playlist: Playlist) -> PlaylistPage {
+        let mut page = PlaylistPage {
+            playlist: Loadable::Loaded(playlist),
+            ..PlaylistPage::default()
+        };
+        page.items.items = (0..4)
+            .map(|index| crate::api::models::PlaylistItem {
+                item: Some(PlayableItem::Track(Track {
+                    id: Some(format!("track-{index}")),
+                    name: format!("Track {index}"),
+                    uri: format!("spotify:track:track-{index}"),
+                    ..Track::default()
+                })),
+                ..crate::api::models::PlaylistItem::default()
+            })
+            .collect();
+        page.items.total = Some(page.items.items.len() as u32);
+        page.items.next_offset = None;
+        page.items.loaded_once = true;
+        page
+    }
+
+    fn playlist_app() -> HeadlessApp {
+        let mut app = headless_app();
+        app.user = Some(User {
+            id: "me".into(),
+            ..User::default()
+        });
+        let playlist = Playlist {
+            id: "mix".into(),
+            name: "Mix".into(),
+            uri: "spotify:playlist:mix".into(),
+            owner: crate::api::models::Owner {
+                id: Some("me".into()),
+                ..crate::api::models::Owner::default()
+            },
+            snapshot_id: Some("snap-a".into()),
+            ..Playlist::default()
+        };
+        app.library.playlists = Loadable::Loaded(vec![playlist.clone()]);
+        let page = loaded_playlist_page(playlist);
+        app.playlist_pages.insert("mix".into(), page);
+        app
+    }
+
+    fn playlist_movement(app: &App, from: usize, insert_before: usize) -> PlaylistMove {
+        let uri = app.playlist_pages["mix"].items.items[from]
+            .playable()
+            .expect("playlist row")
+            .uri()
+            .to_owned();
+        let origin = app
+            .playlist_origin("mix", from, &uri)
+            .expect("complete playlist origin");
+        let payload = TrackPayload::new(uri, "Held".into(), None, Some(origin), app.drag_scope())
+            .expect("track payload");
+        crate::drag::playlist_move(&payload, app.drag_scope(), "mix", insert_before)
+            .expect("non-edge movement")
+    }
+
+    fn assert_stale_playlist_move_rejected(label: &str, mutate: impl FnOnce(&mut PlaylistPage)) {
+        let mut app = playlist_app();
+        let ctx = egui::Context::default();
+        let movement = playlist_movement(&app, 2, 0);
+        mutate(app.playlist_pages.get_mut("mix").expect("playlist page"));
+        let before: Vec<_> = app.playlist_pages["mix"]
+            .items
+            .items
+            .iter()
+            .filter_map(|item| item.playable().map(|item| item.uri().to_owned()))
+            .collect();
+        app.actions.push(Action::MoveInPlaylist(movement));
+        app.apply_actions(&ctx);
+        assert!(
+            !app.backend
+                .take_api_requests()
+                .iter()
+                .any(|request| matches!(request, ApiRequest::ReorderPlaylist { .. })),
+            "accepted stale {label} movement"
+        );
+        let after: Vec<_> = app.playlist_pages["mix"]
+            .items
+            .items
+            .iter()
+            .filter_map(|item| item.playable().map(|item| item.uri().to_owned()))
+            .collect();
+        assert_eq!(after, before, "optimistically changed stale {label} list");
+    }
+
     fn egui_pass(ctx: &egui::Context, run_ui: impl FnMut(&mut egui::Ui)) {
         let mut output = ctx.run_ui(Default::default(), run_ui);
         output.textures_delta.clear();
@@ -4586,11 +4844,11 @@ mod tests {
         let ctx = egui::Context::default();
 
         egui::DragAndDrop::set_payload(&ctx, drag_track(&app));
-        app.clear_stale_drag_payload(&ctx);
+        app.clear_stale_drag_payload(&ctx, false);
         assert!(egui::DragAndDrop::has_payload_of_type::<TrackPayload>(&ctx));
 
         app.open(Page::Search);
-        app.clear_stale_drag_payload(&ctx);
+        app.clear_stale_drag_payload(&ctx, false);
         assert!(!egui::DragAndDrop::has_any_payload(&ctx));
 
         let context = ContextPayload::new(
@@ -4602,7 +4860,7 @@ mod tests {
         .expect("valid drag context");
         egui::DragAndDrop::set_payload(&ctx, context);
         app.reset_data();
-        app.clear_stale_drag_payload(&ctx);
+        app.clear_stale_drag_payload(&ctx, false);
         assert!(!egui::DragAndDrop::has_any_payload(&ctx));
     }
 
@@ -4613,8 +4871,181 @@ mod tests {
         egui::DragAndDrop::set_payload(&ctx, drag_track(&app));
         app.actions.push(Action::ConfigurePersonalWebApp);
         app.apply_actions(&ctx);
-        app.clear_stale_drag_payload(&ctx);
+        app.clear_stale_drag_payload(&ctx, false);
         assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+    }
+
+    #[test]
+    fn playlist_move_revalidates_every_captured_authority_dimension() {
+        assert_stale_playlist_move_rejected("snapshot", |page| {
+            page.playlist
+                .get_mut()
+                .expect("playlist metadata")
+                .snapshot_id = Some("snap-b".into());
+        });
+        assert_stale_playlist_move_rejected("revision", PlaylistPage::revise);
+        assert_stale_playlist_move_rejected("completeness", |page| {
+            page.items.next_offset = Some(page.items.items.len() as u32);
+        });
+        assert_stale_playlist_move_rejected("extent", |page| {
+            page.items.items.pop();
+        });
+        assert_stale_playlist_move_rejected("source occurrence", |page| {
+            let source = page.items.items[2]
+                .playable()
+                .expect("source row")
+                .uri()
+                .to_owned();
+            let Some(PlayableItem::Track(track)) = &mut page.items.items[0].item else {
+                panic!("track row");
+            };
+            track.uri = source;
+        });
+        assert_stale_playlist_move_rejected("source row", |page| {
+            let Some(PlayableItem::Track(track)) = &mut page.items.items[2].item else {
+                panic!("track row");
+            };
+            track.uri = "spotify:track:replacement".into();
+        });
+        assert_stale_playlist_move_rejected("local mutation generation", |page| {
+            page.begin_mutation();
+        });
+    }
+
+    #[test]
+    fn playlist_mutation_gate_and_ids_ignore_stale_cache_completions() {
+        let mut app = playlist_app();
+        let ctx = egui::Context::default();
+        let add = || Action::AddToPlaylist {
+            playlist_id: "mix".into(),
+            uris: vec!["spotify:track:new".into()],
+        };
+        app.actions.extend([add(), add()]);
+        app.apply_actions(&ctx);
+        let requests = app.backend.take_api_requests();
+        let [
+            ApiRequest::AddToPlaylist {
+                mutation_id: old_id,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("one playlist request must win the UI gate: {requests:?}");
+        };
+        assert_eq!(app.pending_playlist_mutations.get("mix"), Some(old_id));
+
+        // A Web API generation replacement retires the UI owner immediately;
+        // the backend still holds the old wire lane until its bounded request
+        // actually ends.
+        let playlist = app.library.playlists.get().expect("playlist library")[0].clone();
+        app.retire_playlist_mutations_for_route_change();
+        assert!(!app.playlist_pages.contains_key("mix"));
+        app.library.playlists = Loadable::Loaded(vec![playlist.clone()]);
+        app.playlist_pages
+            .insert("mix".into(), loaded_playlist_page(playlist));
+        app.backend.take_api_requests();
+        app.actions.push(add());
+        app.apply_actions(&ctx);
+        let requests = app.backend.take_api_requests();
+        let [
+            ApiRequest::AddToPlaylist {
+                mutation_id: successor_id,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("successor mutation request: {requests:?}");
+        };
+        assert_ne!(old_id, successor_id);
+        app.playlist_pages
+            .get_mut("mix")
+            .expect("playlist page")
+            .playlist
+            .get_mut()
+            .expect("playlist metadata")
+            .snapshot_id = Some("successor-snapshot".into());
+        let held_items = app.playlist_pages["mix"].items.items.clone();
+
+        app.handle_api(ApiResponse::PlaylistItemsChanged {
+            mutation_id: *old_id,
+            id: "mix".into(),
+            message: "stale".into(),
+            result: Ok(Some("stale-snapshot".into())),
+        });
+        assert_eq!(
+            app.pending_playlist_mutations.get("mix"),
+            Some(successor_id)
+        );
+        assert_eq!(
+            app.playlist_pages["mix"]
+                .playlist
+                .get()
+                .and_then(|playlist| playlist.snapshot_id.as_deref()),
+            Some("successor-snapshot")
+        );
+        assert_eq!(app.playlist_pages["mix"].items.items, held_items);
+        assert!(app.backend.take_api_requests().is_empty());
+
+        app.handle_api(ApiResponse::PlaylistItemsChanged {
+            mutation_id: *successor_id,
+            id: "mix".into(),
+            message: String::new(),
+            result: Err(crate::api::ApiError::Status {
+                status: 409,
+                message: "conflict".into(),
+            }),
+        });
+        assert!(!app.pending_playlist_mutations.contains_key("mix"));
+        assert!(app.playlist_pages["mix"].items.items.is_empty());
+    }
+
+    #[test]
+    fn reload_retires_drag_but_keeps_the_wire_mutation_gate() {
+        let mut app = playlist_app();
+        let ctx = egui::Context::default();
+        app.actions.push(Action::AddToPlaylist {
+            playlist_id: "mix".into(),
+            uris: vec!["spotify:track:new".into()],
+        });
+        app.apply_actions(&ctx);
+        let requests = app.backend.take_api_requests();
+        let [ApiRequest::AddToPlaylist { mutation_id, .. }] = requests.as_slice() else {
+            panic!("playlist request");
+        };
+        let mutation_id = *mutation_id;
+        egui::DragAndDrop::set_payload(&ctx, drag_track(&app));
+
+        app.reload(Page::Playlist("mix".into()));
+        app.clear_stale_drag_payload(&ctx, false);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+        assert_eq!(
+            app.pending_playlist_mutations.get("mix"),
+            Some(&mutation_id)
+        );
+        app.handle_api(ApiResponse::PlaylistItemsChanged {
+            mutation_id,
+            id: "mix".into(),
+            message: String::new(),
+            result: Ok(Some("snap-b".into())),
+        });
+        assert!(!app.pending_playlist_mutations.contains_key("mix"));
+    }
+
+    #[test]
+    fn signout_retires_playlist_mutation_ownership_and_optimism() {
+        let mut app = playlist_app();
+        let ctx = egui::Context::default();
+        app.actions.push(Action::RemoveFromPlaylist {
+            playlist_id: "mix".into(),
+            uris: vec!["spotify:track:track-1".into()],
+        });
+        app.apply_actions(&ctx);
+        assert!(app.pending_playlist_mutations.contains_key("mix"));
+        assert_eq!(app.playlist_pages["mix"].items.items.len(), 3);
+
+        app.handle_auth(AuthStatus::SignedOut);
+        assert!(app.pending_playlist_mutations.is_empty());
+        assert!(app.playlist_pages.is_empty());
     }
 
     fn snapshot_at(percent: u8) -> LocalState {

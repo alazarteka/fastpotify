@@ -350,7 +350,7 @@ fn track_list(
             app,
             TrackRow {
                 index,
-                playlist_index: None,
+                playlist_origin: None,
                 number: None,
                 item,
                 context: &context,

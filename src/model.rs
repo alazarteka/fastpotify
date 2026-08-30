@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::api::models::*;
+use crate::drag::PlaylistMove;
 
 /// Every screen the central panel can show.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -311,6 +312,27 @@ pub struct PlaylistPage {
     pub cache_complete: bool,
     /// Items read from disk, waiting for the live snapshot to confirm.
     pub pending_cache: Option<(String, Vec<PlaylistItem>)>,
+    /// Monotonic identity of the metadata/list currently rendered.
+    pub revision: u64,
+    /// Monotonic identity of local mutations accepted for this loaded page.
+    pub mutation_generation: u64,
+}
+
+impl PlaylistPage {
+    pub fn revise(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("playlist page revision exhausted");
+    }
+
+    pub fn begin_mutation(&mut self) {
+        self.mutation_generation = self
+            .mutation_generation
+            .checked_add(1)
+            .expect("playlist mutation generation exhausted");
+        self.revise();
+    }
 }
 
 #[derive(Default)]
@@ -488,18 +510,13 @@ pub enum Action {
     ToggleSaved(String),
     AddToPlaylist {
         playlist_id: String,
-        playlist_name: String,
         uris: Vec<String>,
     },
     RemoveFromPlaylist {
         playlist_id: String,
         uris: Vec<String>,
     },
-    MoveInPlaylist {
-        playlist_id: String,
-        from: u32,
-        to: u32,
-    },
+    MoveInPlaylist(PlaylistMove),
     ShowDialog(Dialog),
     CloseDialog,
     CreatePlaylist {

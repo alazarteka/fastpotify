@@ -7,7 +7,7 @@ use egui::{
 
 use crate::api::models::*;
 use crate::app::App;
-use crate::drag::{ContextPayload, PlaylistOrigin, TrackPayload};
+use crate::drag::{ContextPayload, PlaylistMove, PlaylistOrigin, TrackPayload};
 use crate::model::{Action, Dialog, Page, RowContext};
 use crate::theme::{self, Icon, Palette};
 use crate::util;
@@ -255,7 +255,7 @@ pub fn item_menu(
     app: &mut App,
     item: &PlayableItem,
     context: Option<&RowContext>,
-    index: Option<usize>,
+    playlist_origin: Option<&PlaylistOrigin>,
 ) {
     let palette = app.palette;
     ui.set_min_width(220.0);
@@ -299,7 +299,6 @@ pub fn item_menu(
                         if menu_item(ui, &palette, Some(Icon::ListMusic), name) {
                             app.actions.push(Action::AddToPlaylist {
                                 playlist_id: id.clone(),
-                                playlist_name: name.clone(),
                                 uris: vec![uri.clone()],
                             });
                         }
@@ -314,20 +313,18 @@ pub fn item_menu(
         ..
     }) = context
     {
-        if let Some(index) = index {
-            if index > 0 && menu_item(ui, &palette, Some(Icon::ChevronUp), "Move up") {
-                app.actions.push(Action::MoveInPlaylist {
-                    playlist_id: playlist_id.clone(),
-                    from: index as u32,
-                    to: index as u32 - 1,
-                });
+        if let Some(origin) = playlist_origin {
+            let index = origin.source_index() as usize;
+            if index > 0
+                && menu_item(ui, &palette, Some(Icon::ChevronUp), "Move up")
+                && let Some(movement) = PlaylistMove::from_origin(origin.clone(), index - 1)
+            {
+                app.actions.push(Action::MoveInPlaylist(movement));
             }
-            if menu_item(ui, &palette, Some(Icon::ChevronDown), "Move down") {
-                app.actions.push(Action::MoveInPlaylist {
-                    playlist_id: playlist_id.clone(),
-                    from: index as u32,
-                    to: index as u32 + 2,
-                });
+            if menu_item(ui, &palette, Some(Icon::ChevronDown), "Move down")
+                && let Some(movement) = PlaylistMove::from_origin(origin.clone(), index + 2)
+            {
+                app.actions.push(Action::MoveInPlaylist(movement));
             }
         }
         if menu_item(ui, &palette, Some(Icon::Minus), "Remove from this playlist") {
@@ -463,7 +460,7 @@ pub struct TrackRow<'a> {
     /// Authoritative server position when this row can be reordered in its
     /// playlist. This is absent for transformed views and lists with
     /// unrenderable source entries.
-    pub playlist_index: Option<usize>,
+    pub playlist_origin: Option<PlaylistOrigin>,
     pub number: Option<usize>,
     pub item: &'a PlayableItem,
     pub context: &'a RowContext,
@@ -544,25 +541,17 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     ui.data_mut(|data| {
         data.insert_temp(egui::Id::new(("track-row-test-rect", row.item.uri())), rect);
     });
-    if row.item.is_track() && response.drag_started_by(egui::PointerButton::Primary) {
-        let origin = match row.context {
-            RowContext::Context {
-                uri,
-                editable_playlist: Some((id, _)),
-            } => row
-                .playlist_index
-                .and_then(|index| PlaylistOrigin::from_context(uri, id, index)),
-            _ => None,
-        };
-        if let Some(payload) = TrackPayload::new(
+    if row.item.is_track()
+        && response.drag_started_by(egui::PointerButton::Primary)
+        && let Some(payload) = TrackPayload::new(
             row.item.uri().to_owned(),
             row.item.name().to_owned(),
             row.item.image(64).map(str::to_owned),
-            origin,
+            row.playlist_origin.clone(),
             app.drag_scope(),
-        ) {
-            egui::DragAndDrop::set_payload(ui.ctx(), payload);
-        }
+        )
+    {
+        egui::DragAndDrop::set_payload(ui.ctx(), payload);
     }
     let now_playing = app.now_playing();
     let is_current = now_playing
@@ -834,7 +823,15 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
         egui::Popup::menu(&more)
             .id(menu_id)
             .frame(menu_frame(&palette))
-            .show(|ui| item_menu(ui, app, row.item, Some(row.context), row.playlist_index));
+            .show(|ui| {
+                item_menu(
+                    ui,
+                    app,
+                    row.item,
+                    Some(row.context),
+                    row.playlist_origin.as_ref(),
+                )
+            });
     }
 
     // Row interactions.
@@ -867,7 +864,15 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     }
     egui::Popup::context_menu(&response)
         .frame(menu_frame(&palette))
-        .show(|ui| item_menu(ui, app, row.item, Some(row.context), row.playlist_index));
+        .show(|ui| {
+            item_menu(
+                ui,
+                app,
+                row.item,
+                Some(row.context),
+                row.playlist_origin.as_ref(),
+            )
+        });
 }
 
 #[cfg(test)]

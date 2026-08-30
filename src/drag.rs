@@ -4,6 +4,8 @@
 //! payload cannot become an untyped API request or let a filtered view corrupt
 //! hidden ordering state.
 
+use std::collections::HashMap;
+
 use crate::util::{SpotifyUriKind, spotify_uri};
 
 /// Identity of the navigation/auth state in which a drag began.
@@ -16,31 +18,94 @@ impl Scope {
     }
 }
 
-/// An editable playlist row's authoritative server position.
+/// A complete playlist revision from which reorder origins may be captured.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlaylistOrigin {
+pub struct PlaylistAuthority {
     playlist_id: String,
-    index: u32,
+    snapshot_id: String,
+    loaded_extent: u32,
+    revision: u64,
+    mutation_generation: u64,
 }
 
-impl PlaylistOrigin {
-    /// Builds an origin only when the context URI and editable id describe
-    /// the same validated playlist.
-    pub fn from_context(context_uri: &str, editable_id: &str, index: usize) -> Option<Self> {
-        let context = spotify_uri(context_uri)?;
-        let index = u32::try_from(index).ok()?;
-        (context.kind() == SpotifyUriKind::Playlist && context.id() == editable_id).then(|| Self {
-            playlist_id: editable_id.to_owned(),
-            index,
+impl PlaylistAuthority {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        context_uri: &str,
+        playlist_id: &str,
+        snapshot_id: Option<&str>,
+        loaded_extent: usize,
+        total: Option<u32>,
+        complete: bool,
+        revision: u64,
+        mutation_generation: u64,
+    ) -> Option<Self> {
+        let snapshot_id = snapshot_id.filter(|snapshot| !snapshot.is_empty())?;
+        let loaded_extent = u32::try_from(loaded_extent).ok()?;
+        (valid_playlist_identity(context_uri, playlist_id)
+            && complete
+            && total == Some(loaded_extent))
+        .then(|| Self {
+            playlist_id: playlist_id.to_owned(),
+            snapshot_id: snapshot_id.to_owned(),
+            loaded_extent,
+            revision,
+            mutation_generation,
         })
-    }
-
-    pub const fn index(&self) -> u32 {
-        self.index
     }
 
     pub fn playlist_id(&self) -> &str {
         &self.playlist_id
+    }
+}
+
+/// An editable playlist row's authoritative server occurrence at drag start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistOrigin {
+    playlist_id: String,
+    snapshot_id: String,
+    source_uri: String,
+    source_index: u32,
+    source_occurrence: u32,
+    loaded_extent: u32,
+    revision: u64,
+    mutation_generation: u64,
+}
+
+impl PlaylistOrigin {
+    pub fn capture(
+        authority: &PlaylistAuthority,
+        source_uri: &str,
+        source_index: usize,
+        source_occurrence: usize,
+    ) -> Option<Self> {
+        if spotify_uri(source_uri)?.kind() != SpotifyUriKind::Track {
+            return None;
+        }
+        let source_index = u32::try_from(source_index).ok()?;
+        let source_occurrence = u32::try_from(source_occurrence).ok()?;
+        (source_index < authority.loaded_extent).then(|| Self {
+            playlist_id: authority.playlist_id.clone(),
+            snapshot_id: authority.snapshot_id.clone(),
+            source_uri: source_uri.to_owned(),
+            source_index,
+            source_occurrence,
+            loaded_extent: authority.loaded_extent,
+            revision: authority.revision,
+            mutation_generation: authority.mutation_generation,
+        })
+    }
+
+    pub const fn source_index(&self) -> u32 {
+        self.source_index
+    }
+
+    pub fn playlist_id(&self) -> &str {
+        &self.playlist_id
+    }
+
+    pub fn source_uri(&self) -> &str {
+        &self.source_uri
     }
 }
 
@@ -63,7 +128,11 @@ impl TrackPayload {
         origin: Option<PlaylistOrigin>,
         scope: Scope,
     ) -> Option<Self> {
-        (spotify_uri(&uri)?.kind() == SpotifyUriKind::Track).then_some(Self {
+        (spotify_uri(&uri)?.kind() == SpotifyUriKind::Track
+            && origin
+                .as_ref()
+                .is_none_or(|origin| origin.source_uri == uri))
+        .then_some(Self {
             uri,
             title,
             image,
@@ -137,10 +206,60 @@ impl ContextPayload {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaylistMove {
-    pub from: u32,
-    pub insert_before: u32,
+    origin: PlaylistOrigin,
+    insert_before: u32,
+}
+
+impl PlaylistMove {
+    pub fn from_origin(origin: PlaylistOrigin, insert_before: usize) -> Option<Self> {
+        let insert_before = u32::try_from(insert_before).ok()?;
+        (insert_before <= origin.loaded_extent
+            && insert_before != origin.source_index
+            && insert_before != origin.source_index.saturating_add(1))
+        .then_some(Self {
+            origin,
+            insert_before,
+        })
+    }
+
+    pub fn playlist_id(&self) -> &str {
+        self.origin.playlist_id()
+    }
+
+    pub const fn from(&self) -> u32 {
+        self.origin.source_index
+    }
+
+    pub const fn insert_before(&self) -> u32 {
+        self.insert_before
+    }
+
+    pub fn snapshot_id(&self) -> &str {
+        &self.origin.snapshot_id
+    }
+
+    pub fn source_uri(&self) -> &str {
+        self.origin.source_uri()
+    }
+
+    pub fn matches_current(
+        &self,
+        authority: &PlaylistAuthority,
+        source_uri: &str,
+        source_occurrence: usize,
+    ) -> bool {
+        PlaylistOrigin::capture(
+            authority,
+            source_uri,
+            self.origin.source_index as usize,
+            source_occurrence,
+        )
+        .as_ref()
+            == Some(&self.origin)
+            && self.insert_before <= authority.loaded_extent
+    }
 }
 
 /// Resolves an in-playlist drop to Spotify's insert-before coordinates.
@@ -158,12 +277,14 @@ pub fn playlist_move(
     if origin.playlist_id() != playlist_id {
         return None;
     }
-    let insert_before = u32::try_from(slot).ok()?;
-    (insert_before != origin.index() && insert_before != origin.index().saturating_add(1))
-        .then_some(PlaylistMove {
-            from: origin.index(),
-            insert_before,
-        })
+    PlaylistMove::from_origin(origin.clone(), slot)
+}
+
+/// A playlist row is a mutation target only when both API identifiers agree.
+pub fn valid_playlist_identity(uri: &str, playlist_id: &str) -> bool {
+    spotify_uri(uri).is_some_and(|parsed| {
+        parsed.kind() == SpotifyUriKind::Playlist && parsed.id() == playlist_id
+    })
 }
 
 /// Orders one complete playlist library for the sidebar. Pins always lead;
@@ -175,16 +296,26 @@ pub fn playlist_sidebar_indices(
     pinned: &[String],
     custom: &[String],
 ) -> Vec<usize> {
-    let rank = |values: &[String], uri: &str| values.iter().position(|held| held == uri);
+    fn first_ranks(values: &[String]) -> HashMap<&str, usize> {
+        let mut ranks = HashMap::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            ranks.entry(value.as_str()).or_insert(index);
+        }
+        ranks
+    }
+    let recent = first_ranks(recent);
+    let pinned = first_ranks(pinned);
+    let custom = first_ranks(custom);
+    let has_custom_order = !custom.is_empty();
     let mut indices: Vec<usize> = (0..uris.len()).collect();
     indices.sort_by_key(|index| {
         let uri = uris[*index];
-        if let Some(rank) = rank(pinned, uri) {
-            (0, rank, 0)
-        } else if custom.is_empty() {
-            (1, rank(recent, uri).unwrap_or(usize::MAX), *index)
-        } else if let Some(rank) = rank(custom, uri) {
-            (2, rank, 0)
+        if let Some(rank) = pinned.get(uri) {
+            (0, *rank, 0)
+        } else if !has_custom_order {
+            (1, recent.get(uri).copied().unwrap_or(usize::MAX), *index)
+        } else if let Some(rank) = custom.get(uri) {
+            (2, *rank, 0)
         } else {
             (1, *index, 0)
         }
@@ -345,18 +476,49 @@ mod tests {
 
     #[test]
     fn playlist_moves_require_current_matching_origin_and_skip_own_edges() {
+        let authority = PlaylistAuthority::new(
+            "spotify:playlist:p1",
+            "p1",
+            Some("snapshot"),
+            4,
+            Some(4),
+            true,
+            7,
+            3,
+        )
+        .expect("complete playlist authority");
         let origin =
-            PlaylistOrigin::from_context("spotify:playlist:p1", "p1", 2).expect("matching origin");
-        assert!(PlaylistOrigin::from_context("spotify:album:p1", "p1", 2).is_none());
-        assert!(PlaylistOrigin::from_context("spotify:playlist:p1", "p2", 2).is_none());
-        let payload = track(Some(origin));
-        assert_eq!(
-            playlist_move(&payload, scope(), "p1", 0),
-            Some(PlaylistMove {
-                from: 2,
-                insert_before: 0,
-            })
+            PlaylistOrigin::capture(&authority, "spotify:track:t1", 2, 0).expect("matching origin");
+        assert!(
+            PlaylistAuthority::new(
+                "spotify:album:p1",
+                "p1",
+                Some("snapshot"),
+                4,
+                Some(4),
+                true,
+                7,
+                3,
+            )
+            .is_none()
         );
+        assert!(
+            PlaylistAuthority::new(
+                "spotify:playlist:p1",
+                "p2",
+                Some("snapshot"),
+                4,
+                Some(4),
+                true,
+                7,
+                3,
+            )
+            .is_none()
+        );
+        let payload = track(Some(origin));
+        let movement = playlist_move(&payload, scope(), "p1", 0).expect("valid move");
+        assert_eq!(movement.from(), 2);
+        assert_eq!(movement.insert_before(), 0);
         assert_eq!(playlist_move(&payload, scope(), "p1", 2), None);
         assert_eq!(playlist_move(&payload, scope(), "p1", 3), None);
         assert_eq!(playlist_move(&payload, scope(), "p2", 0), None);
@@ -413,6 +575,64 @@ mod tests {
             playlist_sidebar_indices(&uris, &recent, &pinned, &custom),
             vec![1, 3, 0, 2]
         );
+    }
+
+    #[test]
+    fn playlist_target_identity_is_strict() {
+        assert!(valid_playlist_identity("spotify:playlist:mix", "mix"));
+        for (uri, id) in [
+            ("", "mix"),
+            ("spotify:playlist:", "mix"),
+            ("spotify:album:mix", "mix"),
+            ("spotify:playlist:other", "mix"),
+            ("spotify:playlist:mix:extra", "mix"),
+            ("spotify:playlist:mix", ""),
+        ] {
+            assert!(!valid_playlist_identity(uri, id), "accepted {uri:?}/{id:?}");
+        }
+    }
+
+    #[test]
+    fn playlist_authority_requires_a_complete_exact_snapshot() {
+        let authority = |snapshot, extent, total, complete| {
+            PlaylistAuthority::new(
+                "spotify:playlist:mix",
+                "mix",
+                snapshot,
+                extent,
+                total,
+                complete,
+                4,
+                2,
+            )
+        };
+        assert!(authority(Some("snap"), 3, Some(3), true).is_some());
+        assert!(authority(None, 3, Some(3), true).is_none());
+        assert!(authority(Some(""), 3, Some(3), true).is_none());
+        assert!(authority(Some("snap"), 2, Some(3), true).is_none());
+        assert!(authority(Some("snap"), 3, Some(3), false).is_none());
+    }
+
+    #[test]
+    fn sidebar_ranking_scales_by_precomputed_first_occurrences() {
+        let uris: Vec<String> = (0..4_000).map(|index| format!("p{index}")).collect();
+        let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+        let recent = vec!["p3000".into(), "p3000".into(), "deleted".into()];
+        let pinned = vec!["p3999".into(), "p3999".into(), "missing".into()];
+        let custom = vec![
+            "unknown".into(),
+            "p2000".into(),
+            "p2000".into(),
+            "p1000".into(),
+        ];
+        let ranked = playlist_sidebar_indices(&refs, &recent, &pinned, &custom);
+        let mut expected = vec![3999];
+        expected.extend((0..4_000).filter(|index| !matches!(index, 1000 | 2000 | 3999)));
+        expected.extend([2000, 1000]);
+        assert_eq!(ranked, expected);
+
+        let without_custom = playlist_sidebar_indices(&refs, &recent, &pinned, &[]);
+        assert_eq!(&without_custom[..3], &[3999, 3000, 0]);
     }
 
     #[test]
