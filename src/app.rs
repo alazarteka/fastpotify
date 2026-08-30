@@ -178,6 +178,12 @@ pub enum Target {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackOwner {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShuffleDispatch {
     Deferred,
     Local,
@@ -607,22 +613,30 @@ impl App {
             .filter(|remote| remote.received_at.elapsed() < REMOTE_FRESH)
     }
 
+    fn playback_owner(&self, device_id: Option<&str>) -> PlaybackOwner {
+        if device_id.is_some() && device_id == self.local_device_id.as_deref() {
+            PlaybackOwner::Local
+        } else {
+            PlaybackOwner::Remote
+        }
+    }
+
     /// Where playback commands go: this computer's player or a remote device.
     pub fn target(&self) -> Target {
         if self.local_ready && self.local.is_active() {
             return Target::Local;
         }
         if let Some(selected) = &self.selected_device
-            && Some(selected.as_str()) != self.local_device_id.as_deref()
+            && self.playback_owner(Some(selected)) == PlaybackOwner::Remote
         {
             return Target::Remote(Some(selected.clone()));
         }
         if let Some(remote) = self.remote_fresh() {
             let device = remote.state.device.as_ref();
-            let is_local = device
-                .and_then(|device| device.id.as_deref())
-                .is_some_and(|id| Some(id) == self.local_device_id.as_deref());
-            if !is_local && (remote.state.is_playing || remote.state.item.is_some()) {
+            let owner = self.playback_owner(device.and_then(|device| device.id.as_deref()));
+            if owner == PlaybackOwner::Remote
+                && (remote.state.is_playing || remote.state.item.is_some())
+            {
                 return Target::Remote(device.and_then(|device| device.id.clone()));
             }
         }
@@ -1036,7 +1050,7 @@ impl App {
         self.reconcile_authoritative_shuffle(
             state.connected && state.is_active(),
             state.shuffle,
-            true,
+            PlaybackOwner::Local,
         );
         if state.playback != self.local.playback {
             self.optimistic_playing = None;
@@ -1925,13 +1939,19 @@ impl App {
                             state,
                             received_at: observed_at,
                         });
-                        if let Some((active, shuffle)) = self.remote.as_ref().map(|remote| {
+                        if let Some((active, shuffle, owner)) = self.remote.as_ref().map(|remote| {
+                            let device_id = remote
+                                .state
+                                .device
+                                .as_ref()
+                                .and_then(|device| device.id.as_deref());
                             (
                                 remote.state.is_playing || remote.state.item.is_some(),
                                 remote.state.shuffle_state,
+                                self.playback_owner(device_id),
                             )
                         }) {
-                            self.reconcile_authoritative_shuffle(active, shuffle, false);
+                            self.reconcile_authoritative_shuffle(active, shuffle, owner);
                         }
                         if let Some(context) = self
                             .remote
@@ -2941,6 +2961,23 @@ impl App {
             self.pending_local_shuffle = None;
             self.play_request(request, false);
         } else if let Some(shuffle) = self.pending_local_shuffle.take() {
+            if self.target() != Target::Local {
+                let remote = self.remote.as_ref().and_then(|remote| {
+                    let device_id = remote
+                        .state
+                        .device
+                        .as_ref()
+                        .and_then(|device| device.id.as_deref());
+                    (self.playback_owner(device_id) == PlaybackOwner::Remote).then_some((
+                        remote.state.is_playing || remote.state.item.is_some(),
+                        remote.state.shuffle_state,
+                    ))
+                });
+                if let Some((active, shuffle)) = remote {
+                    self.reconcile_authoritative_shuffle(active, shuffle, PlaybackOwner::Remote);
+                }
+                return;
+            }
             self.local.shuffle = shuffle;
             self.shuffle_set_at = Some(Instant::now());
             self.backend.player(PlayerCommand::Shuffle(shuffle));
@@ -3148,12 +3185,26 @@ impl App {
         }
     }
 
-    fn reconcile_authoritative_shuffle(&mut self, active: bool, shuffle: bool, local: bool) {
-        if active
-            && !(local && self.pending_local_shuffle.is_some())
-            && self
-                .shuffle_set_at
-                .is_none_or(|at| at.elapsed() >= SHUFFLE_INTENT_HOLD)
+    fn reconcile_authoritative_shuffle(
+        &mut self,
+        active: bool,
+        shuffle: bool,
+        owner: PlaybackOwner,
+    ) {
+        if !active {
+            return;
+        }
+        if owner == PlaybackOwner::Local
+            && let Some(pending) = self.pending_local_shuffle
+        {
+            if pending == shuffle {
+                self.adopt_external_shuffle(shuffle);
+            }
+            return;
+        }
+        if self
+            .shuffle_set_at
+            .is_none_or(|at| at.elapsed() >= SHUFFLE_INTENT_HOLD)
         {
             self.adopt_external_shuffle(shuffle);
         }
@@ -3225,7 +3276,7 @@ impl App {
     }
 
     fn transfer(&mut self, device_id: String) {
-        if Some(device_id.as_str()) == self.local_device_id.as_deref() {
+        if self.playback_owner(Some(&device_id)) == PlaybackOwner::Local {
             self.selected_device = None;
             self.show_devices = false;
             let was_playing = self.now_playing().is_some_and(|now| now.playing);
@@ -4238,6 +4289,16 @@ mod tests {
         }
     }
 
+    fn active_api_snapshot_on(shuffle: bool, device_id: &str) -> PlaybackState {
+        let mut state = active_remote_snapshot(shuffle);
+        state.device = Some(Device {
+            id: Some(device_id.into()),
+            is_active: true,
+            ..Device::default()
+        });
+        state
+    }
+
     fn deliver_remote_state(app: &mut App, state: Option<PlaybackState>) {
         app.remote_poll_seq += 1;
         app.handle_api(ApiResponse::PlaybackState {
@@ -4828,6 +4889,21 @@ mod tests {
         app
     }
 
+    fn reconnecting_with_pending_shuffle(before: bool, after: bool) -> HeadlessApp {
+        let mut app = headless_app();
+        app.shuffle_wanted = before;
+        app.local.shuffle = before;
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+        });
+        app.handle_playback(LocalPlayback::Connecting);
+        assert_eq!(app.local_device_id.as_deref(), Some("local"));
+        assert_eq!(app.set_shuffle(after), ShuffleDispatch::Deferred);
+        assert_eq!(app.pending_local_shuffle, Some(after));
+        assert!(app.queued_play.is_none());
+        app
+    }
+
     #[test]
     fn queued_local_shuffle_toggles_defer_both_directions_without_remote_action() {
         for (before, after) in [(false, true), (true, false)] {
@@ -4851,19 +4927,16 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_only_intent_dispatches_once_for_both_local_readiness_orders() {
+    fn aged_same_local_api_mismatch_waits_for_both_local_readiness_orders() {
         for (before, after) in [(false, true), (true, false)] {
             for ready_first in [false, true] {
-                let mut app = headless_app();
-                app.shuffle_wanted = before;
-                app.local.shuffle = before;
-                app.handle_playback(LocalPlayback::Connecting);
-                assert!(app.queued_play.is_none());
-
-                assert_eq!(app.set_shuffle(after), ShuffleDispatch::Deferred);
-                assert_eq!(app.pending_local_shuffle, Some(after));
-                assert_eq!(app.local.shuffle, before);
+                let mut app = reconnecting_with_pending_shuffle(before, after);
                 app.shuffle_set_at = Some(Instant::now() - SHUFFLE_INTENT_HOLD);
+                deliver_remote_snapshot(&mut app, active_api_snapshot_on(before, "local"));
+                assert_eq!(app.target(), Target::Remote(None));
+                assert_eq!(app.pending_local_shuffle, Some(after));
+                assert_eq!(app.shuffle_wanted, after);
+                assert_eq!(app.local.shuffle, before);
 
                 let connected = active_local_snapshot(&app, before, Playback::Paused);
                 if ready_first {
@@ -4893,6 +4966,40 @@ mod tests {
                     "repeated readiness events must not dispatch twice"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn matching_same_local_api_snapshot_satisfies_pending_shuffle_without_dispatch() {
+        for ready_first in [false, true] {
+            let mut app = reconnecting_with_pending_shuffle(false, true);
+            app.shuffle_set_at = Some(Instant::now() - SHUFFLE_INTENT_HOLD);
+
+            deliver_remote_snapshot(&mut app, active_api_snapshot_on(true, "local"));
+
+            assert_eq!(app.target(), Target::Remote(None));
+            assert_eq!(app.pending_local_shuffle, None);
+            assert!(app.shuffle_wanted);
+            assert_eq!(app.shuffle_set_at, None);
+            let connected = active_local_snapshot(&app, true, Playback::Paused);
+            if ready_first {
+                app.handle_playback(LocalPlayback::Ready {
+                    device_id: "local".into(),
+                });
+                app.handle_local(connected);
+            } else {
+                app.handle_local(connected);
+                app.handle_playback(LocalPlayback::Ready {
+                    device_id: "local".into(),
+                });
+            }
+
+            assert_eq!(app.pending_local_shuffle, None);
+            assert!(app.local.shuffle);
+            assert_eq!(
+                app.shuffle_set_at, None,
+                "an acknowledged mode must not emit another local command"
+            );
         }
     }
 
@@ -4929,24 +5036,51 @@ mod tests {
     }
 
     #[test]
-    fn remote_target_change_clears_stale_pending_local_shuffle() {
-        let mut app = headless_app();
-        app.handle_playback(LocalPlayback::Connecting);
-        assert_eq!(app.set_shuffle(true), ShuffleDispatch::Deferred);
-        assert_eq!(app.pending_local_shuffle, Some(true));
-        app.selected_device = Some("remote".into());
+    fn distinct_remote_takeover_cancels_pending_local_shuffle_before_dispatch() {
+        for ready_first in [false, true] {
+            let mut app = reconnecting_with_pending_shuffle(false, true);
+            deliver_remote_snapshot(&mut app, active_api_snapshot_on(false, "remote"));
+            assert_eq!(app.target(), Target::Remote(Some("remote".into())));
+            assert_eq!(app.pending_local_shuffle, Some(true));
+            app.shuffle_set_at = Some(Instant::now() - SHUFFLE_INTENT_HOLD);
+            let connected = connected_snapshot(&app);
 
-        assert_eq!(app.set_shuffle(false), ShuffleDispatch::Remote);
+            if ready_first {
+                app.handle_playback(LocalPlayback::Ready {
+                    device_id: "local".into(),
+                });
+                app.handle_local(connected);
+            } else {
+                app.handle_local(connected);
+                app.handle_playback(LocalPlayback::Ready {
+                    device_id: "local".into(),
+                });
+            }
+
+            assert_eq!(app.pending_local_shuffle, None);
+            assert!(!app.local.shuffle, "no stale local command was dispatched");
+            assert!(
+                !app.shuffle_wanted,
+                "the active remote remains authoritative once the hold expires"
+            );
+            assert_eq!(app.shuffle_set_at, None);
+        }
+    }
+
+    #[test]
+    fn lifecycle_failure_and_sign_out_clear_pending_local_shuffle() {
+        for status in [
+            LocalPlayback::Unavailable,
+            LocalPlayback::Failed("engine stopped".into()),
+        ] {
+            let mut app = reconnecting_with_pending_shuffle(false, true);
+            app.handle_playback(status);
+            assert_eq!(app.pending_local_shuffle, None);
+        }
+
+        let mut app = reconnecting_with_pending_shuffle(false, true);
+        app.handle_auth(AuthStatus::SignedOut);
         assert_eq!(app.pending_local_shuffle, None);
-        let remote_dispatch_at = app.shuffle_set_at;
-        app.handle_playback(LocalPlayback::Ready {
-            device_id: "local".into(),
-        });
-        let connected = active_local_snapshot(&app, false, Playback::Paused);
-        app.handle_local(connected);
-
-        assert!(!app.local.shuffle);
-        assert_eq!(app.shuffle_set_at, remote_dispatch_at);
     }
 
     fn connected_snapshot(app: &App) -> LocalState {
