@@ -26,6 +26,9 @@ jobs:
       tag_name: ${{ steps.release-ref.outputs.tag_name }}
       tag_object: ${{ steps.release-ref.outputs.tag_object }}
       version: ${{ steps.release-ref.outputs.version }}
+      numeric_version: ${{ steps.release-ref.outputs.numeric_version }}
+      prerelease: ${{ steps.release-ref.outputs.prerelease }}
+      make_latest: ${{ steps.release-ref.outputs.make_latest }}
     steps:
       - name: Checkout the complete tagged history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,6 +49,9 @@ jobs:
             exit 1
           fi
           bash supply-chain/verify-release-ref.sh
+
+      - name: Test release version contract
+        run: bash supply-chain/test-release-version.sh
 
       - name: Install locked Nix
         uses: cachix/install-nix-action@51f3067b56fe8ae331890c77d4e454f6d60615ff # v31.10.2
@@ -145,10 +151,11 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ needs.policy.outputs.version }}"
+          $numericVersion = "${{ needs.policy.outputs.numeric_version }}"
           $arch = "${{ matrix.target }}".Split("-")[0]
           $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
           if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          & $iscc "/DVersion=$version" "/DArch=$arch" `
+          & $iscc "/DVersion=$version" "/DNumericVersion=$numericVersion" "/DArch=$arch" `
             "/DBinary=$PWD\target\${{ matrix.target }}\release\fastpotify.exe" `
             "/DOutputDir=$PWD\dist" packaging\windows\fastpotify.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -503,6 +510,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.policy.outputs.tag_name }}
+          RELEASE_PRERELEASE: ${{ needs.policy.outputs.prerelease }}
+          RELEASE_MAKE_LATEST: ${{ needs.policy.outputs.make_latest }}
           SOURCE_COMMIT: ${{ needs.policy.outputs.source_commit }}
         run: |
           set -euo pipefail
@@ -537,16 +546,23 @@ jobs:
             fi
           done
 
+          case "$RELEASE_PRERELEASE:$RELEASE_MAKE_LATEST" in
+            false:true|true:false) ;;
+            *) echo "invalid derived release metadata" >&2; exit 1 ;;
+          esac
           payload="$(jq -cn \
             --arg tag "$RELEASE_TAG" \
             --arg commit "$SOURCE_COMMIT" \
-            '{tag_name:$tag,target_commitish:$commit,name:$tag,draft:true,prerelease:false,generate_release_notes:true}')"
+            --argjson prerelease "$RELEASE_PRERELEASE" \
+            --arg make_latest "$RELEASE_MAKE_LATEST" \
+            '{tag_name:$tag,target_commitish:$commit,name:$tag,draft:true,prerelease:$prerelease,make_latest:$make_latest,generate_release_notes:true}')"
           draft="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             --request POST "${api_headers[@]}" \
             --data "$payload" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases")"
           release_id="$(jq -er --arg tag "$RELEASE_TAG" \
-            'select(.draft == true and .tag_name == $tag) | .id | select(type == "number")' \
+            --argjson prerelease "$RELEASE_PRERELEASE" \
+            'select(.draft == true and .tag_name == $tag and .prerelease == $prerelease) | .id | select(type == "number")' \
             <<< "$draft")"
           upload_url="$(jq -er '.upload_url | select(type == "string") | sub("\\{.*$"; "")' \
             <<< "$draft")"
@@ -589,6 +605,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.draft.outputs.release_id }}
           RELEASE_TAG: ${{ needs.policy.outputs.tag_name }}
+          RELEASE_PRERELEASE: ${{ needs.policy.outputs.prerelease }}
+          RELEASE_MAKE_LATEST: ${{ needs.policy.outputs.make_latest }}
         run: |
           set -euo pipefail
           bash supply-chain/verify-release-ref.sh
@@ -601,8 +619,13 @@ jobs:
           draft="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             "${api_headers[@]}" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")"
+          case "$RELEASE_PRERELEASE:$RELEASE_MAKE_LATEST" in
+            false:true|true:false) ;;
+            *) echo "invalid derived release metadata" >&2; exit 1 ;;
+          esac
           jq -e --arg tag "$RELEASE_TAG" --arg id "$RELEASE_ID" \
-            '.id == ($id | tonumber) and .tag_name == $tag and .draft == true and .immutable == false' \
+            --argjson prerelease "$RELEASE_PRERELEASE" \
+            '.id == ($id | tonumber) and .tag_name == $tag and .draft == true and .immutable == false and .prerelease == $prerelease' \
             <<< "$draft" >/dev/null
           assets="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             "${api_headers[@]}" \
@@ -612,9 +635,13 @@ jobs:
             <<< "$assets" | LC_ALL=C sort > "$RUNNER_TEMP/release-assets.final"
           diff -u "$RUNNER_TEMP/release-assets.expected" \
             "$RUNNER_TEMP/release-assets.final"
+          payload="$(jq -cn \
+            --argjson prerelease "$RELEASE_PRERELEASE" \
+            --arg make_latest "$RELEASE_MAKE_LATEST" \
+            '{draft:false,prerelease:$prerelease,make_latest:$make_latest}')"
           exec curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             --request PATCH "${api_headers[@]}" \
             --header 'Content-Type: application/json' \
-            --data '{"draft":false}' \
+            --data "$payload" \
             --output /dev/null \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"

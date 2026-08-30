@@ -276,6 +276,8 @@ pub struct App {
     pub auth: AuthStatus,
     pub user: Option<User>,
     pub local_device_id: Option<String>,
+    /// The ready librespot engine that may admit generation-bound work.
+    local_engine_generation: Option<u64>,
     /// Local playback is authorized and the engine is connected.
     pub local_ready: bool,
     pub local_playback: LocalPlayback,
@@ -386,9 +388,10 @@ pub struct App {
     scroll_last_event: Option<Instant>,
     /// How each table is sorted, per page, for as long as the app runs.
     pub table_sorts: HashMap<Page, TableSort>,
-    /// User ids resolved to display names; `None` while unknown, so an id
-    /// is asked about only once per run.
+    /// User ids resolved to display names; `None` while still unresolved.
     pub user_names: HashMap<String, Option<String>>,
+    /// The engine generation that owns each pending or completed lookup.
+    user_name_requests: HashMap<String, UserNameRequest>,
     /// Context URIs most recently played, newest first: the sidebar's
     /// order. Kept with the session, so it survives a restart.
     pub recent_contexts: Vec<String>,
@@ -406,6 +409,20 @@ pub struct App {
 enum ScrollAxis {
     Horizontal,
     Vertical,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserNameRequest {
+    Pending(u64),
+    Attempted(u64),
+}
+
+impl UserNameRequest {
+    fn generation(self) -> u64 {
+        match self {
+            Self::Pending(generation) | Self::Attempted(generation) => generation,
+        }
+    }
 }
 
 /// A trackpad gesture that pauses this long has ended; the next movement
@@ -481,6 +498,7 @@ impl App {
             auth: AuthStatus::Starting,
             user: None,
             local_device_id: None,
+            local_engine_generation: None,
             local_ready: false,
             local_playback: LocalPlayback::Unavailable,
             local: LocalState::default(),
@@ -558,6 +576,7 @@ impl App {
                 .filter_map(|(page, sort)| Some((Page::decode(page)?, *sort)))
                 .collect(),
             user_names: HashMap::new(),
+            user_name_requests: HashMap::new(),
             recent_contexts: session.recent_contexts.clone(),
             resume_context: session.last_context.clone(),
             resume_track: session.last_track.clone(),
@@ -1040,8 +1059,13 @@ impl App {
                     }
                     self.try_adopt_playlist_cache(&id);
                 }
-                Event::UserName { id, name } => {
-                    self.user_names.insert(id, name);
+                Event::UserName {
+                    generation,
+                    id,
+                    name,
+                } => self.handle_user_name(generation, id, name),
+                Event::UserNamesNotAdmitted { generation, ids } => {
+                    self.handle_user_names_not_admitted(generation, ids)
                 }
                 Event::WebApp { client_id } => {
                     self.invalidate_drag_scope();
@@ -1067,6 +1091,7 @@ impl App {
                 self.load_playlists();
                 self.ensure_loaded(self.page().clone());
                 self.poll_remote(true);
+                self.retry_unresolved_user_names();
             }
             AuthStatus::WaitingForBrowser { url } => self.sign_in_url = Some(url.clone()),
             AuthStatus::SignedOut => {
@@ -1081,7 +1106,10 @@ impl App {
                 self.local = LocalState::default();
                 self.local_ready = false;
                 self.local_device_id = None;
+                self.local_engine_generation = None;
                 self.local_playback = LocalPlayback::Unavailable;
+                self.user_names.clear();
+                self.user_name_requests.clear();
                 self.remote = None;
                 self.reset_data();
             }
@@ -1095,6 +1123,7 @@ impl App {
     }
 
     fn handle_playback(&mut self, status: LocalPlayback) {
+        let previous_generation = self.local_engine_generation;
         if !matches!(&status, LocalPlayback::Ready { .. })
             && self.local.connected
             && self.local.is_active()
@@ -1102,14 +1131,19 @@ impl App {
             self.capture_resume_before_playback_loss(Instant::now());
         }
         match &status {
-            LocalPlayback::Ready { device_id } => {
+            LocalPlayback::Ready {
+                device_id,
+                generation,
+            } => {
                 self.local_device_id = Some(device_id.clone());
+                self.local_engine_generation = Some(*generation);
                 self.local_ready = true;
             }
             LocalPlayback::Unavailable => {
                 self.local_ready = false;
                 self.local.connected = false;
                 self.local_device_id = None;
+                self.local_engine_generation = None;
                 self.pending_local_shuffle = None;
                 if self.queued_play.take().is_some() {
                     self.clear_play_pending();
@@ -1118,6 +1152,7 @@ impl App {
             LocalPlayback::Failed(message) => {
                 self.local_ready = false;
                 self.local.connected = false;
+                self.local_engine_generation = None;
                 self.pending_local_shuffle = None;
                 if self.queued_play.take().is_some() {
                     self.clear_play_pending();
@@ -1127,10 +1162,16 @@ impl App {
             LocalPlayback::Authorizing | LocalPlayback::Connecting => {
                 self.local_ready = false;
                 self.local.connected = false;
+                self.local_engine_generation = None;
             }
         }
         self.local_playback = status;
         self.dispatch_ready_local_work();
+        if self.local_engine_generation != previous_generation
+            && self.local_engine_generation.is_some()
+        {
+            self.retry_unresolved_user_names();
+        }
     }
 
     fn reset_data(&mut self) {
@@ -1997,20 +2038,80 @@ impl App {
         });
     }
 
-    /// Asks Spotify whether these items are in the library, in batches.
-    /// Resolve adder ids that have no known name yet.
+    /// Queue unresolved adder ids and admit at most one lookup per ready engine generation.
     pub fn request_user_names(&mut self, ids: Vec<String>) {
-        let unknown: Vec<String> = ids
-            .into_iter()
-            .filter(|id| !self.user_names.contains_key(id))
-            .collect();
-        if unknown.is_empty() {
+        let generation = self
+            .local_ready
+            .then_some(self.local_engine_generation)
+            .flatten();
+        let mut seen = HashSet::new();
+        let mut admitted = Vec::new();
+        for id in ids {
+            if id.is_empty() || !seen.insert(id.clone()) {
+                continue;
+            }
+            let unresolved = self.user_names.entry(id.clone()).or_insert(None).is_none();
+            let Some(generation) = generation else {
+                continue;
+            };
+            let attempted_here = self
+                .user_name_requests
+                .get(&id)
+                .is_some_and(|request| request.generation() == generation);
+            if unresolved && !attempted_here {
+                self.user_name_requests
+                    .insert(id.clone(), UserNameRequest::Pending(generation));
+                admitted.push(id);
+            }
+        }
+        if admitted.is_empty() {
             return;
         }
-        for id in &unknown {
-            self.user_names.insert(id.clone(), None);
+        let Some(generation) = generation else {
+            return;
+        };
+        self.backend.send(Command::UserNames {
+            generation,
+            ids: admitted,
+        });
+    }
+
+    fn retry_unresolved_user_names(&mut self) {
+        if self.local_engine_generation.is_none() {
+            return;
         }
-        self.backend.send(Command::UserNames(unknown));
+        let unresolved = self
+            .user_names
+            .iter()
+            .filter_map(|(id, name)| name.is_none().then_some(id.clone()))
+            .collect();
+        self.request_user_names(unresolved);
+    }
+
+    fn handle_user_name(&mut self, generation: u64, id: String, name: Option<String>) {
+        if self.local_engine_generation != Some(generation)
+            || self.user_name_requests.get(&id) != Some(&UserNameRequest::Pending(generation))
+        {
+            return;
+        }
+        if name.is_some() {
+            self.user_name_requests.remove(&id);
+        } else {
+            self.user_name_requests
+                .insert(id.clone(), UserNameRequest::Attempted(generation));
+        }
+        self.user_names.insert(id, name);
+    }
+
+    fn handle_user_names_not_admitted(&mut self, generation: u64, ids: Vec<String>) {
+        if self.local_engine_generation != Some(generation) {
+            return;
+        }
+        for id in ids {
+            if self.user_name_requests.get(&id) == Some(&UserNameRequest::Pending(generation)) {
+                self.user_name_requests.remove(&id);
+            }
+        }
     }
 
     pub fn request_contains(&mut self, uris: Vec<String>) {
@@ -4733,6 +4834,108 @@ mod tests {
         HeadlessApp { app, root }
     }
 
+    #[test]
+    fn user_name_requests_wait_for_engine_readiness_and_coalesce_duplicates() {
+        let mut app = headless_app();
+
+        app.request_user_names(vec!["friend".into(), "friend".into(), String::new()]);
+        assert_eq!(app.user_names.get("friend"), Some(&None));
+        assert!(app.backend.take_user_name_requests().is_empty());
+
+        app.handle_auth(AuthStatus::Connected {
+            username: "listener".into(),
+        });
+        assert!(app.backend.take_user_name_requests().is_empty());
+
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+            generation: 7,
+        });
+        assert_eq!(
+            app.backend.take_user_name_requests(),
+            vec![(7, vec!["friend".into()])]
+        );
+
+        app.request_user_names(vec!["friend".into(), "friend".into()]);
+        assert!(app.backend.take_user_name_requests().is_empty());
+    }
+
+    #[test]
+    fn unresolved_user_names_retry_once_per_engine_generation() {
+        let mut app = headless_app();
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+            generation: 1,
+        });
+        app.request_user_names(vec!["friend".into()]);
+        assert_eq!(
+            app.backend.take_user_name_requests(),
+            vec![(1, vec!["friend".into()])]
+        );
+
+        app.handle_user_name(1, "friend".into(), None);
+        app.request_user_names(vec!["friend".into()]);
+        assert!(app.backend.take_user_name_requests().is_empty());
+
+        app.handle_playback(LocalPlayback::Connecting);
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+            generation: 2,
+        });
+        assert_eq!(
+            app.backend.take_user_name_requests(),
+            vec![(2, vec!["friend".into()])]
+        );
+
+        app.handle_user_name(1, "friend".into(), Some("Stale".into()));
+        assert_eq!(app.user_names.get("friend"), Some(&None));
+        assert_eq!(
+            app.user_name_requests.get("friend"),
+            Some(&UserNameRequest::Pending(2))
+        );
+
+        app.handle_user_name(2, "friend".into(), Some("Current".into()));
+        assert_eq!(
+            app.user_names.get("friend").and_then(Option::as_deref),
+            Some("Current")
+        );
+        assert!(!app.user_name_requests.contains_key("friend"));
+    }
+
+    #[test]
+    fn rejected_user_name_admission_retries_on_authorization_and_resets_on_signout() {
+        let mut app = headless_app();
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "local".into(),
+            generation: 4,
+        });
+        app.request_user_names(vec!["friend".into()]);
+        assert_eq!(
+            app.backend.take_user_name_requests(),
+            vec![(4, vec!["friend".into()])]
+        );
+
+        app.handle_user_names_not_admitted(4, vec!["friend".into()]);
+        app.handle_auth(AuthStatus::Connected {
+            username: "listener".into(),
+        });
+        assert_eq!(
+            app.backend.take_user_name_requests(),
+            vec![(4, vec!["friend".into()])]
+        );
+        app.handle_auth(AuthStatus::Connected {
+            username: "listener".into(),
+        });
+        assert!(app.backend.take_user_name_requests().is_empty());
+
+        app.handle_auth(AuthStatus::SignedOut);
+        assert!(app.user_names.is_empty());
+        assert!(app.user_name_requests.is_empty());
+        assert_eq!(app.local_engine_generation, None);
+        app.handle_user_name(4, "friend".into(), Some("Stale".into()));
+        assert!(app.user_names.is_empty());
+    }
+
     fn loaded_playlist_page(playlist: Playlist) -> PlaylistPage {
         let mut page = PlaylistPage {
             playlist: Loadable::Loaded(playlist),
@@ -5840,6 +6043,7 @@ mod tests {
         app.local.shuffle = before;
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
+            generation: 1,
         });
         app.handle_playback(LocalPlayback::Connecting);
         assert_eq!(app.local_device_id.as_deref(), Some("local"));
@@ -5887,6 +6091,7 @@ mod tests {
                 if ready_first {
                     app.handle_playback(LocalPlayback::Ready {
                         device_id: "local".into(),
+                        generation: 2,
                     });
                     assert_eq!(app.pending_local_shuffle, Some(after));
                     app.handle_local(connected);
@@ -5895,6 +6100,7 @@ mod tests {
                     assert_eq!(app.pending_local_shuffle, Some(after));
                     app.handle_playback(LocalPlayback::Ready {
                         device_id: "local".into(),
+                        generation: 2,
                     });
                 }
 
@@ -5903,6 +6109,7 @@ mod tests {
                 let dispatched_at = app.shuffle_set_at;
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 2,
                 });
                 let echo = active_local_snapshot(&app, after, Playback::Paused);
                 app.handle_local(echo);
@@ -5930,12 +6137,14 @@ mod tests {
             if ready_first {
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 2,
                 });
                 app.handle_local(connected);
             } else {
                 app.handle_local(connected);
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 2,
                 });
             }
 
@@ -5959,12 +6168,14 @@ mod tests {
             if ready_first {
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 1,
                 });
                 app.handle_local(connected);
             } else {
                 app.handle_local(connected);
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 1,
                 });
             }
 
@@ -5975,6 +6186,7 @@ mod tests {
             let dispatched_at = app.shuffle_set_at;
             app.handle_playback(LocalPlayback::Ready {
                 device_id: "local".into(),
+                generation: 1,
             });
             assert_eq!(app.shuffle_set_at, dispatched_at);
         }
@@ -5993,12 +6205,14 @@ mod tests {
             if ready_first {
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 2,
                 });
                 app.handle_local(connected);
             } else {
                 app.handle_local(connected);
                 app.handle_playback(LocalPlayback::Ready {
                     device_id: "local".into(),
+                    generation: 2,
                 });
             }
 
@@ -6045,6 +6259,7 @@ mod tests {
 
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
+            generation: 1,
         });
         app.handle_local(connected_snapshot(app));
         assert_eq!(app.optimistic_playing, Some(dispatched));
@@ -6061,6 +6276,7 @@ mod tests {
         assert!(app.optimistic_playing.is_none());
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
+            generation: 1,
         });
 
         assert_play_dispatched_once(&mut app);
@@ -6079,6 +6295,7 @@ mod tests {
 
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
+            generation: 1,
         });
 
         assert!(app.queued_play.is_some());
@@ -6102,6 +6319,7 @@ mod tests {
         });
         app.handle_playback(LocalPlayback::Ready {
             device_id: "local".into(),
+            generation: 1,
         });
 
         assert!(app.queued_play.is_some());

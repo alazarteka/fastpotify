@@ -74,8 +74,9 @@ default:
 - **Release checks:** contacts the fixed GitHub API endpoint at most once a
   day. GitHub receives the connection's IP address, time, and Fastpotify
   version in the User-Agent. The response is capped at 64 KiB, must name a
-  strict `major.minor.patch` version, cannot redirect, and cannot choose the
-  release page Fastpotify opens.
+  release-policy `major.minor.patch` version with an optional prerelease
+  suffix, cannot redirect, and cannot choose the release page Fastpotify
+  opens.
 
 Every artwork request made and decoded by Fastpotify goes through one loader.
 It accepts only HTTPS on port 443 from `scdn.co` or `spotifycdn.com` and their

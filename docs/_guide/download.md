@@ -7,9 +7,19 @@ nav_order: 1
 {% assign v = site.fastpotify_version %}
 {% assign base = "https://github.com/crmne/fastpotify/releases/download/v" | append: v %}
 
-The current version is **v{{ v }}**. Every file below, with its SHA-256, is
-listed in [checksums.txt]({{ base }}/checksums.txt); all versions live on
-the [releases page](https://github.com/crmne/fastpotify/releases).
+The current version is **v{{ v }}**. Every packaged app and installer below is
+listed in [SHA256SUMS]({{ base }}/SHA256SUMS). The release also includes an
+[offline Sigstore attestation bundle]({{ base }}/fastpotify-v{{ v }}-attestation.json);
+all versions live on the
+[releases page](https://github.com/crmne/fastpotify/releases).
+
+The release workflow verifies each build's checksum, consolidates the final
+artifact digests into `SHA256SUMS`, and uses GitHub OIDC to attest exactly
+those subjects. Before publication it checks the manifest again and compares
+the uploaded assets' names, sizes, states, and GitHub-reported SHA-256 digests
+with that attested set. You can calculate the SHA-256 of your download and
+compare it with its line in `SHA256SUMS`; the JSON bundle makes the provenance
+attestation available for offline verification tools.
 
 ## macOS
 
@@ -24,29 +34,22 @@ Open it and drag **Fastpotify** to Applications. Or, with
 brew install --cask crmne/tap/fastpotify
 ```
 
-Homebrew installs it like any download, so the first-open steps below
-apply once. To skip them, clear the quarantine flag instead:
+The published DMG is a mandatory output of the protected macOS signing job: the
+app and disk image are Developer ID signed, the disk image is notarized by
+Apple, and the notarization ticket is stapled and validated before the release
+can be attested or published. Open the published app normally; these releases
+do not require bypassing Gatekeeper or removing quarantine metadata.
+
+### Locally built macOS bundles
+
+`packaging/macos/bundle.sh` creates an ad-hoc-signed development bundle, not the
+Developer ID signed and notarized GitHub release. If Gatekeeper blocks a local
+bundle that you built and inspected yourself, remove quarantine recursively
+from that exact bundle only (nested bundle files can carry the attribute):
 
 ```sh
-xattr -d com.apple.quarantine /Applications/Fastpotify.app
+xattr -dr com.apple.quarantine /path/to/Fastpotify.app
 ```
-
-### First open on macOS
-
-This build is not yet notarized with Apple, so macOS blocks it the first
-time. Recent macOS versions (Sequoia and later) no longer let you bypass
-this with a right-click, so you open it once through Privacy & Security:
-
-1. Double-click **Fastpotify** in Applications. macOS says it cannot be
-   opened because Apple cannot check it for malicious software. Click
-   **Done** (do **not** click Move to Trash).
-2. Open **System Settings**, then **Privacy & Security**.
-3. Scroll down to the **Security** section, find *"Fastpotify was blocked
-   to protect your Mac"*, and click **Open Anyway**.
-4. Authenticate, then click **Open Anyway** once more.
-
-macOS remembers the choice: every launch after this is an ordinary
-double-click. This step disappears once notarized builds ship.
 
 ## Windows
 

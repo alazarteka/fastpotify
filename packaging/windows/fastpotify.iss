@@ -1,8 +1,9 @@
 ; The Windows installer, built with Inno Setup 6.3 or later from a release
 ; binary (the release workflow does this on every tag):
 ;
-;   iscc /DVersion=0.1.4 /DArch=x86_64 /DBinary=...\fastpotify.exe ^
-;        /DOutputDir=dist packaging\windows\fastpotify.iss
+;   iscc /DVersion=0.1.4 /DNumericVersion=0.1.4 /DArch=x86_64 ^
+;        /DBinary=...\fastpotify.exe /DOutputDir=dist ^
+;        packaging\windows\fastpotify.iss
 ;
 ; Arch is x86_64 or aarch64, as in the Rust target triple, so the installer
 ; is named like the zip next to it. It needs no administrator rights: the
@@ -14,6 +15,9 @@
 #endif
 #ifndef Arch
   #error Arch must be defined on the ISCC command line (x86_64 or aarch64)
+#endif
+#ifndef NumericVersion
+  #error NumericVersion must be defined on the ISCC command line
 #endif
 #ifndef Binary
   #error Binary must be defined on the ISCC command line
@@ -57,7 +61,7 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\{#AppExeName}
-VersionInfoVersion={#Version}.0
+VersionInfoVersion={#NumericVersion}.0
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked

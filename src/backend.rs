@@ -609,8 +609,11 @@ pub enum Command {
         snapshot: String,
         items: Vec<PlaylistItem>,
     },
-    /// Resolve user ids to display names through the streaming session.
-    UserNames(Vec<String>),
+    /// Resolve user ids through the exact ready streaming-engine generation.
+    UserNames {
+        generation: u64,
+        ids: Vec<String>,
+    },
 }
 
 pub struct LyricsRequest {
@@ -649,8 +652,14 @@ pub enum Event {
     },
     /// A user id resolved to a display name (`None` when nothing answers).
     UserName {
+        generation: u64,
         id: String,
         name: Option<String>,
+    },
+    /// The requested engine generation was no longer ready for admission.
+    UserNamesNotAdmitted {
+        generation: u64,
+        ids: Vec<String>,
     },
     /// The optional personal Web API application currently ready for routing.
     WebApp {
@@ -670,6 +679,7 @@ pub enum LocalPlayback {
     /// This computer is a ready Spotify Connect device.
     Ready {
         device_id: String,
+        generation: u64,
     },
     Failed(String),
 }
@@ -741,6 +751,21 @@ impl EngineNotificationGuard {
         let mut current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         *current = current.wrapping_add(1);
     }
+
+    fn emit_if_current(
+        &self,
+        generation: u64,
+        events: &std::sync::mpsc::Sender<Event>,
+        waker: &Waker,
+        event: Event,
+    ) -> bool {
+        let current = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if *current != generation || events.send(event).is_err() {
+            return false;
+        }
+        waker.wake();
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -773,6 +798,13 @@ enum CompletionDisposition {
 impl EngineConnectionLifecycle {
     fn is_idle(self) -> bool {
         matches!(self, Self::Idle)
+    }
+
+    fn active_generation(self) -> Option<u64> {
+        match self {
+            Self::Active { generation } => Some(generation),
+            Self::Idle | Self::Connecting { .. } => None,
+        }
     }
 
     fn begin(&mut self, generation: u64) {
@@ -940,6 +972,74 @@ mod engine_lifecycle_tests {
             CompletionDisposition::PublishReady
         );
     }
+
+    #[test]
+    fn user_name_completions_are_scoped_to_the_current_engine_generation() {
+        let guard = EngineNotificationGuard::default();
+        let (events, event_rx) = std::sync::mpsc::channel();
+        let (commands, _command_rx) = mpsc::unbounded_channel();
+        let (first, _first_notify) =
+            guard.notifier(events.clone(), commands.clone(), Waker::default());
+        let mut lifecycle = EngineConnectionLifecycle::default();
+        lifecycle.begin(first);
+        assert_eq!(
+            lifecycle.engine_connected(first),
+            CompletionDisposition::PublishReady
+        );
+        assert_eq!(lifecycle.active_generation(), Some(first));
+        assert!(guard.emit_if_current(
+            first,
+            &events,
+            &Waker::default(),
+            Event::UserName {
+                generation: first,
+                id: "first".into(),
+                name: Some("First".into()),
+            },
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Event::UserName { generation, id, .. })
+                if generation == first && id == "first"
+        ));
+
+        lifecycle.reset();
+        let (second, _second_notify) = guard.notifier(events.clone(), commands, Waker::default());
+        lifecycle.begin(second);
+        assert_eq!(
+            lifecycle.engine_connected(second),
+            CompletionDisposition::PublishReady
+        );
+        assert!(!guard.emit_if_current(
+            first,
+            &events,
+            &Waker::default(),
+            Event::UserName {
+                generation: first,
+                id: "stale".into(),
+                name: Some("Stale".into()),
+            },
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(guard.emit_if_current(
+            second,
+            &events,
+            &Waker::default(),
+            Event::UserName {
+                generation: second,
+                id: "current".into(),
+                name: Some("Current".into()),
+            },
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(Event::UserName { generation, id, .. })
+                if generation == second && id == "current"
+        ));
+    }
 }
 
 /// The interface's handle to the runtime.
@@ -954,6 +1054,8 @@ pub struct Backend {
     api_requests: std::sync::Mutex<Vec<ApiRequest>>,
     #[cfg(test)]
     player_commands: std::sync::Mutex<Vec<PlayerCommand>>,
+    #[cfg(test)]
+    user_name_requests: std::sync::Mutex<Vec<(u64, Vec<String>)>>,
 }
 
 impl Backend {
@@ -1016,6 +1118,8 @@ impl Backend {
             api_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             player_commands: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            user_name_requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1032,6 +1136,13 @@ impl Backend {
     }
 
     pub fn send(&self, command: Command) {
+        #[cfg(test)]
+        if let Command::UserNames { generation, ids } = &command {
+            self.user_name_requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((*generation, ids.clone()));
+        }
         if self.offline && !matches!(command, Command::Accent { .. } | Command::Shutdown) {
             return;
         }
@@ -1071,6 +1182,16 @@ impl Backend {
         std::mem::take(
             &mut *self
                 .player_commands
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_user_name_requests(&self) -> Vec<(u64, Vec<String>)> {
+        std::mem::take(
+            &mut *self
+                .user_name_requests
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()),
         )
@@ -1621,7 +1742,7 @@ impl Worker {
                     snapshot,
                     items,
                 } => self.store_playlist_cache(id, snapshot, items),
-                Command::UserNames(ids) => self.fetch_user_names(ids),
+                Command::UserNames { generation, ids } => self.fetch_user_names(generation, ids),
                 Command::ConfigurePersonalWebApp(client_id) => {
                     self.configure_personal_web_app(client_id)
                 }
@@ -2501,7 +2622,10 @@ impl Worker {
                     log::warn!("unable to resume playback after reconnecting: {error}");
                 }
                 self.engine = Some(engine);
-                self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
+                self.emit(Event::Playback(LocalPlayback::Ready {
+                    device_id,
+                    generation,
+                }));
             }
             (None, _) => {
                 self.pending_resume = None;
@@ -2631,19 +2755,34 @@ impl Worker {
         });
     }
 
-    /// Ask Spotify who is behind each user id. Only the streaming session
-    /// can ask; without one the interface shows the bare ids.
-    fn fetch_user_names(&self, ids: Vec<String>) {
-        let Some(engine) = self.engine.clone() else {
+    /// Ask the exact ready streaming generation who is behind each user id.
+    fn fetch_user_names(&self, generation: u64, ids: Vec<String>) {
+        let Some(engine) = self
+            .engine
+            .clone()
+            .filter(|_| self.engine_connection.active_generation() == Some(generation))
+        else {
+            self.emit(Event::UserNamesNotAdmitted { generation, ids });
             return;
         };
         let events = self.events.clone();
         let waker = self.waker.clone();
+        let notifications = self.engine_notifications.clone();
         tokio::spawn(async move {
             for id in ids {
                 let name = engine.user_display_name(&id).await;
-                let _ = events.send(Event::UserName { id, name });
-                waker.wake();
+                if !notifications.emit_if_current(
+                    generation,
+                    &events,
+                    &waker,
+                    Event::UserName {
+                        generation,
+                        id,
+                        name,
+                    },
+                ) {
+                    break;
+                }
             }
         });
     }

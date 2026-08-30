@@ -249,6 +249,7 @@ pub fn populate(app: &mut App) {
     app.local_ready = true;
     app.local_playback = crate::backend::LocalPlayback::Ready {
         device_id: "local-demo".into(),
+        generation: 1,
     };
     app.user = Some(User {
         id: "demo".into(),

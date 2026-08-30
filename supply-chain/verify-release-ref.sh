@@ -4,6 +4,10 @@
 # tag deletion/replacement race before signing or publishing.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=release-version.sh
+source "$script_dir/release-version.sh"
+
 : "${GITHUB_API_URL:?GITHUB_API_URL is required}"
 : "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -18,7 +22,7 @@ if [[ "${GITHUB_REF_PROTECTED:-false}" != "true" ]]; then
     echo "release tag is not covered by a repository ruleset" >&2
     exit 1
 fi
-if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+if ! release_version_parse "$GITHUB_REF_NAME"; then
     echo "release tag is not a supported semantic version: $GITHUB_REF_NAME" >&2
     exit 1
 fi
@@ -75,7 +79,7 @@ if [[ -n "${EXPECTED_SOURCE_COMMIT:-}" && "$source_commit" != "$EXPECTED_SOURCE_
     exit 1
 fi
 
-version="${GITHUB_REF_NAME#v}"
+version="$RELEASE_VERSION"
 manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 if [[ "$manifest_version" != "$version" ]]; then
     echo "tag version $version does not match Cargo.toml $manifest_version" >&2
@@ -95,6 +99,9 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
         printf 'source_commit=%s\n' "$source_commit"
         printf 'source_date_epoch=%s\n' "$source_date_epoch"
         printf 'version=%s\n' "$version"
+        printf 'numeric_version=%s\n' "$RELEASE_NUMERIC_VERSION"
+        printf 'prerelease=%s\n' "$RELEASE_PRERELEASE"
+        printf 'make_latest=%s\n' "$RELEASE_MAKE_LATEST"
     } >> "$GITHUB_OUTPUT"
 fi
 

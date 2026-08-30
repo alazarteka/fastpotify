@@ -16,13 +16,21 @@ binary="$1"
 app="$2"
 version="$3"
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../../supply-chain/release-version.sh
+source "$here/../../supply-chain/release-version.sh"
+if ! release_version_parse "v$version"; then
+    echo "unsupported bundle version: $version" >&2
+    exit 1
+fi
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 cp "$binary" "$app/Contents/MacOS/fastpotify"
 chmod 755 "$app/Contents/MacOS/fastpotify"
-sed "s/__VERSION__/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
+sed -e "s/__VERSION__/$version/g" \
+    -e "s/__BUILD__/$RELEASE_NUMERIC_VERSION/g" \
+    "$here/Info.plist" > "$app/Contents/Info.plist"
 
 cp "$here/fastpotify.icns" "$app/Contents/Resources/fastpotify.icns"
 
