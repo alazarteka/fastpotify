@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::Color32;
+use rand::Rng as _;
+use rand::seq::IndexedRandom;
 
 use crate::api::PlayRequest;
 use crate::api::models::{
@@ -55,14 +57,11 @@ pub struct RemoteSnapshot {
 /// before any state says so.
 struct AssumedContext {
     uri: String,
-    /// `Some` when the play asked for shuffle too.
-    shuffle: Option<bool>,
     at: Instant,
 }
 
 struct QueuedPlay {
     request: PlayRequest,
-    shuffle_first: bool,
 }
 
 #[derive(Default)]
@@ -247,6 +246,10 @@ pub struct App {
     pending_local_volume: Option<(u16, Instant)>,
     optimistic_playing: Option<(bool, Instant)>,
     unavailable_recovery: UnavailableRecovery,
+    /// Shuffle as the listener set it, carried across playback contexts.
+    shuffle_wanted: bool,
+    /// Prevent an echo of a local change from looking like another client.
+    shuffle_set_at: Option<Instant>,
     /// The context the interface just started, shown as playing until
     /// Spotify's own state says the same thing.
     assumed_context: Option<AssumedContext>,
@@ -403,6 +406,8 @@ impl App {
             pending_local_volume: None,
             optimistic_playing: None,
             unavailable_recovery: UnavailableRecovery::default(),
+            shuffle_wanted: session.shuffle_on,
+            shuffle_set_at: None,
             assumed_context: None,
             last_now_playing_uri: None,
             playlist_busy: false,
@@ -413,7 +418,11 @@ impl App {
             scroll_accum: egui::Vec2::ZERO,
             glide: None,
             scroll_last_event: None,
-            table_sorts: HashMap::new(),
+            table_sorts: session
+                .sorts
+                .iter()
+                .filter_map(|(page, sort)| Some((Page::decode(page)?, *sort)))
+                .collect(),
             user_names: HashMap::new(),
             recent_contexts: session.recent_contexts.clone(),
             resume_context: session.last_context.clone(),
@@ -535,15 +544,22 @@ impl App {
     /// The context playing as the interface should show it: the one just
     /// asked for until Spotify's state confirms it, then Spotify's own.
     pub fn playing_context_uri(&self) -> Option<String> {
-        if let Some(assumed) = &self.assumed_context
-            && assumed.at.elapsed() < ASSUMED_CONTEXT_HOLD
-        {
-            return Some(assumed.uri.clone());
-        }
-        self.remote
+        let remote = self
+            .remote
             .as_ref()
             .and_then(|remote| remote.state.context.as_ref())
-            .map(|context| context.uri.clone())
+            .map(|context| context.uri.clone());
+        if let Some(assumed) = &self.assumed_context {
+            let held = assumed.at.elapsed() < ASSUMED_CONTEXT_HOLD;
+            // A filtered or sorted view plays as plain tracks, so Spotify
+            // never names its source context. Keep the context until an
+            // actual state contradicts it or playback stops.
+            let contradicted = remote.as_deref().is_some_and(|uri| uri != assumed.uri);
+            if held || (!contradicted && self.believed_playing()) {
+                return Some(assumed.uri.clone());
+            }
+        }
+        remote
     }
 
     /// Whether the playing context shuffles, honouring a shuffle the
@@ -560,13 +576,7 @@ impl App {
     }
 
     pub fn playing_context_shuffle(&self) -> bool {
-        if let Some(assumed) = &self.assumed_context
-            && assumed.at.elapsed() < ASSUMED_CONTEXT_HOLD
-            && let Some(shuffle) = assumed.shuffle
-        {
-            return shuffle;
-        }
-        self.now_playing().is_some_and(|now| now.shuffle)
+        self.shuffle_wanted
     }
 
     pub fn now_playing(&self) -> Option<NowPlaying> {
@@ -616,7 +626,7 @@ impl App {
                 position_ms: self.local.position_now(),
                 playing,
                 loading: self.local.playback == Playback::Loading,
-                shuffle: self.local.shuffle,
+                shuffle: self.shuffle_wanted,
                 repeat: self.local.repeat,
                 volume_percent: volume_to_percent(self.local.volume),
                 can_control: true,
@@ -689,7 +699,7 @@ impl App {
             position_ms: position,
             playing,
             loading: false,
-            shuffle: remote.state.shuffle_state,
+            shuffle: self.shuffle_wanted,
             repeat: RepeatMode::from_api(&remote.state.repeat_state),
             volume_percent: volume,
             can_control: device.is_none_or(|device| !device.is_restricted),
@@ -889,6 +899,13 @@ impl App {
     fn handle_local(&mut self, state: LocalState) {
         let track_changed = state.track != self.local.track;
         let reconnected = state.connected && !self.local.connected;
+        if state.shuffle != self.local.shuffle
+            && self
+                .shuffle_set_at
+                .is_none_or(|at| at.elapsed() > Duration::from_secs(5))
+        {
+            self.adopt_external_shuffle(state.shuffle);
+        }
         if state.playback != self.local.playback {
             self.optimistic_playing = None;
             if matches!(state.playback, Playback::Playing | Playback::Loading) {
@@ -1682,10 +1699,26 @@ impl App {
                                 .as_ref()
                                 .map(|item| item.uri().to_string())
                         });
+                        let previous_shuffle = self
+                            .remote
+                            .as_ref()
+                            .map(|remote| remote.state.shuffle_state);
                         self.remote = state.map(|state| RemoteSnapshot {
                             state,
                             received_at: Instant::now(),
                         });
+                        if let (Some(previous), Some(current)) = (
+                            previous_shuffle,
+                            self.remote
+                                .as_ref()
+                                .map(|remote| remote.state.shuffle_state),
+                        ) && previous != current
+                            && self
+                                .shuffle_set_at
+                                .is_none_or(|at| at.elapsed() > Duration::from_secs(5))
+                        {
+                            self.adopt_external_shuffle(current);
+                        }
                         if let Some(context) = self
                             .remote
                             .as_ref()
@@ -2454,10 +2487,99 @@ impl App {
         self.mark_session_dirty();
     }
 
-    /// With `shuffle_first`, shuffle is turned on before playback starts,
-    /// in one ordered exchange: two independent requests race, and shuffle
-    /// sometimes lost.
-    fn play_request(&mut self, request: PlayRequest, shuffle_first: bool) {
+    /// A random playable track from a context already loaded in memory.
+    fn random_track_in(&self, context_uri: &str) -> Option<String> {
+        let uris: Vec<&str> = if let Some(id) = context_uri.strip_prefix("spotify:playlist:") {
+            self.playlist_pages
+                .get(id)?
+                .items
+                .items
+                .iter()
+                .filter_map(|item| item.playable())
+                .filter(|item| match item {
+                    PlayableItem::Track(track) => {
+                        track.is_playable != Some(false) && !track.is_local
+                    }
+                    PlayableItem::Episode(_) => true,
+                })
+                .map(PlayableItem::uri)
+                .collect()
+        } else if let Some(id) = context_uri.strip_prefix("spotify:album:") {
+            self.album_pages
+                .get(id)?
+                .tracks
+                .items
+                .iter()
+                .filter(|track| track.is_playable != Some(false) && !track.is_local)
+                .map(|track| track.uri.as_str())
+                .collect()
+        } else if context_uri.ends_with(":collection") {
+            self.library
+                .liked
+                .items
+                .iter()
+                .map(|item| &item.track)
+                .filter(|track| track.is_playable != Some(false) && !track.is_local)
+                .map(|track| track.uri.as_str())
+                .collect()
+        } else {
+            return None;
+        };
+        uris.choose(&mut rand::rng()).map(|uri| (*uri).to_string())
+    }
+
+    fn assume_context(&mut self, uri: String) {
+        self.note_recent_context(&uri);
+        self.assumed_context = Some(AssumedContext {
+            uri,
+            at: Instant::now(),
+        });
+    }
+
+    fn prepare_play_request(&self, mut request: PlayRequest, shuffle: bool) -> PlayRequest {
+        if shuffle && request.offset_uri.is_none() && request.offset_position.is_none() {
+            if request.uris.is_empty() {
+                if let Some(context) = request.context_uri.as_deref() {
+                    request.offset_uri = self.random_track_in(context);
+                }
+            } else {
+                request.offset_position =
+                    Some(rand::rng().random_range(0..request.uris.len()) as u32);
+            }
+        }
+        if request.uris.len() > 500 {
+            let selected = request
+                .offset_position
+                .map(|index| index as usize)
+                .or_else(|| {
+                    let uri = request.offset_uri.as_deref()?;
+                    request.uris.iter().position(|candidate| candidate == uri)
+                })
+                .unwrap_or(0) as u32;
+            let had_index = request.offset_position.is_some();
+            let (uris, index) = cap_uris(std::mem::take(&mut request.uris), selected);
+            request.uris = uris;
+            if had_index {
+                request.offset_position = Some(index);
+            }
+        }
+        request
+    }
+
+    /// Apply the listener's shuffle mode and start one ordered play request.
+    fn play_request(&mut self, mut request: PlayRequest, enable_shuffle: bool) {
+        if enable_shuffle {
+            if !self.shuffle_wanted {
+                self.shuffle_wanted = true;
+                self.mark_session_dirty();
+            }
+            self.shuffle_set_at = Some(Instant::now());
+        }
+        let shuffle = self.shuffle_wanted;
+        // A play queued behind a reconnect is transformed only when it is
+        // actually dispatched, so a shuffle toggle while waiting still wins.
+        let queued_request = request.clone();
+        request = self.prepare_play_request(request, shuffle);
         let mut keys: Vec<String> = Vec::new();
         if let Some(context) = &request.context_uri {
             keys.push(context.clone());
@@ -2482,20 +2604,14 @@ impl App {
         }
         self.set_play_pending(keys);
         if let Some(context) = request.context_uri.clone() {
-            self.note_recent_context(&context);
             // Light the page and the sidebar up at once; Spotify's own
             // state takes a poll or two to say the same thing.
-            self.assumed_context = Some(AssumedContext {
-                uri: context,
-                shuffle: shuffle_first.then_some(true),
-                at: Instant::now(),
-            });
+            self.assume_context(context);
         }
         match self.target() {
             Target::Local if !self.local.connected => {
                 self.queued_play = Some(QueuedPlay {
-                    request,
-                    shuffle_first,
+                    request: queued_request,
                 });
             }
             Target::Local => {
@@ -2507,18 +2623,22 @@ impl App {
                     offset_index: request.offset_position,
                     position_ms: request.position_ms,
                     play: true,
-                    shuffle: shuffle_first.then_some(true),
+                    shuffle: Some(shuffle),
                 }));
                 self.optimistic_playing = Some((true, Instant::now()));
             }
             Target::Remote(Some(device_id)) => {
                 self.queued_play = None;
-                if shuffle_first {
-                    self.backend.api(ApiRequest::ShufflePlay {
-                        device_id: Some(device_id),
-                        play: request,
-                    });
-                } else {
+                let shuffle_matches = self.remote.as_ref().is_some_and(|remote| {
+                    remote.state.shuffle_state == shuffle
+                        && remote
+                            .state
+                            .device
+                            .as_ref()
+                            .and_then(|device| device.id.as_deref())
+                            == Some(device_id.as_str())
+                });
+                if shuffle_matches {
                     self.backend.api(ApiRequest::Remote {
                         action: RemoteAction::Play,
                         device_id: Some(device_id),
@@ -2527,6 +2647,12 @@ impl App {
                         percent: 0,
                         flag: false,
                         repeat: String::new(),
+                    });
+                } else {
+                    self.backend.api(ApiRequest::PlayWithShuffle {
+                        device_id: Some(device_id),
+                        play: request,
+                        shuffle,
                     });
                 }
                 self.optimistic_playing = Some((true, Instant::now()));
@@ -2540,8 +2666,7 @@ impl App {
                     LocalPlayback::Connecting | LocalPlayback::Authorizing
                 ) {
                     self.queued_play = Some(QueuedPlay {
-                        request,
-                        shuffle_first,
+                        request: queued_request,
                     });
                 } else {
                     self.clear_play_pending();
@@ -2558,12 +2683,8 @@ impl App {
         if !self.local_ready || !self.local.connected {
             return;
         }
-        if let Some(QueuedPlay {
-            request,
-            shuffle_first,
-        }) = self.queued_play.take()
-        {
-            self.play_request(request, shuffle_first);
+        if let Some(QueuedPlay { request }) = self.queued_play.take() {
+            self.play_request(request, false);
         }
     }
 
@@ -2759,10 +2880,16 @@ impl App {
         }
     }
 
-    fn set_shuffle(&mut self, shuffle: bool) {
-        if let Some(assumed) = &mut self.assumed_context {
-            assumed.shuffle = Some(shuffle);
+    fn adopt_external_shuffle(&mut self, shuffle: bool) {
+        if self.shuffle_wanted != shuffle {
+            self.shuffle_wanted = shuffle;
+            self.mark_session_dirty();
         }
+    }
+
+    fn set_shuffle(&mut self, shuffle: bool) {
+        self.adopt_external_shuffle(shuffle);
+        self.shuffle_set_at = Some(Instant::now());
         match self.target() {
             Target::Local => {
                 self.local.shuffle = shuffle;
@@ -2931,6 +3058,14 @@ impl App {
                 let request = PlayRequest::tracks(uris).starting_at_index(index);
                 self.play_request(request, false);
             }
+            Action::PlayView { context_uri, uris } => {
+                if uris.is_empty() {
+                    return;
+                }
+                let request = PlayRequest::tracks(uris);
+                self.play_request(request, false);
+                self.assume_context(context_uri);
+            }
             Action::PlayFromRow {
                 context,
                 uri,
@@ -2947,10 +3082,14 @@ impl App {
                     let request = PlayRequest::tracks(uris).starting_at_index(index);
                     self.play_request(request, false);
                 }
+                RowContext::View { uris, context_uri } => {
+                    let (uris, index) = cap_uris(uris, index);
+                    let request = PlayRequest::tracks(uris).starting_at_index(index);
+                    self.play_request(request, false);
+                    self.assume_context(context_uri);
+                }
             },
-            Action::ShufflePlay(uri) => {
-                self.play_request(PlayRequest::context(uri), true);
-            }
+            Action::ShufflePlay(uri) => self.play_request(PlayRequest::context(uri), true),
             Action::TogglePlay => self.toggle_play(),
             Action::Next => match self.target() {
                 Target::Local => self.backend.player(PlayerCommand::Next),
@@ -3000,8 +3139,7 @@ impl App {
                 }
             }
             Action::ToggleShuffle => {
-                let shuffle = self.now_playing().is_some_and(|now| now.shuffle);
-                self.set_shuffle(!shuffle);
+                self.set_shuffle(!self.shuffle_wanted);
             }
             Action::SetShuffle(shuffle) => self.set_shuffle(shuffle),
             Action::CycleRepeat => {
@@ -3503,12 +3641,20 @@ impl App {
         self.session_dirty = false;
         self.last_session_save = Instant::now();
         if !self.offline {
+            let mut sorts: Vec<_> = self
+                .table_sorts
+                .iter()
+                .map(|(page, sort)| (page.encode(), *sort))
+                .collect();
+            sorts.sort_by(|a, b| a.0.cmp(&b.0));
             SessionState {
                 last_page: Some(self.page().encode()),
                 recent_contexts: self.recent_contexts.clone(),
                 last_context: self.resume_context.clone(),
                 last_track: self.resume_track.clone(),
                 last_position_ms: self.resume_position_ms,
+                shuffle_on: self.shuffle_wanted,
+                sorts,
             }
             .save(&self.dirs.session_file());
         }
@@ -3664,6 +3810,63 @@ mod tests {
         assert_eq!(volume_to_percent(app.settings.volume), 35);
     }
 
+    #[test]
+    fn shuffled_context_starts_on_a_loaded_playable_item() {
+        let mut app = headless_app();
+        let mut page = AlbumPage::default();
+        page.tracks.items = vec![
+            Track {
+                uri: "spotify:track:unavailable".into(),
+                is_playable: Some(false),
+                ..Track::default()
+            },
+            Track {
+                uri: "spotify:track:local".into(),
+                is_local: true,
+                ..Track::default()
+            },
+            Track {
+                uri: "spotify:track:playable".into(),
+                ..Track::default()
+            },
+        ];
+        app.album_pages.insert("album".into(), page);
+
+        let request = app.prepare_play_request(PlayRequest::context("spotify:album:album"), true);
+        assert_eq!(
+            request.offset_uri.as_deref(),
+            Some("spotify:track:playable")
+        );
+
+        let ordered = app.prepare_play_request(PlayRequest::context("spotify:album:album"), false);
+        assert!(ordered.offset_uri.is_none());
+    }
+
+    #[test]
+    fn shuffled_view_chooses_before_capping_the_request() {
+        let app = headless_app();
+        let uris: Vec<String> = (0..700)
+            .map(|index| format!("spotify:track:{index}"))
+            .collect();
+        let request = app.prepare_play_request(PlayRequest::tracks(uris), true);
+
+        assert!(!request.uris.is_empty());
+        assert!(request.uris.len() <= 500);
+        assert_eq!(request.offset_position, Some(0));
+    }
+
+    #[test]
+    fn shuffle_changes_from_another_client_become_the_mode() {
+        let mut app = headless_app();
+        app.handle_local(LocalState {
+            shuffle: true,
+            volume: app.local.volume,
+            ..LocalState::default()
+        });
+        assert!(app.shuffle_wanted);
+        assert!(app.session_dirty);
+    }
+
     fn play_queued_during_reconnect() -> App {
         let mut app = headless_app();
         app.local.connected = true;
@@ -3679,7 +3882,8 @@ mod tests {
             queued.request.context_uri.as_deref(),
             Some("spotify:album:x")
         );
-        assert!(queued.shuffle_first);
+        assert!(app.shuffle_wanted);
+        assert!(app.session_dirty);
         assert!(app.optimistic_playing.is_none());
         app
     }
@@ -3722,9 +3926,10 @@ mod tests {
         assert_eq!(
             app.assumed_context
                 .as_ref()
-                .and_then(|context| context.shuffle),
-            Some(true)
+                .map(|context| context.uri.as_str()),
+            Some("spotify:album:x")
         );
+        assert!(app.shuffle_wanted);
     }
 
     #[test]

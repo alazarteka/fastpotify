@@ -187,11 +187,11 @@ pub enum ApiRequest {
         device_id: String,
         play: bool,
     },
-    /// Shuffle on, then start the context, one after the other: sent as two
-    /// independent requests they race, and shuffle sometimes lost.
-    ShufflePlay {
+    /// Apply shuffle, then play, in one ordered backend operation.
+    PlayWithShuffle {
         device_id: Option<String>,
         play: PlayRequest,
+        shuffle: bool,
     },
     AddToQueue {
         uri: String,
@@ -2073,9 +2073,13 @@ async fn handle(api: &ApiClient, request: ApiRequest) -> ApiResponse {
             };
             ApiResponse::Remote { action, result }
         }
-        ApiRequest::ShufflePlay { device_id, play } => {
+        ApiRequest::PlayWithShuffle {
+            device_id,
+            play,
+            shuffle,
+        } => {
             let device = device_id.as_deref();
-            let result = match api.set_shuffle(true, device).await {
+            let result = match api.set_shuffle(shuffle, device).await {
                 Ok(()) => api.play(device, Some(&play)).await,
                 Err(error) => Err(error),
             };

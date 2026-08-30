@@ -111,6 +111,7 @@ pub fn hero(app: &mut App, ui: &mut egui::Ui, hero: Hero<'_>) {
 
 pub struct Actions<'a> {
     pub play_uri: Option<String>,
+    pub view: Option<Vec<String>>,
     pub saved: Option<(String, bool)>,
     pub saved_icons: (Icon, Icon),
     pub saved_tooltips: (&'a str, &'a str),
@@ -152,6 +153,11 @@ pub fn actions_row(
             {
                 if now_playing_here {
                     app.actions.push(Action::TogglePlay);
+                } else if let Some(uris) = actions.view.clone() {
+                    app.actions.push(Action::PlayView {
+                        context_uri: uri.clone(),
+                        uris,
+                    });
                 } else {
                     app.actions.push(Action::PlayContext {
                         uri: uri.clone(),
@@ -265,71 +271,8 @@ pub struct Table<'a> {
 pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
     let palette = app.palette;
     let needle = table.filter.trim().to_lowercase();
-    let visible: Vec<usize> = table
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, (item, _, _))| {
-            if needle.is_empty() {
-                return true;
-            }
-            let haystack = match item {
-                PlayableItem::Track(track) => format!(
-                    "{} {} {}",
-                    track.name,
-                    track.artist_names(),
-                    track
-                        .album
-                        .as_ref()
-                        .map(|album| album.name.as_str())
-                        .unwrap_or("")
-                ),
-                PlayableItem::Episode(episode) => episode.name.clone(),
-            };
-            haystack.to_lowercase().contains(&needle)
-        })
-        .map(|(index, _)| index)
-        .collect();
-
     let sort = app.table_sorts.get(&table.page).copied();
-    let mut visible = visible;
-    if let Some(sort) = sort {
-        let album_of = |item: &PlayableItem| match item {
-            PlayableItem::Track(track) => track
-                .album
-                .as_ref()
-                .map(|album| album.name.to_lowercase())
-                .unwrap_or_default(),
-            PlayableItem::Episode(_) => String::new(),
-        };
-        let duration_of = |item: &PlayableItem| match item {
-            PlayableItem::Track(track) => track.duration_ms,
-            PlayableItem::Episode(episode) => episode.duration_ms,
-        };
-        visible.sort_by(|a, b| {
-            let (item_a, added_a, adder_a) = &table.items[*a];
-            let (item_b, added_b, adder_b) = &table.items[*b];
-            let ordering = match sort.column {
-                SortColumn::Title => item_a
-                    .name()
-                    .to_lowercase()
-                    .cmp(&item_b.name().to_lowercase()),
-                SortColumn::Album => album_of(item_a).cmp(&album_of(item_b)),
-                SortColumn::Added => added_a.cmp(added_b),
-                SortColumn::AddedBy => adder_a
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .cmp(&adder_b.as_deref().unwrap_or_default().to_lowercase()),
-                SortColumn::Duration => duration_of(item_a).cmp(&duration_of(item_b)),
-            };
-            if sort.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            }
-        });
-    }
+    let visible = view_indices(table.items, &needle, sort);
 
     if !table.items.is_empty()
         && let Some(column) = widgets::table_header(
@@ -349,36 +292,43 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
                 ascending: false,
             }),
             Some(sort) if sort.column == column => None,
+            Some(_) if column == SortColumn::Index => None,
             _ => Some(TableSort {
                 column,
-                ascending: true,
+                ascending: column != SortColumn::Index,
             }),
         };
         match next {
             Some(sort) => {
                 app.table_sorts.insert(table.page.clone(), sort);
+                app.mark_session_dirty();
                 // A sort covers the whole list, so the rest must load.
                 app.actions.push(Action::LoadMore(table.page.clone()));
             }
             None => {
                 app.table_sorts.remove(&table.page);
+                app.mark_session_dirty();
             }
         }
     }
-    // What is displayed is what plays: a sorted view plays in its own
-    // order, as a plain list of tracks, and its rows cannot edit server
-    // positions that no longer match the screen.
-    let context = if sort.is_some() {
-        RowContext::Uris(
-            visible
-                .iter()
-                .map(|&index| table.items[index].0.uri().to_string())
-                .collect(),
-        )
+    // A transformed view plays exactly what is on screen and cannot edit
+    // server positions that no longer correspond to its row indices.
+    let view_active = sort.is_some() || !needle.is_empty();
+    let context = if view_active {
+        let uris = visible
+            .iter()
+            .map(|&index| table.items[index].0.uri().to_string())
+            .collect();
+        match &table.context {
+            RowContext::Context { uri, .. } => RowContext::View {
+                uris,
+                context_uri: uri.clone(),
+            },
+            _ => RowContext::Uris(uris),
+        }
     } else {
         table.context.clone()
     };
-    let sorted = sort.is_some();
     widgets::virtual_rows(ui, visible.len(), theme::ROW_HEIGHT, |ui, row| {
         let index = visible[row];
         let (item, added_at, added_by) = &table.items[index];
@@ -386,8 +336,8 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             ui,
             app,
             TrackRow {
-                index: if sorted { row } else { index },
-                number: Some(if sorted { row + 1 } else { index + 1 }),
+                index: if view_active { row } else { index },
+                number: Some(if sort.is_some() { row + 1 } else { index + 1 }),
                 item,
                 context: &context,
                 show_cover: table.show_cover,
@@ -426,6 +376,82 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             table.can_load_more && !table.loading,
         );
     }
+}
+
+/// Indices in the order a table presents them after filtering and sorting.
+fn view_indices(items: &[TableItem], needle: &str, sort: Option<TableSort>) -> Vec<usize> {
+    let mut visible: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, (item, _, _))| {
+            if needle.is_empty() {
+                return true;
+            }
+            let haystack = match item {
+                PlayableItem::Track(track) => format!(
+                    "{} {} {}",
+                    track.name,
+                    track.artist_names(),
+                    track
+                        .album
+                        .as_ref()
+                        .map(|album| album.name.as_str())
+                        .unwrap_or("")
+                ),
+                PlayableItem::Episode(episode) => episode.name.clone(),
+            };
+            haystack.to_lowercase().contains(needle)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if let Some(sort) = sort {
+        let album_of = |item: &PlayableItem| match item {
+            PlayableItem::Track(track) => track
+                .album
+                .as_ref()
+                .map(|album| album.name.to_lowercase())
+                .unwrap_or_default(),
+            PlayableItem::Episode(_) => String::new(),
+        };
+        visible.sort_by(|a, b| {
+            let (item_a, added_a, adder_a) = &items[*a];
+            let (item_b, added_b, adder_b) = &items[*b];
+            let ordering = match sort.column {
+                SortColumn::Title => item_a
+                    .name()
+                    .to_lowercase()
+                    .cmp(&item_b.name().to_lowercase()),
+                SortColumn::Album => album_of(item_a).cmp(&album_of(item_b)),
+                SortColumn::Added => added_a.cmp(added_b),
+                SortColumn::AddedBy => adder_a
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .cmp(&adder_b.as_deref().unwrap_or_default().to_lowercase()),
+                SortColumn::Duration => item_a.duration_ms().cmp(&item_b.duration_ms()),
+                SortColumn::Index => a.cmp(b),
+            };
+            if sort.ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+    }
+    visible
+}
+
+fn view_uris(items: &[TableItem], filter: &str, sort: Option<TableSort>) -> Option<Vec<String>> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() && sort.is_none() {
+        return None;
+    }
+    Some(
+        view_indices(items, &needle, sort)
+            .into_iter()
+            .map(|index| items[index].0.uri().to_string())
+            .collect(),
+    )
 }
 
 fn total_duration(items: &[TableItem]) -> u64 {
@@ -621,12 +647,20 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             );
             let owned = playlist.owned_by(&user_id);
             let saved = app.is_saved(&playlist.uri).unwrap_or(false);
+            let view = view_uris(
+                &items,
+                &page.filter,
+                app.table_sorts
+                    .get(&Page::Playlist(id.to_string()))
+                    .copied(),
+            );
             let playlist_clone = playlist.clone();
             actions_row(
                 app,
                 ui,
                 Actions {
                     play_uri: Some(playlist.uri.clone()),
+                    view,
                     saved: (!owned).then(|| (playlist.uri.clone(), saved)),
                     saved_icons: (Icon::CirclePlus, Icon::CircleCheck),
                     saved_tooltips: ("Add to Your Library", "Remove from Your Library"),
@@ -680,20 +714,6 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &str) {
     match &page.album {
         Loadable::Loaded(album) => {
             album_hero(app, ui, album, &page.tracks);
-            let saved = app.is_saved(&album.uri).unwrap_or(false);
-            actions_row(
-                app,
-                ui,
-                Actions {
-                    play_uri: Some(album.uri.clone()),
-                    saved: Some((album.uri.clone(), saved)),
-                    saved_icons: (Icon::CirclePlus, Icon::CircleCheck),
-                    saved_tooltips: ("Save to Your Library", "Remove from Your Library"),
-                    owned_playlist: None,
-                    name: &album.name,
-                },
-                None,
-            );
             let items: Vec<TableItem> = page
                 .tracks
                 .items
@@ -712,6 +732,26 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     (PlayableItem::Track(track), None, None)
                 })
                 .collect();
+            let saved = app.is_saved(&album.uri).unwrap_or(false);
+            let view = view_uris(
+                &items,
+                "",
+                app.table_sorts.get(&Page::Album(id.to_string())).copied(),
+            );
+            actions_row(
+                app,
+                ui,
+                Actions {
+                    play_uri: Some(album.uri.clone()),
+                    view,
+                    saved: Some((album.uri.clone(), saved)),
+                    saved_icons: (Icon::CirclePlus, Icon::CircleCheck),
+                    saved_tooltips: ("Save to Your Library", "Remove from Your Library"),
+                    owned_playlist: None,
+                    name: &album.name,
+                },
+                None,
+            );
             table(
                 app,
                 ui,
@@ -850,11 +890,17 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
     let mut filter = ui
         .data(|data| data.get_temp::<String>(filter_id))
         .unwrap_or_default();
+    let view = view_uris(
+        &items,
+        &filter,
+        app.table_sorts.get(&Page::LikedSongs).copied(),
+    );
     actions_row(
         app,
         ui,
         Actions {
             play_uri: collection_uri.clone(),
+            view,
             saved: None,
             saved_icons: (Icon::Heart, Icon::HeartFilled),
             saved_tooltips: ("", ""),
@@ -926,6 +972,23 @@ fn palette_of(app: &App) -> Palette {
 mod tests {
     use super::*;
 
+    fn track(name: &str, uri: &str, album: &str, duration_ms: u32) -> TableItem {
+        (
+            PlayableItem::Track(crate::api::models::Track {
+                name: name.into(),
+                uri: uri.into(),
+                duration_ms,
+                album: Some(Album {
+                    name: album.into(),
+                    ..Album::default()
+                }),
+                ..crate::api::models::Track::default()
+            }),
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn matching_copyright_credits_share_one_line() {
         let copyrights = vec![
@@ -945,5 +1008,38 @@ mod tests {
         ];
 
         assert_eq!(copyright_lines(&copyrights), vec!["© ℗ 2026 Example Label"]);
+    }
+
+    #[test]
+    fn filtered_view_keeps_natural_order_and_exact_play_set() {
+        let items = vec![
+            track("First", "spotify:track:1", "Blue", 30),
+            track("Second match", "spotify:track:2", "Red", 20),
+            track("Third match", "spotify:track:3", "Green", 10),
+        ];
+
+        assert_eq!(view_indices(&items, "match", None), vec![1, 2]);
+        assert_eq!(
+            view_uris(&items, "match", None),
+            Some(vec!["spotify:track:2".into(), "spotify:track:3".into()])
+        );
+    }
+
+    #[test]
+    fn index_sort_reverses_the_lists_own_order() {
+        let items = vec![
+            track("One", "spotify:track:1", "A", 10),
+            track("Two", "spotify:track:2", "B", 20),
+            track("Three", "spotify:track:3", "C", 30),
+        ];
+        let reversed = view_indices(
+            &items,
+            "",
+            Some(TableSort {
+                column: SortColumn::Index,
+                ascending: false,
+            }),
+        );
+        assert_eq!(reversed, vec![2, 1, 0]);
     }
 }

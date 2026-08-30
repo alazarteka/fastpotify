@@ -370,19 +370,21 @@ pub struct ShowPage {
 }
 
 /// A table's sort, chosen by clicking a column heading.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TableSort {
     pub column: SortColumn,
     pub ascending: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SortColumn {
     Title,
     Album,
     Added,
     Duration,
     AddedBy,
+    /// The list's own order, reversible from the # heading.
+    Index,
 }
 
 /// One of the things a track row can be part of, for playback context and
@@ -397,6 +399,11 @@ pub enum RowContext {
     },
     /// A loose list of tracks, played as a queue of URIs.
     Uris(Vec<String>),
+    /// A sorted or filtered view whose on-screen order is its play order.
+    View {
+        uris: Vec<String>,
+        context_uri: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -449,6 +456,10 @@ pub enum Action {
     PlayUris {
         uris: Vec<String>,
         index: u32,
+    },
+    PlayView {
+        context_uri: String,
+        uris: Vec<String>,
     },
     PlayFromRow {
         context: RowContext,

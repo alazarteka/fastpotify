@@ -1,7 +1,8 @@
 //! Widgets shared by every view: covers, cards, track rows, menus, sliders.
 
 use egui::{
-    Align, Color32, CornerRadius, Layout, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
+    Align, Color32, CornerRadius, Layout, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2,
+    vec2,
 };
 
 use crate::api::models::*;
@@ -847,6 +848,19 @@ pub fn explicit_badge(ui: &mut Ui, palette: &Palette) {
 /// The header row above a track table.
 /// The column headings above a track table. Answers with the heading that
 /// was clicked, so the table can sort by it.
+fn paint_sort_arrow(ui: &Ui, center: Pos2, ascending: bool, color: Color32) {
+    let (wing, tip) = if ascending { (2.8, -3.2) } else { (-2.8, 3.2) };
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            center + vec2(-4.0, wing),
+            center + vec2(4.0, wing),
+            center + vec2(0.0, tip),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
 #[expect(clippy::fn_params_excessive_bools)]
 pub fn table_header(
     ui: &mut Ui,
@@ -883,23 +897,8 @@ pub fn table_header(
         };
         ui.painter().galley(top_left, galley, color);
         if let Some(sort) = active {
-            // Drawn, not typed: an arrow glyph relies on the loaded fonts
-            // and rendered as a hollow box on some machines.
             let center = pos2(top_left.x + size.x + 8.0, rect.center().y);
-            let (wing, tip) = if sort.ascending {
-                (2.8, -3.2)
-            } else {
-                (-2.8, 3.2)
-            };
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![
-                    center + vec2(-4.0, wing),
-                    center + vec2(4.0, wing),
-                    center + vec2(0.0, tip),
-                ],
-                color,
-                egui::Stroke::NONE,
-            ));
+            paint_sort_arrow(ui, center, sort.ascending, color);
         }
         if response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -908,14 +907,46 @@ pub fn table_header(
             clicked = Some(column);
         }
     };
+    let mut number_clicked = false;
     let mut x = rect.left() + 8.0;
-    ui.painter().text(
-        pos2(x + 22.0, rect.center().y),
-        egui::Align2::CENTER_CENTER,
-        "#",
-        font.clone(),
-        color,
-    );
+    {
+        let number = Rect::from_center_size(pos2(x + 22.0, rect.center().y), vec2(30.0, 22.0));
+        let natural = sort.is_none();
+        let active = sort.filter(|sort| sort.column == SortColumn::Index);
+        let response = ui.interact(number, ui.id().with("table-header-number"), Sense::click());
+        let number_color = if natural || active.is_some() {
+            palette.accent
+        } else if response.hovered() {
+            palette.text
+        } else {
+            color
+        };
+        ui.painter().text(
+            number.center(),
+            egui::Align2::CENTER_CENTER,
+            "#",
+            font.clone(),
+            number_color,
+        );
+        if let Some(ascending) = active
+            .map(|sort| sort.ascending)
+            .or(natural.then_some(true))
+        {
+            paint_sort_arrow(
+                ui,
+                pos2(number.center().x + 12.0, rect.center().y),
+                ascending,
+                number_color,
+            );
+        }
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Reverse or restore the list's own order")
+            .clicked()
+        {
+            number_clicked = true;
+        }
+    }
     x += 44.0;
     if show_cover {
         x += 52.0;
@@ -948,6 +979,9 @@ pub fn table_header(
     if added_width > 0.0 {
         heading(ui, cx, "DATE ADDED", SortColumn::Added);
     }
+    if number_clicked {
+        clicked = Some(SortColumn::Index);
+    }
     let clock = Rect::from_center_size(
         pos2(rect.right() - 36.0 - 56.0 / 2.0 - 6.0, rect.center().y),
         Vec2::splat(15.0),
@@ -966,6 +1000,14 @@ pub fn table_header(
         color
     };
     Icon::Clock.image(clock_color, 15.0).paint_at(ui, clock);
+    if let Some(sort) = sort.filter(|sort| sort.column == SortColumn::Duration) {
+        paint_sort_arrow(
+            ui,
+            pos2(clock.right() + 9.0, rect.center().y),
+            sort.ascending,
+            clock_color,
+        );
+    }
     if response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("Sort by duration")
@@ -1410,5 +1452,64 @@ mod tests {
 
         assert_ne!(first_frame[0], first_frame[1]);
         assert_eq!(first_frame, second_frame);
+    }
+
+    fn table_header_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (Option<crate::model::SortColumn>, Pos2) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(500.0, 120.0))),
+            events,
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let mut origin = Pos2::ZERO;
+        let mut output = ctx.run_ui(input, |ui| {
+            origin = ui.cursor().min;
+            clicked = table_header(ui, &Palette::dark(), false, false, false, false, None);
+        });
+        output.textures_delta.clear();
+        (clicked, origin)
+    }
+
+    #[test]
+    fn number_heading_uses_a_real_click_target() {
+        let ctx = egui::Context::default();
+        let (_, origin) = table_header_frame(&ctx, Vec::new());
+        let pos = origin + vec2(30.0, 17.0);
+        let modifiers = egui::Modifiers::NONE;
+        assert_eq!(
+            table_header_frame(
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                    },
+                ],
+            )
+            .0,
+            None
+        );
+        assert_eq!(
+            table_header_frame(
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers,
+                    },
+                ],
+            )
+            .0,
+            Some(crate::model::SortColumn::Index)
+        );
     }
 }

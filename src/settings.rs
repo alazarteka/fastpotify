@@ -191,6 +191,10 @@ pub struct SessionState {
     pub last_context: Option<String>,
     pub last_track: Option<String>,
     pub last_position_ms: u32,
+    /// Shuffle is a listener mode that carries across playback contexts.
+    pub shuffle_on: bool,
+    /// Each table's chosen sort, keyed by its encoded page.
+    pub sorts: Vec<(String, crate::model::TableSort)>,
 }
 
 impl SessionState {
@@ -239,5 +243,31 @@ mod tests {
         Settings::enforce_external_service_consent(&mut settings);
         assert!(settings.check_for_updates);
         assert!(settings.lrclib_lyrics);
+    }
+
+    #[test]
+    fn older_session_files_default_new_persistence_fields() {
+        let session: SessionState =
+            serde_json::from_str(r#"{"last_page":"home","last_position_ms":1200}"#).unwrap();
+        assert!(!session.shuffle_on);
+        assert!(session.sorts.is_empty());
+    }
+
+    #[test]
+    fn shuffle_and_table_sort_round_trip_together() {
+        let session = SessionState {
+            shuffle_on: true,
+            sorts: vec![(
+                "liked".into(),
+                crate::model::TableSort {
+                    column: crate::model::SortColumn::Index,
+                    ascending: false,
+                },
+            )],
+            ..SessionState::default()
+        };
+        let restored: SessionState =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(restored, session);
     }
 }
