@@ -73,7 +73,7 @@ One readable JSON file, written atomically. The interesting fields:
 | `audio_cache_mb` | `1024` | On-disk audio cache budget |
 | `theme` | `dark` | `dark`, `light`, or `system` |
 | `accent_from_art` | `true` | Tint pages with album art |
-| `keep_playing_in_background` | `true` | Close to tray |
+| `keep_playing_in_background` | `true` | Keep playing after the window closes |
 | `check_for_updates` | `false` | Ask GitHub at most once a day for a newer release |
 | `lrclib_lyrics` | `false` | Ask LRCLIB when Spotify lyrics are unavailable |
 | `external_services_disclosed` | `false` | Records that the external-service choices were made after their disclosure was shown |

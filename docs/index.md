@@ -38,7 +38,7 @@ features:
     details: Pages and the player take their colour from the album art. Light, dark, or follow the system, with the layout you already know from Spotify.
   - icon: ⌨️
     title: Keyboard-first, desktop-native
-    details: Shortcuts for everything, MPRIS media controls on Linux, and a tray that keeps the music playing after you close the window.
+    details: Shortcuts for everything, native media controls, and background playback after you close the window.
   - icon: 🔓
     title: Open source
     details: MIT-licensed Rust on egui and librespot, with an honest write-up of how it talks to Spotify.

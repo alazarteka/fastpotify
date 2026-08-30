@@ -1042,6 +1042,7 @@ impl App {
         };
         for command in commands {
             match command {
+                TrayCommand::Show => self.actions.push(Action::ShowWindow),
                 TrayCommand::ShowHide => self.actions.push(if self.window_hidden {
                     Action::ShowWindow
                 } else {

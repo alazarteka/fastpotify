@@ -70,13 +70,13 @@ Podcasts and tracks nobody has transcribed say so.
 
 ![The lyrics panel beside a playlist, following the song](/assets/images/lyrics.png)
 
-## The tray
+## Closing the window
 
-Closing the window keeps the music playing: Fastpotify stays in the system
-tray with play, pause, skip, and quit in its menu, and clicking the icon
-brings the window back. On Linux it is a standard status-notifier item, so
-it works in any bar that shows tray icons, and MPRIS keeps `playerctl`,
-media keys, and your desktop's players widget working the whole time.
+Closing the window keeps the music playing. On macOS, Fastpotify remains in
+the Dock; click it to recreate the window, and use macOS Now Playing or media
+keys while it is closed. On Linux and Windows it stays in the system tray with
+playback and quit controls. Linux also exposes MPRIS to `playerctl`, media
+keys, and desktop player widgets.
 
 ## One window, one instance
 

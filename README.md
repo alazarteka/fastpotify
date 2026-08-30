@@ -42,12 +42,10 @@ as one ordinary desktop application rather than a shell plugin.
 - **Light and dark**, or follow the system.
 - **Keyboard-first.** Every common action has a shortcut (`Ctrl+/` lists
   them).
-- **Keeps playing when you close the window.** The window closes for real,
-  the music and the process stay in the system tray (Linux status notifier),
-  and clicking the tray, or your desktop's media controls, brings a window
-  back. No compositor-specific tricks, so it behaves the same on any
-  desktop. Quit from the tray menu or `Ctrl+Q`; turn the behaviour off in
-  Settings if you prefer close-to-quit.
+- **Keeps playing when you close the window.** The window closes for real
+  while the music and process stay alive. Reopen it from the Dock on macOS or
+  the system tray on Linux and Windows. Quit with `Cmd+Q` on macOS or from the
+  tray/`Ctrl+Q` elsewhere; Settings can switch to close-to-quit.
 - **Honest about the network.** Pages show spinners while they load, a
   quiet indicator appears in the top bar whenever the app is talking to
   Spotify for more than a moment, and if Spotify asks the app to back off

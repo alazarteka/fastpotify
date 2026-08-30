@@ -305,7 +305,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Keep music playing when the window closes",
-            "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q.",
+            if cfg!(target_os = "macos") {
+                "Fastpotify stays in the Dock. Click it to reopen; quit with Cmd+Q."
+            } else {
+                "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q."
+            },
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.keep_playing_in_background)
                     .changed()

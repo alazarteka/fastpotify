@@ -1,23 +1,23 @@
-//! The tray item on Windows and macOS: the same menu as on Linux, so closing
-//! the window leaves the music playing on every desktop.
+//! Background-window integration for Windows and macOS.
 //!
-//! Windows runs the item on its own thread with a message loop, like the
-//! Linux one. macOS allows status items on the main thread only, and only
-//! while its event loop runs, so there the item is created with the first
-//! window and, while no window exists, the headless loop in `main` pumps
-//! the application's events itself. The app also leaves the Dock while it
-//! is hidden: a Dock icon with no window behind it has nothing to offer, and
-//! the status item is the way back.
+//! Windows runs a tray item on its own thread with a message loop, like Linux.
+//! macOS already has Now Playing and keeps Fastpotify in the Dock, whose reopen
+//! callback recreates a closed window. While no window exists, the headless
+//! loop in `main` pumps AppKit so Dock and media-control events keep working.
 
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+#[cfg(windows)]
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCommand {
+    Show,
     ShowHide,
     PlayPause,
     Next,
@@ -25,14 +25,21 @@ pub enum TrayCommand {
     Quit,
 }
 
+#[cfg(windows)]
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+#[cfg(windows)]
 const SHOW: &str = "show";
+#[cfg(windows)]
 const PLAY_PAUSE: &str = "play-pause";
+#[cfg(windows)]
 const NEXT: &str = "next";
+#[cfg(windows)]
 const PREVIOUS: &str = "previous";
+#[cfg(windows)]
 const QUIT: &str = "quit";
 
+#[cfg(windows)]
 fn command_for(id: &MenuId) -> Option<TrayCommand> {
     match id.0.as_str() {
         SHOW => Some(TrayCommand::ShowHide),
@@ -44,25 +51,23 @@ fn command_for(id: &MenuId) -> Option<TrayCommand> {
     }
 }
 
+#[cfg(windows)]
 fn play_pause_label(playing: bool) -> &'static str {
     if playing { "Pause" } else { "Play" }
 }
 
 /// The item, and the menu entry whose label follows playback.
+#[cfg(windows)]
 struct Item {
     _icon: TrayIcon,
     play_pause: MenuItem,
 }
 
 /// Builds the item on the current thread and routes its events to `sender`.
+#[cfg(windows)]
 fn build(sender: Sender<TrayCommand>, wake: Wake) -> Result<Item, Box<dyn std::error::Error>> {
     let size = 32u32;
-    #[cfg(not(target_os = "macos"))]
     let icon = Icon::from_rgba(crate::util::app_icon_rgba(size as usize), size, size)?;
-    // macOS draws template images itself, black or white to match the menu
-    // bar, so the item looks native in either theme.
-    #[cfg(target_os = "macos")]
-    let icon = Icon::from_rgba(crate::util::tray_template_rgba(size as usize), size, size)?;
     let menu = Menu::new();
     let play_pause = MenuItem::with_id(PLAY_PAUSE, play_pause_label(false), true, None);
     menu.append_items(&[
@@ -78,12 +83,6 @@ fn build(sender: Sender<TrayCommand>, wake: Wake) -> Result<Item, Box<dyn std::e
         .with_icon(icon)
         .with_tooltip("Fastpotify")
         .with_menu(Box::new(menu));
-    // A plain click shows or hides the window on every platform; the menu
-    // stays on right click.
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .with_icon_as_template(true)
-        .with_menu_on_left_click(false);
     let icon = builder.build()?;
 
     let menu_sender = sender.clone();
@@ -229,61 +228,91 @@ pub fn idle(duration: Duration) {
 #[cfg(target_os = "macos")]
 mod host {
     use std::cell::RefCell;
+    use std::ffi::CString;
 
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2::runtime::{AnyClass, AnyObject, Bool, MethodImplementation, Sel};
+    use objc2::{Encode, MainThreadMarker, sel};
+    use objc2_app_kit::{NSApplication, NSEventMask};
     use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
 
     use super::*;
 
     thread_local! {
-        /// The status item, which only the main thread may touch.
-        pub static ITEM: RefCell<Option<Item>> = const { RefCell::new(None) };
+        pub(super) static REOPEN: RefCell<Option<Sender<TrayCommand>>> = const { RefCell::new(None) };
     }
 
-    /// Creates the item, once, on the main thread.
-    pub fn create(sender: Sender<TrayCommand>, wake: Wake, playing: bool) {
-        if MainThreadMarker::new().is_none() {
-            log::warn!("the status item can only be made on the main thread");
+    pub(super) fn request_reopen(has_visible_windows: bool) -> Bool {
+        if !has_visible_windows {
+            REOPEN.with(|slot| {
+                if let Some(sender) = slot.borrow().as_ref() {
+                    let _ = sender.send(TrayCommand::Show);
+                }
+            });
+        }
+        Bool::YES
+    }
+
+    extern "C-unwind" fn application_should_handle_reopen(
+        _delegate: *mut AnyObject,
+        _selector: Sel,
+        _application: *mut NSApplication,
+        has_visible_windows: Bool,
+    ) -> Bool {
+        request_reopen(has_visible_windows.as_bool())
+    }
+
+    fn install_reopen_handler(app: &NSApplication) {
+        let Some(delegate) = app.delegate() else {
+            log::warn!("the macOS application delegate is unavailable");
+            return;
+        };
+        let delegate: &AnyObject = AsRef::<AnyObject>::as_ref(&*delegate);
+        let class = delegate.class();
+        let selector = sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+        if class.responds_to(selector) {
             return;
         }
-        match build(sender, wake) {
-            Ok(item) => {
-                item.play_pause.set_text(play_pause_label(playing));
-                ITEM.with(|slot| *slot.borrow_mut() = Some(item));
-            }
-            Err(error) => log::info!("no status item: {error}"),
+        let implementation: extern "C-unwind" fn(
+            *mut AnyObject,
+            Sel,
+            *mut NSApplication,
+            Bool,
+        ) -> Bool = application_should_handle_reopen;
+        let types = CString::new(format!("{}@:@{}", Bool::ENCODING, Bool::ENCODING))
+            .expect("valid Objective-C type encoding");
+        let installed = unsafe {
+            objc2::ffi::class_addMethod(
+                class as *const AnyClass as *mut AnyClass,
+                selector,
+                implementation.__imp(),
+                types.as_ptr(),
+            )
+        };
+        if !installed.as_bool() {
+            log::warn!("the macOS Dock reopen handler could not be installed");
         }
     }
 
-    pub fn exists() -> bool {
-        ITEM.with(|slot| slot.borrow().is_some())
+    pub fn install(sender: Sender<TrayCommand>) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            log::warn!("the macOS Dock handler can only be made on the main thread");
+            return;
+        };
+        REOPEN.with(|slot| *slot.borrow_mut() = Some(sender));
+        install_reopen_handler(&NSApplication::sharedApplication(mtm));
     }
 
-    pub fn set_playing(playing: bool) {
-        ITEM.with(|slot| {
-            if let Some(item) = slot.borrow().as_ref() {
-                item.play_pause.set_text(play_pause_label(playing));
-            }
-        });
-    }
-
-    /// Regular apps have a Dock icon and a menu bar; accessories have
-    /// neither, which suits an app whose only presence is a status item.
-    pub fn set_activation_policy(policy: NSApplicationActivationPolicy, activate: bool) {
+    pub fn activate() {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
         let app = NSApplication::sharedApplication(mtm);
-        let _ = app.setActivationPolicy(policy);
-        if activate {
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
-        }
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 
-    /// Runs the application's event loop for `duration`, so the status
-    /// item and the media controls keep answering without a window.
+    /// Runs the application's event loop for `duration`, so Dock activation
+    /// and media controls keep answering without a window.
     pub fn pump(duration: Duration) {
         let Some(mtm) = MainThreadMarker::new() else {
             std::thread::sleep(duration);
@@ -311,21 +340,17 @@ mod host {
 #[cfg(target_os = "macos")]
 pub struct TrayService {
     commands: Receiver<TrayCommand>,
-    playing: bool,
-    /// What the item needs, until the first window lets it be made.
-    pending: Option<(Sender<TrayCommand>, Wake)>,
+    /// Installed after AppKit creates its delegate with the first window.
+    pending: Option<Sender<TrayCommand>>,
 }
 
 #[cfg(target_os = "macos")]
 impl TrayService {
-    /// Prepares the item. It is made with the first window, when AppKit's
-    /// event loop is running, which it must be.
-    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Option<Self> {
+    pub fn spawn(_wake: impl Fn() + Send + Sync + 'static) -> Option<Self> {
         let (sender, commands) = std::sync::mpsc::channel();
         Some(Self {
             commands,
-            playing: false,
-            pending: Some((sender, Arc::new(wake))),
+            pending: Some(sender),
         })
     }
 
@@ -333,37 +358,18 @@ impl TrayService {
         self.commands.try_iter().collect()
     }
 
-    /// Keeps the menu's Play/Pause label matching reality.
-    pub fn set_playing(&mut self, playing: bool) {
-        if self.playing != playing {
-            self.playing = playing;
-            host::set_playing(playing);
-        }
-    }
+    pub fn set_playing(&mut self, _playing: bool) {}
 
-    /// A window exists: make the item if this is the first one, and take
-    /// the app's place in the Dock again.
+    /// A window exists: install the Dock callback once and bring the app forward.
     pub fn attach(&mut self) {
-        if let Some((sender, wake)) = self.pending.take() {
-            host::create(sender, wake, self.playing);
+        if let Some(sender) = self.pending.take() {
+            host::install(sender);
         }
-        if host::exists() {
-            host::set_activation_policy(
-                objc2_app_kit::NSApplicationActivationPolicy::Regular,
-                true,
-            );
-        }
+        host::activate();
     }
 
-    /// No window: leave the Dock. The status item is the way back.
-    pub fn hidden(&mut self) {
-        if host::exists() {
-            host::set_activation_policy(
-                objc2_app_kit::NSApplicationActivationPolicy::Accessory,
-                false,
-            );
-        }
-    }
+    /// No window: the Dock icon remains available.
+    pub fn hidden(&mut self) {}
 }
 
 /// Waits while the app lives in the tray without a window, keeping AppKit
@@ -371,4 +377,22 @@ impl TrayService {
 #[cfg(target_os = "macos")]
 pub fn idle(duration: Duration) {
     host::pump(duration);
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_reopen_requests_a_window_only_when_none_is_visible() {
+        let (sender, commands) = std::sync::mpsc::channel();
+        host::REOPEN.with(|slot| *slot.borrow_mut() = Some(sender));
+
+        assert!(host::request_reopen(true).as_bool());
+        assert!(commands.try_recv().is_err());
+
+        assert!(host::request_reopen(false).as_bool());
+        assert_eq!(commands.try_recv(), Ok(TrayCommand::Show));
+        host::REOPEN.with(|slot| *slot.borrow_mut() = None);
+    }
 }

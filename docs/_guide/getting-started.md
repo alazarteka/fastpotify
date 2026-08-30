@@ -68,9 +68,9 @@ speaker.
 
 ## A few things worth knowing on day one
 
-- **Closing the window does not stop the music.** Fastpotify keeps playing
-  from the system tray; reopen it from the tray icon and quit from the tray
-  menu or Ctrl+Q. Settings can turn this off.
+- **Closing the window does not stop the music.** Fastpotify keeps playing;
+  reopen it from the Dock on macOS or the tray elsewhere. Quit with Cmd+Q on
+  macOS or from the tray/Ctrl+Q elsewhere. Settings can turn this off.
 - **Play buttons tell you what is happening.** A pressed play button spins
   until Spotify reacts, so the app is never silently "stuck".
 - **The keyboard does everything.** Space plays and pauses, Ctrl+F or `/`
