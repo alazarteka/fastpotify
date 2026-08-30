@@ -28,7 +28,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 cp "$binary" "$app/Contents/MacOS/fastpotify"
 chmod 755 "$app/Contents/MacOS/fastpotify"
-sed -e "s/__VERSION__/$version/g" \
+sed -e "s/__VERSION__/$RELEASE_NUMERIC_VERSION/g" \
     -e "s/__BUILD__/$RELEASE_NUMERIC_VERSION/g" \
     "$here/Info.plist" > "$app/Contents/Info.plist"
 

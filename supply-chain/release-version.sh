@@ -12,21 +12,40 @@ release_version_parse() {
     fi
 
     local tag="$1"
-    if [ "${#tag}" -gt 65 ] ||
-        [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+    # The numeric core shares Apple's 4/2/2-digit CFBundleVersion limit.
+    local pattern='^v(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)(-[0-9A-Za-z]([0-9A-Za-z-]*[0-9A-Za-z])?(\.[0-9A-Za-z]([0-9A-Za-z-]*[0-9A-Za-z])?)*)?$'
+    if [ "${#tag}" -gt 65 ] || [[ ! "$tag" =~ $pattern ]]; then
         return 1
     fi
 
-    RELEASE_VERSION_TAG="$tag"
-    RELEASE_VERSION="${tag#v}"
-    RELEASE_NUMERIC_VERSION="${RELEASE_VERSION%%-*}"
-    if [[ "$RELEASE_VERSION" == *-* ]]; then
+    local version="${tag#v}"
+    local numeric="${version%%-*}"
+    if [[ "$version" == *-* ]]; then
+        local suffix="${version#*-}"
+        local identifier
+        local -a identifiers
+        IFS='.' read -r -a identifiers <<< "$suffix"
+        for identifier in "${identifiers[@]}"; do
+            if [[ "$identifier" =~ ^[0-9]+$ ]] &&
+                [ "${#identifier}" -gt 1 ] && [[ "$identifier" == 0* ]]; then
+                return 1
+            fi
+            if [[ "$identifier" =~ ^rc([0-9]+)$ ]]; then
+                local rc_number="${BASH_REMATCH[1]}"
+                if [ "${#rc_number}" -gt 1 ] && [[ "$rc_number" == 0* ]]; then
+                    return 1
+                fi
+            fi
+        done
         RELEASE_PRERELEASE=true
         RELEASE_MAKE_LATEST=false
     else
         RELEASE_PRERELEASE=false
         RELEASE_MAKE_LATEST=true
     fi
+    RELEASE_VERSION_TAG="$tag"
+    RELEASE_VERSION="$version"
+    RELEASE_NUMERIC_VERSION="$numeric"
 }
 
 release_version_emit() {

@@ -71,12 +71,15 @@ default:
   User-Agent. Responses are not redirected and are capped at 2 MiB. Decoded
   lyrics also have per-input-line timestamp, total-line, and cumulative-text
   limits so compact LRC input cannot multiply into an unbounded result.
-- **Release checks:** contacts the fixed GitHub API endpoint at most once a
-  day. GitHub receives the connection's IP address, time, and Fastpotify
-  version in the User-Agent. The response is capped at 64 KiB, must name a
-  release-policy `major.minor.patch` version with an optional prerelease
-  suffix, cannot redirect, and cannot choose the release page Fastpotify
-  opens.
+- **Release checks:** contacts one of two fixed GitHub API endpoints at most
+  once a day. Stable builds use GitHub's latest stable release; prerelease
+  builds use a single list of at most 20 releases so they can see later
+  prereleases and the final release. GitHub receives the connection's IP
+  address, time, and Fastpotify version in the User-Agent. The response is
+  capped at 64 KiB; drafts, inconsistent metadata, and tags outside the
+  release-policy `major.minor.patch` grammar with its optional prerelease
+  suffix are ignored. The request cannot redirect or choose the release page
+  Fastpotify opens.
 
 Every artwork request made and decoded by Fastpotify goes through one loader.
 It accepts only HTTPS on port 443 from `scdn.co` or `spotifycdn.com` and their

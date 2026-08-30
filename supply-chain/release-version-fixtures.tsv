@@ -1,0 +1,39 @@
+# kind<TAB>arguments. Tests reject unknown kinds and malformed field counts.
+valid	v0.2.0	0.2.0	false	true
+valid	v0.4.0-rc1	0.4.0	true	false
+valid	v12.34.56-beta.2	12.34.56	true	false
+valid	v9999.99.99-rc99	9999.99.99	true	false
+valid	v1.2.3-alpha-beta.4	1.2.3	true	false
+invalid	0.4.0
+invalid	v0.4
+invalid	v0.4.0.1
+invalid	v00.4.0
+invalid	v0.04.0
+invalid	v0.4.00
+invalid	v10000.0.0
+invalid	v0.100.0
+invalid	v0.0.100
+invalid	v18446744073709551616.0.0
+invalid	v0.4.0-
+invalid	v0.4.0-01
+invalid	v0.4.0-rc01
+invalid	v0.4.0-rc_1
+invalid	v0.4.0--rc1
+invalid	v0.4.0-rc1.
+invalid	v0.4.0-.rc1
+invalid	v0.4.0-rc..1
+invalid	v0.4.0-rc1+
+invalid	v0.4.0+build
+invalid	v0.4.0 rc1
+invalid	 v0.4.0
+order	0.4.0-rc2	0.4.0-rc1	true
+order	0.4.0-rc10	0.4.0-rc2	true
+order	0.4.0	0.4.0-rc10	true
+order	0.5.0-rc1	0.4.0-rc10	true
+order	0.4.0-rc2	0.4.0	false
+order	0.5.0-rc1	0.4.0	false
+order	0.4.0-rc1	0.4.0-rc1	false
+order	0.4.0-beta.10	0.4.0-beta.2	true
+order	0.3.9	0.4.0-rc1	false
+channel	0.4.0	stable
+channel	0.4.0-rc1	prerelease
