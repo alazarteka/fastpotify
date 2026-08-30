@@ -47,49 +47,64 @@ struct Entry {
     owned: bool,
     editable: bool,
     playlist_index: Option<usize>,
+    pin_rank: Option<usize>,
 }
 
-struct PinRanks<'a> {
-    first: HashMap<&'a str, usize>,
+impl Entry {
+    fn is_pinned(&self) -> bool {
+        self.pin_rank.is_some()
+    }
 }
 
-impl<'a> PinRanks<'a> {
+struct SidebarPreparation<'a> {
+    pin_ranks: HashMap<&'a str, usize>,
+}
+
+impl<'a> SidebarPreparation<'a> {
     fn new(pinned: &'a [String]) -> Self {
-        let mut first = HashMap::with_capacity(pinned.len());
+        let mut pin_ranks = HashMap::with_capacity(pinned.len());
         for (index, uri) in pinned.iter().enumerate() {
-            first.entry(uri.as_str()).or_insert(index);
+            pin_ranks.entry(uri.as_str()).or_insert(index);
         }
-        Self { first }
+        Self { pin_ranks }
     }
 
-    fn get(&self, uri: &str) -> Option<usize> {
-        self.first.get(uri).copied()
+    fn playlist_indices(&self, uris: &[&str], recent: &[String], custom: &[String]) -> Vec<usize> {
+        playlist_sidebar_indices(uris, recent, &self.pin_ranks, custom)
     }
-}
 
-/// Applies the ordering metadata consumed by the rendered sidebar list.
-fn prepare_entries(
-    entries: &mut [Entry],
-    filter: Filter,
-    pin_ranks: &PinRanks<'_>,
-) -> (usize, usize) {
-    // Non-playlist shelves have only the global pin order. Playlist ordering
-    // already came from the shared pin/recency/custom policy.
-    if filter != Filter::Playlists {
-        entries.sort_by_key(|entry| {
-            if entry.liked {
-                (0, 0)
+    fn unpinned_playlist_indices(&self, uris: &[&str], mut indices: Vec<usize>) -> Vec<usize> {
+        indices.retain(|index| !self.pin_ranks.contains_key(uris[*index]));
+        indices
+    }
+
+    /// Applies the ordering metadata consumed by row rendering and menus.
+    fn prepare_entries(&self, entries: &mut [Entry], filter: Filter) -> (usize, usize) {
+        for entry in entries.iter_mut() {
+            entry.pin_rank = if entry.liked {
+                None
             } else {
-                pin_ranks.get(&entry.uri).map_or((2, 0), |rank| (1, rank))
-            }
-        });
+                self.pin_ranks.get(entry.uri.as_str()).copied()
+            };
+        }
+        // Non-playlist shelves have only the global pin order. Playlist ordering
+        // already came from the shared pin/recency/custom policy.
+        if filter != Filter::Playlists {
+            entries.sort_by_key(|entry| {
+                if entry.liked {
+                    (0, 0)
+                } else {
+                    entry.pin_rank.map_or((2, 0), |rank| (1, rank))
+                }
+            });
+        }
+        let liked_rows = entries.iter().take_while(|entry| entry.liked).count();
+        let pinned_rows = entries
+            .iter()
+            .filter(|entry| !entry.liked && entry.is_pinned())
+            .count();
+        (liked_rows, pinned_rows)
     }
-    let liked_rows = entries.iter().take_while(|entry| entry.liked).count();
-    let pinned_rows = entries
-        .iter()
-        .filter(|entry| !entry.liked && pin_ranks.get(&entry.uri).is_some())
-        .count();
-    (liked_rows, pinned_rows)
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -285,7 +300,9 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
 
     let needle = app.library.filter.trim().to_lowercase();
     let user_id = app.user_id().unwrap_or("").to_string();
+    let preparation = SidebarPreparation::new(&app.settings.pinned_contexts);
     let mut entries: Vec<Entry> = Vec::new();
+    let mut full_playlist_indices = Vec::new();
     let mut loading = false;
     let mut error: Option<String> = None;
     let mut more_page: Option<Page> = None;
@@ -306,6 +323,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     owned: false,
                     editable: false,
                     playlist_index: None,
+                    pin_rank: None,
                 });
             }
             match &app.library.playlists {
@@ -314,12 +332,12 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                         .iter()
                         .map(|playlist| playlist.uri.as_str())
                         .collect();
-                    for index in playlist_sidebar_indices(
+                    let indices = preparation.playlist_indices(
                         &uris,
                         &app.recent_contexts,
-                        &app.settings.pinned_contexts,
                         &app.settings.sidebar_order,
-                    ) {
+                    );
+                    for &index in &indices {
                         let playlist = &playlists[index];
                         if !needle.is_empty() && !playlist.name.to_lowercase().contains(&needle) {
                             continue;
@@ -338,8 +356,10 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             owned,
                             editable,
                             playlist_index: Some(index),
+                            pin_rank: None,
                         });
                     }
+                    full_playlist_indices = preparation.unpinned_playlist_indices(&uris, indices);
                 }
                 Loadable::Loading | Loadable::NotLoaded => loading = true,
                 Loadable::Failed(message) => error = Some(message.clone()),
@@ -374,6 +394,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     owned: false,
                     editable: false,
                     playlist_index: None,
+                    pin_rank: None,
                 });
             }
             loading = app.library.albums.loading && app.library.albums.items.is_empty();
@@ -398,6 +419,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     owned: false,
                     editable: false,
                     playlist_index: None,
+                    pin_rank: None,
                 });
             }
             loading = app.library.artists.loading && app.library.artists.items.is_empty();
@@ -423,6 +445,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     owned: false,
                     editable: false,
                     playlist_index: None,
+                    pin_rank: None,
                 });
             }
             loading = app.library.shows.loading && app.library.shows.items.is_empty();
@@ -434,8 +457,8 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let custom_order = filter == Filter::Playlists && !app.settings.sidebar_order.is_empty();
-    let pin_ranks = PinRanks::new(&app.settings.pinned_contexts);
-    let (liked_rows, pinned_rows) = prepare_entries(&mut entries, filter, &pin_ranks);
+    let (liked_rows, pinned_rows) = preparation.prepare_entries(&mut entries, filter);
+    drop(preparation);
     let playing_context = app.playing_context_uri();
     let current_page = app.page().clone();
 
@@ -491,8 +514,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 let active = entry.page == current_page;
                 let playing =
                     !entry.uri.is_empty() && playing_context.as_deref() == Some(entry.uri.as_str());
-                let pinned =
-                    !entry.uri.is_empty() && app.settings.pinned_contexts.contains(&entry.uri);
+                let pinned = entry.is_pinned();
                 let (rect, response) = ui.allocate_exact_size(
                     vec2(ui.available_width(), ROW_HEIGHT),
                     Sense::click_and_drag(),
@@ -528,6 +550,10 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     data.insert_temp(
                         egui::Id::new(("sidebar-row-test-rect", entry.page.clone())),
                         rect,
+                    );
+                    data.insert_temp(
+                        egui::Id::new(("sidebar-row-test-pinned", entry.page.clone())),
+                        pinned,
                     );
                 });
                 if ui.is_rect_visible(rect) {
@@ -710,7 +736,6 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 &entry.name,
                                 owned_playlist.as_ref(),
                             );
-                            let pinned = app.settings.pinned_contexts.contains(&entry.uri);
                             if super::widgets::menu_item(
                                 ui,
                                 &palette,
@@ -777,7 +802,16 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                         entries.iter().map(|entry| entry.uri.clone()).collect();
                     let changed = match filter {
                         Filter::Playlists => {
-                            let full_order = full_playlist_order(app);
+                            let full_order =
+                                app.library
+                                    .playlists
+                                    .get()
+                                    .map_or_else(Vec::new, |playlists| {
+                                        full_playlist_indices
+                                            .iter()
+                                            .map(|index| playlists[*index].uri.clone())
+                                            .collect()
+                                    });
                             drop_playlist_context(
                                 &mut app.settings.pinned_contexts,
                                 &mut app.settings.sidebar_order,
@@ -815,26 +849,9 @@ pub(crate) fn row_rect(ctx: &egui::Context, page: &Page) -> Option<Rect> {
     ctx.data(|data| data.get_temp(egui::Id::new(("sidebar-row-test-rect", page.clone()))))
 }
 
-/// Every loaded playlist in the order the complete, unfiltered shelf uses.
-/// Pinned contexts are excluded because they live in their own list.
-fn full_playlist_order(app: &App) -> Vec<String> {
-    let Some(playlists) = app.library.playlists.get() else {
-        return Vec::new();
-    };
-    let uris: Vec<&str> = playlists
-        .iter()
-        .map(|playlist| playlist.uri.as_str())
-        .collect();
-    playlist_sidebar_indices(
-        &uris,
-        &app.recent_contexts,
-        &app.settings.pinned_contexts,
-        &app.settings.sidebar_order,
-    )
-    .into_iter()
-    .map(|index| playlists[index].uri.clone())
-    .filter(|uri| !app.settings.pinned_contexts.contains(uri))
-    .collect()
+#[cfg(test)]
+pub(crate) fn row_pinned(ctx: &egui::Context, page: &Page) -> Option<bool> {
+    ctx.data(|data| data.get_temp(egui::Id::new(("sidebar-row-test-pinned", page.clone()))))
 }
 
 /// The purple-to-blue Liked Songs tile.
@@ -909,11 +926,12 @@ mod tests {
             owned: false,
             editable: false,
             playlist_index: None,
+            pin_rank: None,
         }
     }
 
     #[test]
-    fn actual_sidebar_preparation_reuses_first_pin_ranks_at_scale() {
+    fn actual_sidebar_row_and_menu_preparation_reuses_large_first_pin_map() {
         let mut entries: Vec<_> = (0..4_000)
             .map(|index| {
                 entry(
@@ -924,16 +942,17 @@ mod tests {
             })
             .collect();
         entries.push(entry("liked", "", true));
-        let pinned = vec![
-            "spotify:album:unknown".into(),
-            "spotify:album:3000".into(),
-            "spotify:album:3000".into(),
-            "spotify:album:deleted".into(),
-            "spotify:album:1000".into(),
-        ];
-        let ranks = PinRanks::new(&pinned);
+        let mut pinned: Vec<String> = (0..4_000)
+            .map(|index| format!("spotify:album:deleted-{index}"))
+            .collect();
+        pinned[17] = "spotify:album:3000".into();
+        pinned[201] = "spotify:album:3000".into();
+        pinned[3_999] = "spotify:album:1000".into();
+        let preparation = SidebarPreparation::new(&pinned);
 
-        let (liked_rows, pinned_rows) = prepare_entries(&mut entries, Filter::Albums, &ranks);
+        let (liked_rows, pinned_rows) = preparation.prepare_entries(&mut entries, Filter::Albums);
+        drop(preparation);
+        drop(pinned);
 
         assert_eq!((liked_rows, pinned_rows), (1, 2));
         let mut expected = vec!["liked".to_string(), "item-3000".into(), "item-1000".into()];
@@ -949,32 +968,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+        assert!(!entries[0].is_pinned());
+        assert!(entries[1].is_pinned());
+        assert!(entries[2].is_pinned());
+        assert!(entries[3..].iter().all(|entry| !entry.is_pinned()));
     }
 
     #[test]
-    fn playlist_shelf_preparation_counts_pins_without_reordering_its_policy() {
-        let mut entries = vec![
-            entry("second", "spotify:playlist:second", false),
-            entry("first", "spotify:playlist:first", false),
-            entry("third", "spotify:playlist:third", false),
+    fn playlist_render_and_drop_preparation_share_pin_ranks_and_full_order() {
+        let uris = [
+            "spotify:playlist:p1",
+            "spotify:playlist:p2",
+            "spotify:playlist:p3",
+            "spotify:playlist:new",
+            "spotify:playlist:p4",
         ];
         let pinned = vec![
-            "spotify:playlist:missing".into(),
-            "spotify:playlist:first".into(),
-            "spotify:playlist:first".into(),
+            "spotify:playlist:deleted".into(),
+            "spotify:playlist:p2".into(),
+            "spotify:playlist:p2".into(),
+            "spotify:playlist:unknown".into(),
+            "spotify:playlist:p4".into(),
         ];
-        let ranks = PinRanks::new(&pinned);
+        let recent = vec!["spotify:playlist:p3".into()];
+        let custom = vec![
+            "spotify:playlist:gone".into(),
+            "spotify:playlist:p1".into(),
+            "spotify:playlist:p1".into(),
+            "spotify:playlist:p3".into(),
+        ];
+        let preparation = SidebarPreparation::new(&pinned);
+        let indices = preparation.playlist_indices(&uris, &recent, &custom);
+        let mut entries = vec![entry("liked", "", true)];
+        entries.extend(
+            indices
+                .iter()
+                .map(|index| entry(uris[*index], uris[*index], false)),
+        );
+        let full_playlist_indices = preparation.unpinned_playlist_indices(&uris, indices);
+        let full_order: Vec<_> = full_playlist_indices
+            .iter()
+            .map(|index| uris[*index])
+            .collect();
 
         assert_eq!(
-            prepare_entries(&mut entries, Filter::Playlists, &ranks),
-            (0, 1)
+            preparation.prepare_entries(&mut entries, Filter::Playlists),
+            (1, 2)
         );
+        drop(preparation);
+        drop(pinned);
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.name.as_str())
                 .collect::<Vec<_>>(),
-            ["second", "first", "third"]
+            [
+                "liked",
+                "spotify:playlist:p2",
+                "spotify:playlist:p4",
+                "spotify:playlist:new",
+                "spotify:playlist:p1",
+                "spotify:playlist:p3",
+            ]
+        );
+        assert_eq!(
+            entries.iter().map(Entry::is_pinned).collect::<Vec<_>>(),
+            [false, true, true, false, false, false]
+        );
+        assert_eq!(
+            full_order,
+            [
+                "spotify:playlist:new",
+                "spotify:playlist:p1",
+                "spotify:playlist:p3",
+            ]
         );
     }
 }

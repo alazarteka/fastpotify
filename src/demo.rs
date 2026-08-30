@@ -1211,6 +1211,16 @@ mod tests {
     fn sidebar_playlist_drop_persists_complete_music_only_order() {
         let (ctx, mut app) = demo_app("drop-sidebar-order-test");
         assert!(app.settings.sidebar_order.is_empty());
+        app.settings.pinned_contexts = (0..4_000)
+            .map(|index| format!("spotify:playlist:deleted-{index}"))
+            .collect();
+        app.settings.pinned_contexts[17] = "spotify:playlist:pl3".into();
+        app.settings.pinned_contexts[201] = "spotify:playlist:pl3".into();
+        frame(&ctx, &mut app);
+        assert_eq!(
+            crate::ui::sidebar::row_pinned(&ctx, &Page::Playlist("pl3".into())),
+            Some(true)
+        );
         app.backend.take_api_requests();
 
         let mut target = None;
@@ -1231,11 +1241,17 @@ mod tests {
             }
         }
         let target = target.expect("no drop position reached the unpinned playlist shelf");
-        assert_eq!(app.settings.sidebar_order.len(), PLAYLISTS.len());
+        assert_eq!(app.settings.sidebar_order.len(), PLAYLISTS.len() - 1);
+        assert!(
+            !app.settings
+                .sidebar_order
+                .iter()
+                .any(|uri| uri == "spotify:playlist:pl3")
+        );
         let mut unique = app.settings.sidebar_order.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), PLAYLISTS.len());
+        assert_eq!(unique.len(), PLAYLISTS.len() - 1);
         assert!(app.backend.take_api_requests().is_empty());
 
         let before = app.settings.sidebar_order.clone();

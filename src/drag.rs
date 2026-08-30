@@ -290,10 +290,11 @@ pub fn valid_playlist_identity(uri: &str, playlist_id: &str) -> bool {
 /// Orders one complete playlist library for the sidebar. Pins always lead;
 /// without a custom order the remainder follows recency, while a custom
 /// order keeps newly discovered playlists between pins and its saved rows.
+/// The caller supplies the frame's precomputed first-occurrence pin ranks.
 pub fn playlist_sidebar_indices(
     uris: &[&str],
     recent: &[String],
-    pinned: &[String],
+    pinned: &HashMap<&str, usize>,
     custom: &[String],
 ) -> Vec<usize> {
     fn first_ranks(values: &[String]) -> HashMap<&str, usize> {
@@ -304,7 +305,6 @@ pub fn playlist_sidebar_indices(
         ranks
     }
     let recent = first_ranks(recent);
-    let pinned = first_ranks(pinned);
     let custom = first_ranks(custom);
     let has_custom_order = !custom.is_empty();
     let mut indices: Vec<usize> = (0..uris.len()).collect();
@@ -564,7 +564,7 @@ mod tests {
     fn playlist_sidebar_order_has_one_pin_recency_and_custom_policy() {
         let uris = ["p1", "p2", "p3", "new"];
         let recent = vec!["p3".into(), "p1".into()];
-        let pinned = vec!["p2".into()];
+        let pinned = HashMap::from([("p2", 0)]);
         assert_eq!(
             playlist_sidebar_indices(&uris, &recent, &pinned, &[]),
             vec![1, 2, 0, 3]
@@ -618,7 +618,7 @@ mod tests {
         let uris: Vec<String> = (0..4_000).map(|index| format!("p{index}")).collect();
         let refs: Vec<&str> = uris.iter().map(String::as_str).collect();
         let recent = vec!["p3000".into(), "p3000".into(), "deleted".into()];
-        let pinned = vec!["p3999".into(), "p3999".into(), "missing".into()];
+        let pinned = HashMap::from([("p3999", 0), ("missing", 2)]);
         let custom = vec![
             "unknown".into(),
             "p2000".into(),
