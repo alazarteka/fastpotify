@@ -144,6 +144,8 @@ pub struct App {
     pub settings: Settings,
     settings_dirty: bool,
     last_settings_save: Instant,
+    session_dirty: bool,
+    last_session_save: Instant,
     pub backend: Backend,
     media_controls: Option<MediaService>,
     tray: Option<TrayService>,
@@ -332,6 +334,8 @@ impl App {
             settings,
             settings_dirty: false,
             last_settings_save: Instant::now(),
+            session_dirty: false,
+            last_session_save: Instant::now(),
             backend,
             media_controls,
             tray,
@@ -938,6 +942,7 @@ impl App {
         self.resume_context = self.playing_context_uri();
         self.resume_track = Some(now.uri.clone());
         self.resume_position_ms = 0;
+        self.mark_session_dirty();
         if now.local
             && !now.is_episode
             && let Some(id) = &now.id
@@ -1057,11 +1062,20 @@ impl App {
         if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
             self.save_settings();
         }
+        self.update_resume_point(false);
+        if self.session_dirty && self.last_session_save.elapsed() > Duration::from_secs(2) {
+            self.save_session();
+        }
     }
 
     /// Note that a setting changed, so the file is saved shortly.
     pub fn mark_settings_dirty(&mut self) {
         self.settings_dirty = true;
+    }
+
+    /// Note that restorable UI or playback state changed.
+    pub fn mark_session_dirty(&mut self) {
+        self.session_dirty = true;
     }
 
     fn save_settings(&mut self) {
@@ -2392,6 +2406,7 @@ impl App {
             self.history.remove(0);
         }
         self.history_index = self.history.len() - 1;
+        self.mark_session_dirty();
         self.show_devices = false;
         self.ensure_loaded(page);
     }
@@ -2430,9 +2445,13 @@ impl App {
         if !uri.contains(":playlist:") && !uri.contains(":album:") && !uri.contains(":collection") {
             return;
         }
+        if self.recent_contexts.first().is_some_and(|held| held == uri) {
+            return;
+        }
         self.recent_contexts.retain(|held| held != uri);
         self.recent_contexts.insert(0, uri.to_string());
         self.recent_contexts.truncate(60);
+        self.mark_session_dirty();
     }
 
     /// With `shuffle_first`, shuffle is turned on before playback starts,
@@ -2881,6 +2900,7 @@ impl App {
             Action::Back => {
                 if self.can_go_back() {
                     self.history_index -= 1;
+                    self.mark_session_dirty();
                     let page = self.page().clone();
                     self.ensure_loaded(page);
                 }
@@ -2888,6 +2908,7 @@ impl App {
             Action::Forward => {
                 if self.can_go_forward() {
                     self.history_index += 1;
+                    self.mark_session_dirty();
                     let page = self.page().clone();
                     self.ensure_loaded(page);
                 }
@@ -3167,6 +3188,7 @@ impl App {
                 self.backend.send(Command::SignOut);
                 self.history = vec![Page::Home];
                 self.history_index = 0;
+                self.mark_session_dirty();
             }
             Action::ToggleQueuePanel => {
                 self.show_queue_panel = !self.show_queue_panel;
@@ -3455,11 +3477,31 @@ impl App {
     /// Persist state when a window closes (to the tray or for good).
     pub fn save_state(&mut self) {
         self.save_settings();
-        if let Some(now) = self.now_playing() {
-            self.resume_context = self.playing_context_uri();
-            self.resume_track = Some(now.uri.clone());
-            self.resume_position_ms = now.position_ms;
+        self.save_session();
+    }
+
+    fn update_resume_point(&mut self, force: bool) {
+        let Some(now) = self.now_playing() else {
+            return;
+        };
+        let context = self.playing_context_uri();
+        let changed = force
+            || self.resume_context != context
+            || self.resume_track.as_deref() != Some(now.uri.as_str())
+            || self.resume_position_ms.abs_diff(now.position_ms) >= 5_000;
+        if !changed {
+            return;
         }
+        self.resume_context = context;
+        self.resume_track = Some(now.uri);
+        self.resume_position_ms = now.position_ms;
+        self.mark_session_dirty();
+    }
+
+    fn save_session(&mut self) {
+        self.update_resume_point(true);
+        self.session_dirty = false;
+        self.last_session_save = Instant::now();
         if !self.offline {
             SessionState {
                 last_page: Some(self.page().encode()),

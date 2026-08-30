@@ -2,10 +2,52 @@
 
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
+
+fn load_private_json<T>(path: &Path, max_bytes: usize, kind: &str) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    match crate::secrets::read_private_bounded(path, max_bytes) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            log::warn!("{kind} at {} is unreadable: {error}", path.display());
+            T::default()
+        }),
+        Ok(None) => T::default(),
+        Err(error) => {
+            log::warn!(
+                "{kind} at {} could not be read safely: {error}",
+                path.display()
+            );
+            T::default()
+        }
+    }
+}
+
+fn save_private_json<T>(value: &T, path: &Path, kind: &str, pretty: bool)
+where
+    T: Serialize,
+{
+    let bytes = if pretty {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!("unable to encode {kind}: {error}");
+            return;
+        }
+    };
+    if let Err(error) = crate::secrets::write_private_atomic(path, &bytes) {
+        log::warn!("unable to save {kind} to {}: {error}", path.display());
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,26 +143,9 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> Self {
-        match crate::secrets::read_private_bounded(path, MAX_SETTINGS_BYTES) {
-            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-                Ok(mut settings) => {
-                    Self::enforce_external_service_consent(&mut settings);
-                    settings
-                }
-                Err(error) => {
-                    log::warn!("settings at {} are unreadable: {error}", path.display());
-                    Self::default()
-                }
-            },
-            Ok(None) => Self::default(),
-            Err(error) => {
-                log::warn!(
-                    "settings at {} could not be read safely: {error}",
-                    path.display()
-                );
-                Self::default()
-            }
-        }
+        let mut settings = load_private_json(path, MAX_SETTINGS_BYTES, "settings");
+        Self::enforce_external_service_consent(&mut settings);
+        settings
     }
 
     fn enforce_external_service_consent(settings: &mut Self) {
@@ -131,16 +156,7 @@ impl Settings {
     }
 
     pub fn save(&self, path: &Path) {
-        let text = match serde_json::to_string_pretty(self) {
-            Ok(text) => text,
-            Err(error) => {
-                log::warn!("unable to encode settings: {error}");
-                return;
-            }
-        };
-        if let Err(error) = crate::secrets::write_private_atomic(path, text.as_bytes()) {
-            log::warn!("unable to save settings to {}: {error}", path.display());
-        }
+        save_private_json(self, path, "settings", true);
     }
 
     pub fn platform_backend(&self) -> Option<String> {
@@ -179,17 +195,11 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn load(path: &Path) -> Self {
-        crate::secrets::read_private_bounded(path, MAX_SESSION_BYTES)
-            .ok()
-            .flatten()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        load_private_json(path, MAX_SESSION_BYTES, "session")
     }
 
     pub fn save(&self, path: &Path) {
-        if let Ok(bytes) = serde_json::to_vec(self) {
-            let _ = crate::secrets::write_private_atomic(path, &bytes);
-        }
+        save_private_json(self, path, "session", false);
     }
 }
 
