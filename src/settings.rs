@@ -1,9 +1,10 @@
 //! User preferences, stored as one readable JSON file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_BYTES: usize = 1024 * 1024;
@@ -41,7 +42,36 @@ where
     }
 }
 
-fn save_private_json<T>(value: &T, path: &Path, kind: &str, pretty: bool)
+#[derive(Debug, Error)]
+pub enum SaveError {
+    #[error("unable to encode {kind}: {source}")]
+    Encode {
+        kind: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("refusing to save {kind}: encoded data is {actual} bytes (limit {limit})")]
+    TooLarge {
+        kind: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+    #[error("unable to save {kind} to {path}: {source}")]
+    Write {
+        kind: &'static str,
+        path: PathBuf,
+        #[source]
+        source: crate::secrets::SecretError,
+    },
+}
+
+fn save_private_json<T>(
+    value: &T,
+    path: &Path,
+    max_bytes: usize,
+    kind: &'static str,
+    pretty: bool,
+) -> Result<(), SaveError>
 where
     T: Serialize,
 {
@@ -49,17 +79,20 @@ where
         serde_json::to_vec_pretty(value)
     } else {
         serde_json::to_vec(value)
-    };
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            log::warn!("unable to encode {kind}: {error}");
-            return;
-        }
-    };
-    if let Err(error) = crate::secrets::write_private_atomic(path, &bytes) {
-        log::warn!("unable to save {kind} to {}: {error}", path.display());
     }
+    .map_err(|source| SaveError::Encode { kind, source })?;
+    if bytes.len() > max_bytes {
+        return Err(SaveError::TooLarge {
+            kind,
+            actual: bytes.len(),
+            limit: max_bytes,
+        });
+    }
+    crate::secrets::write_private_atomic(path, &bytes).map_err(|source| SaveError::Write {
+        kind,
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,8 +234,8 @@ impl Settings {
         }
     }
 
-    pub fn save(&self, path: &Path) {
-        save_private_json(self, path, "settings", true);
+    pub fn save(&self, path: &Path) -> Result<(), SaveError> {
+        save_private_json(self, path, MAX_SETTINGS_BYTES, "settings", true)
     }
 
     pub fn platform_backend(&self) -> Option<String> {
@@ -262,14 +295,31 @@ impl SessionState {
         load_private_json(path, MAX_SESSION_BYTES, "session")
     }
 
-    pub fn save(&self, path: &Path) {
-        save_private_json(self, path, "session", false);
+    pub fn save(&self, path: &Path) -> Result<(), SaveError> {
+        save_private_json(self, path, MAX_SESSION_BYTES, "session", false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_test_file(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "fastpotify-settings-test-{}-{started}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join(name)
+    }
 
     #[test]
     fn external_services_are_off_by_default() {
@@ -361,5 +411,37 @@ mod tests {
         let restored: SessionState =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
         assert_eq!(restored, session);
+    }
+
+    #[test]
+    fn oversized_session_is_rejected_without_replacing_valid_state() {
+        let path = private_test_file("session.json");
+        let valid = SessionState {
+            last_page: Some("home".into()),
+            ..SessionState::default()
+        };
+        valid.save(&path).expect("write valid session");
+        let before = std::fs::read(&path).expect("read valid session");
+
+        let oversized = SessionState {
+            recent_contexts: vec!["x".repeat(MAX_SESSION_BYTES + 1)],
+            ..valid
+        };
+        let error = oversized.save(&path).expect_err("reject oversized state");
+
+        assert!(matches!(
+            error,
+            SaveError::TooLarge {
+                kind: "session",
+                limit: MAX_SESSION_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved session"),
+            before
+        );
+        let root = path.parent().expect("test directory");
+        std::fs::remove_dir_all(root).expect("remove test directory");
     }
 }

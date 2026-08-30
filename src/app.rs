@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use egui::Color32;
-use rand::Rng as _;
 use rand::seq::IndexedRandom;
 
 use crate::api::PlayRequest;
@@ -20,7 +19,7 @@ use crate::media_controls::MediaService;
 use crate::model::*;
 use crate::paths::AppDirs;
 use crate::player::{EngineConfig, LoadSpec, LocalState, Playback, PlayerCommand, RepeatMode};
-use crate::settings::{SessionState, Settings, ThemeChoice};
+use crate::settings::{SaveError, SessionState, Settings, ThemeChoice};
 use crate::single_instance::ControlCommand;
 use crate::theme::{self, Palette};
 use crate::tray::{TrayCommand, TrayService};
@@ -47,10 +46,15 @@ const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
 /// waiting for the ordinary poll.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
 const CONTAINS_BATCH: usize = 50;
+const STATE_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+const STATE_SAVE_RETRY: Duration = Duration::from_secs(30);
+const RESUME_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(120);
+const SHUFFLE_INTENT_HOLD: Duration = Duration::from_secs(5);
+const MAX_PLAY_URIS: usize = 500;
 const WINDOW_MIN_SIZE: [f32; 2] = [400.0, 300.0];
-const WINDOW_MAX_SIZE: [f32; 2] = [3000.0, 2000.0];
-const WINDOW_POSITION_MIN: f32 = -1000.0;
-const WINDOW_POSITION_MAX: f32 = 5000.0;
+const WINDOW_MAX_SIZE: [f32; 2] = [16_384.0, 8_640.0];
+const WINDOW_POSITION_MIN: f32 = -32_768.0;
+const WINDOW_POSITION_MAX: f32 = 32_768.0;
 
 fn valid_window_size(size: [f32; 2]) -> bool {
     (WINDOW_MIN_SIZE[0]..=WINDOW_MAX_SIZE[0]).contains(&size[0])
@@ -66,6 +70,39 @@ fn geometry_changed(previous: Option<[f32; 2]>, current: [f32; 2]) -> bool {
     previous.is_none_or(|previous| {
         (previous[0] - current[0]).abs() > 1.0 || (previous[1] - current[1]).abs() > 1.0
     })
+}
+
+fn state_save_due(dirty: bool, retrying: bool, last_attempt: Instant, now: Instant) -> bool {
+    state_save_wait(dirty, retrying, last_attempt, now) == Some(Duration::ZERO)
+}
+
+fn state_save_wait(
+    dirty: bool,
+    retrying: bool,
+    last_attempt: Instant,
+    now: Instant,
+) -> Option<Duration> {
+    dirty.then(|| {
+        let interval = if retrying {
+            STATE_SAVE_RETRY
+        } else {
+            STATE_SAVE_DEBOUNCE
+        };
+        interval.saturating_sub(now.saturating_duration_since(last_attempt))
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StateSaveError {
+    #[error("settings save failed: {0}")]
+    Settings(Box<SaveError>),
+    #[error("session save failed: {0}")]
+    Session(Box<SaveError>),
+    #[error("settings save failed: {settings}; session save failed: {session}")]
+    Both {
+        settings: Box<SaveError>,
+        session: Box<SaveError>,
+    },
 }
 
 pub struct RemoteSnapshot {
@@ -140,6 +177,13 @@ pub enum Target {
     Remote(Option<String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShuffleDispatch {
+    Deferred,
+    Local,
+    Remote,
+}
+
 /// How the application is being started.
 #[derive(Clone, Copy, Debug)]
 pub struct AppOptions {
@@ -162,9 +206,11 @@ pub struct App {
     pub dirs: AppDirs,
     pub settings: Settings,
     settings_dirty: bool,
-    last_settings_save: Instant,
+    settings_save_retrying: bool,
+    last_settings_save_attempt: Instant,
     session_dirty: bool,
-    last_session_save: Instant,
+    session_save_retrying: bool,
+    last_session_save_attempt: Instant,
     pub backend: Backend,
     media_controls: Option<MediaService>,
     tray: Option<TrayService>,
@@ -305,6 +351,7 @@ pub struct App {
     resume_context: Option<String>,
     resume_track: Option<String>,
     resume_position_ms: u32,
+    last_resume_checkpoint: Instant,
     /// A newer release than this build, once GitHub has said so.
     pub update: Option<crate::updates::Release>,
     last_update_check: Option<Instant>,
@@ -366,9 +413,11 @@ impl App {
             dirs,
             settings,
             settings_dirty: false,
-            last_settings_save: Instant::now(),
+            settings_save_retrying: false,
+            last_settings_save_attempt: Instant::now(),
             session_dirty: false,
-            last_session_save: Instant::now(),
+            session_save_retrying: false,
+            last_session_save_attempt: Instant::now(),
             backend,
             media_controls,
             tray,
@@ -461,6 +510,7 @@ impl App {
             resume_context: session.last_context.clone(),
             resume_track: session.last_track.clone(),
             resume_position_ms: session.last_position_ms,
+            last_resume_checkpoint: Instant::now(),
             update: None,
             last_update_check: None,
         };
@@ -964,13 +1014,8 @@ impl App {
     fn handle_local(&mut self, state: LocalState) {
         let track_changed = state.track != self.local.track;
         let reconnected = state.connected && !self.local.connected;
-        if state.shuffle != self.local.shuffle
-            && self
-                .shuffle_set_at
-                .is_none_or(|at| at.elapsed() > Duration::from_secs(5))
-        {
-            self.adopt_external_shuffle(state.shuffle);
-        }
+        let paused = state.playback == Playback::Paused && self.local.playback != Playback::Paused;
+        self.reconcile_authoritative_shuffle(state.connected && state.is_active(), state.shuffle);
         if state.playback != self.local.playback {
             self.optimistic_playing = None;
             if matches!(state.playback, Playback::Playing | Playback::Loading) {
@@ -1008,6 +1053,9 @@ impl App {
         if track_changed {
             self.on_now_playing_changed();
         }
+        if paused {
+            self.update_resume_point_at(true, Instant::now());
+        }
         if reconnected {
             self.start_queued_play_if_ready();
         }
@@ -1023,7 +1071,8 @@ impl App {
         self.last_now_playing_uri = Some(now.uri.clone());
         self.resume_context = self.playing_context_uri();
         self.resume_track = Some(now.uri.clone());
-        self.resume_position_ms = 0;
+        self.resume_position_ms = now.position_ms;
+        self.last_resume_checkpoint = Instant::now();
         self.mark_session_dirty();
         if now.local
             && !now.is_episode
@@ -1161,12 +1210,37 @@ impl App {
             self.last_eviction = now;
             self.backend.art().evict_stale(ctx);
         }
-        if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
-            self.save_settings();
+        if let Some(Err(error)) = self.try_autosave_settings_at(now) {
+            log::warn!(
+                "{error}; settings remain pending and will retry in {} seconds",
+                STATE_SAVE_RETRY.as_secs()
+            );
         }
-        self.update_resume_point(false);
-        if self.session_dirty && self.last_session_save.elapsed() > Duration::from_secs(2) {
-            self.save_session();
+        self.update_resume_point_at(false, now);
+        if let Some(Err(error)) = self.try_autosave_session_at(now) {
+            log::warn!(
+                "{error}; session state remains pending and will retry in {} seconds",
+                STATE_SAVE_RETRY.as_secs()
+            );
+        }
+        for wait in [
+            state_save_wait(
+                self.settings_dirty,
+                self.settings_save_retrying,
+                self.last_settings_save_attempt,
+                now,
+            ),
+            state_save_wait(
+                self.session_dirty,
+                self.session_save_retrying,
+                self.last_session_save_attempt,
+                now,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ctx.request_repaint_after(wait);
         }
     }
 
@@ -1180,14 +1254,46 @@ impl App {
         self.session_dirty = true;
     }
 
-    fn save_settings(&mut self) {
-        self.settings_dirty = false;
-        self.last_settings_save = Instant::now();
-        if self.offline {
+    fn try_autosave_settings_at(&mut self, now: Instant) -> Option<Result<(), SaveError>> {
+        state_save_due(
+            self.settings_dirty,
+            self.settings_save_retrying,
+            self.last_settings_save_attempt,
+            now,
+        )
+        .then(|| self.save_settings_at(now))
+    }
+
+    fn try_autosave_session_at(&mut self, now: Instant) -> Option<Result<(), SaveError>> {
+        state_save_due(
+            self.session_dirty,
+            self.session_save_retrying,
+            self.last_session_save_attempt,
+            now,
+        )
+        .then(|| self.save_session_at(now))
+    }
+
+    fn save_settings_at(&mut self, now: Instant) -> Result<(), SaveError> {
+        self.last_settings_save_attempt = now;
+        let result = if self.offline {
             // Demo data must never overwrite the person's real preferences.
-            return;
+            Ok(())
+        } else {
+            self.settings.save(&self.dirs.settings_file())
+        };
+        match result {
+            Ok(()) => {
+                self.settings_dirty = false;
+                self.settings_save_retrying = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.settings_dirty = true;
+                self.settings_save_retrying = true;
+                Err(error)
+            }
         }
-        self.settings.save(&self.dirs.settings_file());
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -1777,6 +1883,7 @@ impl App {
                 self.remote_poll_pending = false;
                 match result {
                     Ok(state) => {
+                        let observed_at = Instant::now();
                         let previous_uri = self.remote.as_ref().and_then(|remote| {
                             remote
                                 .state
@@ -1784,25 +1891,21 @@ impl App {
                                 .as_ref()
                                 .map(|item| item.uri().to_string())
                         });
-                        let previous_shuffle = self
+                        let was_playing = self
                             .remote
                             .as_ref()
-                            .map(|remote| remote.state.shuffle_state);
+                            .is_some_and(|remote| remote.state.is_playing);
                         self.remote = state.map(|state| RemoteSnapshot {
                             state,
-                            received_at: Instant::now(),
+                            received_at: observed_at,
                         });
-                        if let (Some(previous), Some(current)) = (
-                            previous_shuffle,
-                            self.remote
-                                .as_ref()
-                                .map(|remote| remote.state.shuffle_state),
-                        ) && previous != current
-                            && self
-                                .shuffle_set_at
-                                .is_none_or(|at| at.elapsed() > Duration::from_secs(5))
-                        {
-                            self.adopt_external_shuffle(current);
+                        if let Some((active, shuffle)) = self.remote.as_ref().map(|remote| {
+                            (
+                                remote.state.is_playing || remote.state.item.is_some(),
+                                remote.state.shuffle_state,
+                            )
+                        }) {
+                            self.reconcile_authoritative_shuffle(active, shuffle);
                         }
                         if let Some(context) = self
                             .remote
@@ -1847,6 +1950,13 @@ impl App {
                         }
                         if uri != previous_uri {
                             self.on_now_playing_changed();
+                        }
+                        if was_playing
+                            && self.remote.as_ref().is_some_and(|remote| {
+                                !remote.state.is_playing && remote.state.item.is_some()
+                            })
+                        {
+                            self.update_resume_point_at(true, observed_at);
                         }
                     }
                     Err(error) => log::debug!("playback state unavailable: {error}"),
@@ -2579,7 +2689,10 @@ impl App {
     }
 
     /// A random playable track from a context already loaded in memory.
-    fn random_track_in(&self, context_uri: &str) -> Option<String> {
+    fn random_track_in<R>(&self, context_uri: &str, rng: &mut R) -> Option<String>
+    where
+        R: rand::Rng + ?Sized,
+    {
         let uris: Vec<&str> = if let Some(id) = context_uri.strip_prefix("spotify:playlist:") {
             self.playlist_pages
                 .get(id)?
@@ -2616,7 +2729,7 @@ impl App {
         } else {
             return None;
         };
-        uris.choose(&mut rand::rng()).map(|uri| (*uri).to_string())
+        uris.choose(rng).map(|uri| (*uri).to_string())
     }
 
     fn assume_context(&mut self, uri: String) {
@@ -2627,18 +2740,40 @@ impl App {
         });
     }
 
-    fn prepare_play_request(&self, mut request: PlayRequest, shuffle: bool) -> PlayRequest {
+    fn prepare_play_request(&self, request: PlayRequest, shuffle: bool) -> PlayRequest {
+        self.prepare_play_request_with_rng(request, shuffle, &mut rand::rng())
+    }
+
+    fn prepare_play_request_with_rng<R>(
+        &self,
+        mut request: PlayRequest,
+        shuffle: bool,
+        rng: &mut R,
+    ) -> PlayRequest
+    where
+        R: rand::Rng + ?Sized,
+    {
+        let mut generated_shuffle_index = None;
         if shuffle && request.offset_uri.is_none() && request.offset_position.is_none() {
             if request.uris.is_empty() {
                 if let Some(context) = request.context_uri.as_deref() {
-                    request.offset_uri = self.random_track_in(context);
+                    request.offset_uri = self.random_track_in(context, rng);
                 }
             } else {
-                request.offset_position =
-                    Some(rand::rng().random_range(0..request.uris.len()) as u32);
+                let selected = rng.random_range(0..request.uris.len());
+                generated_shuffle_index = Some(selected);
+                request.offset_position = Some(selected as u32);
             }
         }
-        if request.uris.len() > 500 {
+        if request.uris.len() > MAX_PLAY_URIS {
+            if let Some(selected) = generated_shuffle_index {
+                let start = selected
+                    .saturating_sub(MAX_PLAY_URIS / 2)
+                    .min(request.uris.len() - MAX_PLAY_URIS);
+                request.uris = request.uris[start..start + MAX_PLAY_URIS].to_vec();
+                request.offset_position = Some((selected - start) as u32);
+                return request;
+            }
             let selected = request
                 .offset_position
                 .map(|index| index as usize)
@@ -2659,12 +2794,9 @@ impl App {
 
     /// Apply the listener's shuffle mode and start one ordered play request.
     fn play_request(&mut self, mut request: PlayRequest, enable_shuffle: bool) {
-        if enable_shuffle {
-            if !self.shuffle_wanted {
-                self.shuffle_wanted = true;
-                self.mark_session_dirty();
-            }
-            self.shuffle_set_at = Some(Instant::now());
+        if enable_shuffle && !self.shuffle_wanted {
+            self.shuffle_wanted = true;
+            self.mark_session_dirty();
         }
         let shuffle = self.shuffle_wanted;
         // A play queued behind a reconnect is transformed only when it is
@@ -2707,6 +2839,7 @@ impl App {
             }
             Target::Local => {
                 self.queued_play = None;
+                self.shuffle_set_at = Some(Instant::now());
                 self.backend.player(PlayerCommand::Load(LoadSpec {
                     context_uri: request.context_uri.clone(),
                     uris: request.uris.clone(),
@@ -2720,6 +2853,7 @@ impl App {
             }
             Target::Remote(Some(device_id)) => {
                 self.queued_play = None;
+                self.shuffle_set_at = Some(Instant::now());
                 let shuffle_matches = self.remote.as_ref().is_some_and(|remote| {
                     remote.state.shuffle_state == shuffle
                         && remote
@@ -2972,33 +3106,50 @@ impl App {
     }
 
     fn adopt_external_shuffle(&mut self, shuffle: bool) {
+        self.shuffle_set_at = None;
         if self.shuffle_wanted != shuffle {
             self.shuffle_wanted = shuffle;
             self.mark_session_dirty();
         }
     }
 
-    fn set_shuffle(&mut self, shuffle: bool) {
+    fn reconcile_authoritative_shuffle(&mut self, active: bool, shuffle: bool) {
+        if active
+            && self
+                .shuffle_set_at
+                .is_none_or(|at| at.elapsed() >= SHUFFLE_INTENT_HOLD)
+        {
+            self.adopt_external_shuffle(shuffle);
+        }
+    }
+
+    fn set_shuffle(&mut self, shuffle: bool) -> ShuffleDispatch {
         self.adopt_external_shuffle(shuffle);
         self.shuffle_set_at = Some(Instant::now());
+        if self.queued_play.is_some() {
+            return ShuffleDispatch::Deferred;
+        }
         match self.target() {
             Target::Local => {
                 self.local.shuffle = shuffle;
                 self.backend.player(PlayerCommand::Shuffle(shuffle));
+                ShuffleDispatch::Local
             }
-            Target::Remote(device_id) => {
+            Target::Remote(None) => ShuffleDispatch::Deferred,
+            Target::Remote(Some(device_id)) => {
                 if let Some(remote) = self.remote.as_mut() {
                     remote.state.shuffle_state = shuffle;
                 }
                 self.backend.api(ApiRequest::Remote {
                     action: RemoteAction::Shuffle,
-                    device_id,
+                    device_id: Some(device_id),
                     play: None,
                     position_ms: 0,
                     percent: 0,
                     flag: shuffle,
                     repeat: String::new(),
                 });
+                ShuffleDispatch::Remote
             }
         }
     }
@@ -3232,7 +3383,9 @@ impl App {
             Action::ToggleShuffle => {
                 self.set_shuffle(!self.shuffle_wanted);
             }
-            Action::SetShuffle(shuffle) => self.set_shuffle(shuffle),
+            Action::SetShuffle(shuffle) => {
+                self.set_shuffle(shuffle);
+            }
             Action::CycleRepeat => {
                 let mode = self.now_playing().map(|now| now.repeat).unwrap_or_default();
                 self.set_repeat(mode.next());
@@ -3409,7 +3562,9 @@ impl App {
                 self.auth = AuthStatus::SignedOut;
             }
             Action::SwitchWebApp => {
-                self.save_settings();
+                if let Err(error) = self.save_settings_at(Instant::now()) {
+                    self.toast_error(format!("Couldn't save settings: {error}"));
+                }
                 self.backend
                     .send(Command::SwitchWebApp(self.settings.web_client_id.clone()));
             }
@@ -3464,7 +3619,9 @@ impl App {
                 }
             }
             Action::RestartEngine => {
-                self.save_settings();
+                if let Err(error) = self.save_settings_at(Instant::now()) {
+                    self.toast_error(format!("Couldn't save settings: {error}"));
+                }
                 let config = engine_config(&self.dirs, &self.settings);
                 self.backend.send(Command::RestartEngine(config));
                 if self.local_ready {
@@ -3731,34 +3888,53 @@ impl App {
     }
 
     /// Persist state when a window closes (to the tray or for good).
-    pub fn save_state(&mut self) {
-        self.save_settings();
-        self.save_session();
+    pub fn save_state(&mut self) -> Result<(), StateSaveError> {
+        let now = Instant::now();
+        self.update_resume_point_at(true, now);
+        let settings = self.save_settings_at(now).err();
+        let session = self.write_session_at(now).err();
+        match (settings, session) {
+            (None, None) => Ok(()),
+            (Some(error), None) => Err(StateSaveError::Settings(Box::new(error))),
+            (None, Some(error)) => Err(StateSaveError::Session(Box::new(error))),
+            (Some(settings), Some(session)) => Err(StateSaveError::Both {
+                settings: Box::new(settings),
+                session: Box::new(session),
+            }),
+        }
     }
 
-    fn update_resume_point(&mut self, force: bool) {
-        let Some(now) = self.now_playing() else {
+    fn update_resume_point_at(&mut self, force: bool, checkpoint_at: Instant) {
+        let Some(now_playing) = self.now_playing() else {
             return;
         };
         let context = self.playing_context_uri();
-        let changed = force
-            || self.resume_context != context
-            || self.resume_track.as_deref() != Some(now.uri.as_str())
-            || self.resume_position_ms.abs_diff(now.position_ms) >= 5_000;
+        let identity_changed = self.resume_context != context
+            || self.resume_track.as_deref() != Some(now_playing.uri.as_str());
+        let checkpoint_due = checkpoint_at.saturating_duration_since(self.last_resume_checkpoint)
+            >= RESUME_CHECKPOINT_INTERVAL
+            && self.resume_position_ms != now_playing.position_ms;
+        let changed = force || identity_changed || checkpoint_due;
         if !changed {
             return;
         }
         self.resume_context = context;
-        self.resume_track = Some(now.uri);
-        self.resume_position_ms = now.position_ms;
+        self.resume_track = Some(now_playing.uri);
+        self.resume_position_ms = now_playing.position_ms;
+        self.last_resume_checkpoint = checkpoint_at;
         self.mark_session_dirty();
     }
 
-    fn save_session(&mut self) {
-        self.update_resume_point(true);
-        self.session_dirty = false;
-        self.last_session_save = Instant::now();
-        if !self.offline {
+    fn save_session_at(&mut self, now: Instant) -> Result<(), SaveError> {
+        self.update_resume_point_at(true, now);
+        self.write_session_at(now)
+    }
+
+    fn write_session_at(&mut self, now: Instant) -> Result<(), SaveError> {
+        self.last_session_save_attempt = now;
+        let result = if self.offline {
+            Ok(())
+        } else {
             let mut sorts: Vec<_> = self
                 .table_sorts
                 .iter()
@@ -3777,14 +3953,27 @@ impl App {
                 window_pos: self.last_window_pos,
                 queue_open: Some(self.show_queue_panel),
             }
-            .save(&self.dirs.session_file());
+            .save(&self.dirs.session_file())
+        };
+        match result {
+            Ok(()) => {
+                self.session_dirty = false;
+                self.session_save_retrying = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.session_dirty = true;
+                self.session_save_retrying = true;
+                Err(error)
+            }
         }
     }
 
     /// Final teardown at real quit.
-    pub fn shutdown(&mut self) {
-        self.save_state();
+    pub fn shutdown(&mut self) -> Result<(), StateSaveError> {
+        let result = self.save_state();
         self.backend.shutdown();
+        result
     }
 }
 
@@ -3850,12 +4039,11 @@ fn friendly_page_error(error: &crate::api::ApiError, own_app: bool) -> String {
 /// Spotify balks at gigantic track lists, so a play that starts deep in
 /// one keeps the five hundred songs from its start onward.
 fn cap_uris(uris: Vec<String>, index: u32) -> (Vec<String>, u32) {
-    const MAX: usize = 500;
-    if uris.len() <= MAX {
+    if uris.len() <= MAX_PLAY_URIS {
         return (uris, index);
     }
     let start = (index as usize).min(uris.len() - 1);
-    let end = (start + MAX).min(uris.len());
+    let end = (start + MAX_PLAY_URIS).min(uris.len());
     (uris[start..end].to_vec(), 0)
 }
 
@@ -3866,10 +4054,13 @@ mod tests {
     #[test]
     fn window_geometry_rejects_unusable_session_values() {
         assert!(valid_window_size([1240.0, 800.0]));
+        assert!(valid_window_size([3840.0, 2160.0]));
         assert!(!valid_window_size([399.0, 800.0]));
+        assert!(!valid_window_size([100_000.0, 2160.0]));
         assert!(!valid_window_size([1240.0, f32::NAN]));
-        assert!(valid_window_position([-500.0, 2400.0]));
-        assert!(!valid_window_position([5001.0, 0.0]));
+        assert!(valid_window_position([-1920.0, 0.0]));
+        assert!(valid_window_position([-7680.0, 4320.0]));
+        assert!(!valid_window_position([-100_000.0, 0.0]));
         assert!(!valid_window_position([f32::INFINITY, 0.0]));
     }
 
@@ -3888,9 +4079,45 @@ mod tests {
         assert_eq!(percent_to_volume(200), u16::MAX);
     }
 
-    fn headless_app() -> App {
-        let root =
-            std::env::temp_dir().join(format!("fastpotify-volume-test-{}", std::process::id()));
+    struct HeadlessApp {
+        app: App,
+        root: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for HeadlessApp {
+        type Target = App;
+
+        fn deref(&self) -> &Self::Target {
+            &self.app
+        }
+    }
+
+    impl std::ops::DerefMut for HeadlessApp {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.app
+        }
+    }
+
+    impl Drop for HeadlessApp {
+        fn drop(&mut self) {
+            self.app.backend.shutdown();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn headless_app() -> HeadlessApp {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-app-test-{}-{started}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let dirs = AppDirs {
             config: root.join("config"),
             state: root.join("state"),
@@ -3905,8 +4132,9 @@ mod tests {
                 tray: false,
             },
         );
+        app.backend.set_offline(true);
         app.local_ready = true;
-        app
+        HeadlessApp { app, root }
     }
 
     fn egui_pass(ctx: &egui::Context, run_ui: impl FnMut(&mut egui::Ui)) {
@@ -3919,6 +4147,44 @@ mod tests {
             volume: percent_to_volume(percent),
             ..LocalState::default()
         }
+    }
+
+    fn active_local_snapshot(app: &App, shuffle: bool, playback: Playback) -> LocalState {
+        LocalState {
+            connected: true,
+            playback,
+            track: Some(crate::player::LocalTrack {
+                uri: "spotify:track:active".into(),
+                title: "Active".into(),
+                duration_ms: 240_000,
+                ..crate::player::LocalTrack::default()
+            }),
+            position_ms: 30_000,
+            volume: app.local.volume,
+            shuffle,
+            ..LocalState::default()
+        }
+    }
+
+    fn active_remote_snapshot(shuffle: bool) -> PlaybackState {
+        PlaybackState {
+            shuffle_state: shuffle,
+            item: Some(PlayableItem::Track(Track {
+                uri: "spotify:track:remote".into(),
+                name: "Remote".into(),
+                duration_ms: 240_000,
+                ..Track::default()
+            })),
+            ..PlaybackState::default()
+        }
+    }
+
+    fn deliver_remote_snapshot(app: &mut App, state: PlaybackState) {
+        app.remote_poll_seq += 1;
+        app.handle_api(ApiResponse::PlaybackState {
+            seq: app.remote_poll_seq,
+            result: Ok(Some(state)),
+        });
     }
 
     #[test]
@@ -3945,6 +4211,165 @@ mod tests {
         assert!(!app.settings.sidebar_visible);
         assert!(app.settings_dirty);
         assert!(!app.session_dirty);
+    }
+
+    #[test]
+    fn successful_settings_save_cleans_only_after_durable_write() {
+        let mut app = headless_app();
+        app.settings.device_name = "Durable desktop".into();
+        app.mark_settings_dirty();
+
+        app.save_settings_at(Instant::now()).expect("save settings");
+
+        assert!(!app.settings_dirty);
+        assert!(!app.settings_save_retrying);
+        assert_eq!(
+            Settings::load(&app.dirs.settings_file()).device_name,
+            "Durable desktop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_settings_path_retains_dirty_state_until_rate_limited_retry() {
+        use std::os::unix::fs::symlink;
+
+        let mut app = headless_app();
+        std::fs::create_dir_all(&app.dirs.config).expect("create config directory");
+        let target = app.dirs.config.join("outside.json");
+        std::fs::write(&target, b"untouched").expect("create symlink target");
+        let settings_path = app.dirs.settings_file();
+        symlink(&target, &settings_path).expect("create unsafe settings path");
+        app.settings.device_name = "Pending settings".into();
+        app.mark_settings_dirty();
+
+        let error = app.save_state().expect_err("unsafe destination must fail");
+        match error {
+            StateSaveError::Settings(error) => {
+                assert!(matches!(*error, SaveError::Write { .. }));
+            }
+            other => panic!("only the unsafe settings path should fail: {other}"),
+        }
+
+        assert!(app.settings_dirty);
+        assert!(app.settings_save_retrying);
+        let failed_at = app.last_settings_save_attempt;
+        assert!(
+            app.try_autosave_settings_at(failed_at + STATE_SAVE_RETRY - Duration::from_millis(1))
+                .is_none(),
+            "a failed save must not retry every frame"
+        );
+        assert_eq!(std::fs::read(&target).expect("read target"), b"untouched");
+
+        std::fs::remove_file(&settings_path).expect("remove unsafe symlink");
+        app.try_autosave_settings_at(failed_at + STATE_SAVE_RETRY)
+            .expect("retry is due")
+            .expect("retry succeeds");
+        assert!(!app.settings_dirty);
+        assert!(!app.settings_save_retrying);
+        assert_eq!(
+            Settings::load(&settings_path).device_name,
+            "Pending settings"
+        );
+    }
+
+    #[test]
+    fn oversized_session_retains_dirty_state_and_the_last_valid_file() {
+        let mut app = headless_app();
+        app.mark_session_dirty();
+        app.write_session_at(Instant::now())
+            .expect("write valid session");
+        let path = app.dirs.session_file();
+        let before = std::fs::read(&path).expect("read valid session");
+        app.recent_contexts = vec!["x".repeat(1024 * 1024 + 1)];
+        app.mark_session_dirty();
+
+        assert!(matches!(
+            app.write_session_at(Instant::now())
+                .expect_err("reject oversized session"),
+            SaveError::TooLarge {
+                kind: "session",
+                ..
+            }
+        ));
+
+        assert!(app.session_dirty);
+        assert!(app.session_save_retrying);
+        assert_eq!(std::fs::read(path).expect("read preserved session"), before);
+    }
+
+    #[test]
+    fn resume_position_uses_long_checkpoint_cadence_but_track_change_is_immediate() {
+        let mut app = headless_app();
+        let baseline = Instant::now();
+        let mut state = active_local_snapshot(&app, false, Playback::Playing);
+        state.position_ms = 10_000;
+        app.local = state;
+        app.resume_context = None;
+        app.resume_track = Some("spotify:track:active".into());
+        app.resume_position_ms = 10_000;
+        app.last_resume_checkpoint = baseline;
+        app.session_dirty = false;
+        app.local.position_ms = 45_000;
+
+        app.update_resume_point_at(false, baseline + Duration::from_secs(30));
+        assert_eq!(app.resume_position_ms, 10_000);
+        assert!(!app.session_dirty);
+
+        app.update_resume_point_at(false, baseline + RESUME_CHECKPOINT_INTERVAL);
+        assert_eq!(app.resume_position_ms, 45_000);
+        assert!(app.session_dirty);
+
+        app.session_dirty = false;
+        app.local.track.as_mut().expect("local track").uri = "spotify:track:next".into();
+        app.local.position_ms = 12_345;
+        app.update_resume_point_at(
+            false,
+            baseline + RESUME_CHECKPOINT_INTERVAL + Duration::from_secs(1),
+        );
+        assert_eq!(app.resume_track.as_deref(), Some("spotify:track:next"));
+        assert_eq!(app.resume_position_ms, 12_345);
+        assert!(app.session_dirty);
+    }
+
+    #[test]
+    fn pause_transition_and_explicit_window_save_flush_current_resume() {
+        let mut app = headless_app();
+        app.local = active_local_snapshot(&app, false, Playback::Playing);
+        app.resume_context = None;
+        app.resume_track = Some("spotify:track:active".into());
+        app.resume_position_ms = 30_000;
+        app.session_dirty = false;
+        let mut paused = active_local_snapshot(&app, false, Playback::Paused);
+        paused.position_ms = 34_567;
+
+        app.handle_local(paused);
+
+        assert_eq!(app.resume_position_ms, 34_567);
+        assert!(app.session_dirty);
+        app.save_state().expect("save state on window close");
+        assert!(!app.session_dirty);
+        assert_eq!(
+            SessionState::load(&app.dirs.session_file()).last_position_ms,
+            34_567
+        );
+    }
+
+    #[test]
+    fn shutdown_flushes_the_latest_resume_even_without_a_due_checkpoint() {
+        let mut app = headless_app();
+        let session_path = app.dirs.session_file();
+        let mut state = active_local_snapshot(&app, false, Playback::Paused);
+        state.position_ms = 51_234;
+        app.local = state;
+        app.resume_context = None;
+        app.resume_track = Some("spotify:track:active".into());
+        app.resume_position_ms = 50_000;
+        app.session_dirty = false;
+
+        app.shutdown().expect("save before backend shutdown");
+
+        assert_eq!(SessionState::load(&session_path).last_position_ms, 51_234);
     }
 
     #[test]
@@ -4040,31 +4465,126 @@ mod tests {
     }
 
     #[test]
-    fn shuffled_view_chooses_before_capping_the_request() {
+    fn shuffled_large_view_keeps_a_full_ordered_window_around_near_tail_start() {
+        use rand::{Rng as _, SeedableRng as _};
+
         let app = headless_app();
         let uris: Vec<String> = (0..700)
             .map(|index| format!("spotify:track:{index}"))
             .collect();
-        let request = app.prepare_play_request(PlayRequest::tracks(uris), true);
+        let (seed, selected) = (0..10_000_u64)
+            .find_map(|seed| {
+                let selected = rand::rngs::StdRng::seed_from_u64(seed).random_range(0..uris.len());
+                (selected >= 690).then_some((seed, selected))
+            })
+            .expect("a seed selecting near the tail");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-        assert!(!request.uris.is_empty());
-        assert!(request.uris.len() <= 500);
+        let request = app.prepare_play_request_with_rng(PlayRequest::tracks(uris), true, &mut rng);
+
+        let start = 700 - MAX_PLAY_URIS;
+        let expected: Vec<String> = (start..700)
+            .map(|index| format!("spotify:track:{index}"))
+            .collect();
+        let offset = selected - start;
+        assert_eq!(request.uris, expected, "the original view order is kept");
+        assert_eq!(request.uris.len(), MAX_PLAY_URIS);
+        assert_eq!(request.offset_position, Some(offset as u32));
+        assert_eq!(
+            request.uris[offset],
+            format!("spotify:track:{selected}"),
+            "the selected track is inside the capped request"
+        );
+        assert_eq!(
+            request.uris.iter().collect::<HashSet<_>>().len(),
+            MAX_PLAY_URIS,
+            "the containing window does not rotate or duplicate entries"
+        );
+    }
+
+    #[test]
+    fn explicitly_clicked_near_tail_row_still_becomes_request_start() {
+        let app = headless_app();
+        let uris: Vec<String> = (0..700)
+            .map(|index| format!("spotify:track:{index}"))
+            .collect();
+
+        let request =
+            app.prepare_play_request(PlayRequest::tracks(uris).starting_at_index(695), true);
+
+        assert_eq!(request.uris.len(), 5);
+        assert_eq!(request.uris[0], "spotify:track:695");
         assert_eq!(request.offset_position, Some(0));
     }
 
     #[test]
     fn shuffle_changes_from_another_client_become_the_mode() {
         let mut app = headless_app();
-        app.handle_local(LocalState {
-            shuffle: true,
-            volume: app.local.volume,
-            ..LocalState::default()
-        });
+        let state = active_local_snapshot(&app, true, Playback::Paused);
+        app.handle_local(state);
         assert!(app.shuffle_wanted);
         assert!(app.session_dirty);
     }
 
-    fn play_queued_during_reconnect() -> App {
+    #[test]
+    fn first_active_snapshots_reconcile_persisted_shuffle_but_idle_does_not() {
+        let mut local = headless_app();
+        local.shuffle_wanted = true;
+        local.session_dirty = false;
+        let state = active_local_snapshot(&local, false, Playback::Paused);
+        local.handle_local(state);
+        assert!(!local.shuffle_wanted);
+        assert!(local.session_dirty);
+
+        let mut remote = headless_app();
+        remote.shuffle_wanted = true;
+        remote.session_dirty = false;
+        deliver_remote_snapshot(&mut remote, active_remote_snapshot(false));
+        assert!(!remote.shuffle_wanted);
+        assert!(remote.session_dirty);
+
+        let mut idle = headless_app();
+        idle.shuffle_wanted = true;
+        deliver_remote_snapshot(
+            &mut idle,
+            PlaybackState {
+                shuffle_state: false,
+                ..PlaybackState::default()
+            },
+        );
+        assert!(idle.shuffle_wanted, "idle state preserves the desired mode");
+    }
+
+    #[test]
+    fn unchanged_shuffle_mismatch_is_held_then_reconciled_for_local_and_remote() {
+        let mut local = headless_app();
+        local.shuffle_wanted = true;
+        local.shuffle_set_at = Some(Instant::now());
+        let mismatch = active_local_snapshot(&local, false, Playback::Paused);
+        local.handle_local(mismatch.clone());
+        assert!(local.shuffle_wanted, "a current local intent is held");
+        local.shuffle_set_at = Some(Instant::now() - SHUFFLE_INTENT_HOLD);
+        local.handle_local(mismatch);
+        assert!(
+            !local.shuffle_wanted,
+            "an unchanged failed local command is authoritative after the hold"
+        );
+
+        let mut remote = headless_app();
+        remote.shuffle_wanted = true;
+        remote.shuffle_set_at = Some(Instant::now());
+        let mismatch = active_remote_snapshot(false);
+        deliver_remote_snapshot(&mut remote, mismatch.clone());
+        assert!(remote.shuffle_wanted, "a current remote intent is held");
+        remote.shuffle_set_at = Some(Instant::now() - SHUFFLE_INTENT_HOLD);
+        deliver_remote_snapshot(&mut remote, mismatch);
+        assert!(
+            !remote.shuffle_wanted,
+            "an unchanged failed remote command is authoritative after the hold"
+        );
+    }
+
+    fn play_queued_during_reconnect() -> HeadlessApp {
         let mut app = headless_app();
         app.local.connected = true;
         app.handle_playback(LocalPlayback::Connecting);
@@ -4083,6 +4603,37 @@ mod tests {
         assert!(app.session_dirty);
         assert!(app.optimistic_playing.is_none());
         app
+    }
+
+    fn play_queued_with_mode(shuffle: bool) -> HeadlessApp {
+        let mut app = headless_app();
+        app.shuffle_wanted = shuffle;
+        app.local.shuffle = shuffle;
+        app.handle_playback(LocalPlayback::Connecting);
+        app.play_request(PlayRequest::context("spotify:album:queued"), false);
+        assert!(app.queued_play.is_some());
+        app
+    }
+
+    #[test]
+    fn queued_local_shuffle_toggles_defer_both_directions_without_remote_action() {
+        for (before, after) in [(false, true), (true, false)] {
+            let mut app = play_queued_with_mode(before);
+            let local_before = app.local.shuffle;
+            let remote_before = app.remote.as_ref().map(|remote| remote.state.clone());
+
+            let dispatch = app.set_shuffle(after);
+
+            assert_eq!(dispatch, ShuffleDispatch::Deferred);
+            assert_eq!(app.shuffle_wanted, after);
+            assert_eq!(app.local.shuffle, local_before);
+            assert_eq!(
+                app.remote.as_ref().map(|remote| remote.state.clone()),
+                remote_before
+            );
+            assert!(app.queued_play.is_some());
+            assert!(app.toasts.is_empty());
+        }
     }
 
     fn connected_snapshot(app: &App) -> LocalState {
@@ -4111,7 +4662,8 @@ mod tests {
     fn queued_play_waits_for_ready_after_current_engine_connects() {
         let mut app = play_queued_during_reconnect();
 
-        app.handle_local(connected_snapshot(&app));
+        let connected = connected_snapshot(&app);
+        app.handle_local(connected);
 
         assert!(app.queued_play.is_some());
         assert!(app.optimistic_playing.is_none());
@@ -4139,7 +4691,8 @@ mod tests {
 
         assert!(app.queued_play.is_some());
         assert!(app.optimistic_playing.is_none());
-        app.handle_local(connected_snapshot(&app));
+        let connected = connected_snapshot(&app);
+        app.handle_local(connected);
 
         assert_play_dispatched_once(&mut app);
     }
@@ -4148,9 +4701,11 @@ mod tests {
     fn disconnected_between_connected_and_ready_keeps_play_queued() {
         let mut app = play_queued_during_reconnect();
 
-        app.handle_local(connected_snapshot(&app));
+        let connected = connected_snapshot(&app);
+        app.handle_local(connected);
+        let volume = app.local.volume;
         app.handle_local(LocalState {
-            volume: app.local.volume,
+            volume,
             ..LocalState::default()
         });
         app.handle_playback(LocalPlayback::Ready {
@@ -4159,7 +4714,8 @@ mod tests {
 
         assert!(app.queued_play.is_some());
         assert!(app.optimistic_playing.is_none());
-        app.handle_local(connected_snapshot(&app));
+        let connected = connected_snapshot(&app);
+        app.handle_local(connected);
 
         assert_play_dispatched_once(&mut app);
     }

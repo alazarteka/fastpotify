@@ -343,8 +343,10 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    if let Some(mut app) = slot.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        app.shutdown();
+    if let Some(mut app) = slot.lock().unwrap_or_else(|p| p.into_inner()).take()
+        && let Err(error) = app.shutdown()
+    {
+        log::error!("unable to save application state during shutdown: {error}");
     }
     Ok(())
 }
@@ -620,8 +622,15 @@ impl eframe::App for Shell {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(app) = self.app.as_mut() {
-            app.save_state();
+        // A hidden-to-tray process keeps running after this window exits.
+        // Real quits are flushed once by `App::shutdown` below.
+        if let Some(app) = self
+            .app
+            .as_mut()
+            .filter(|app| app.hide_intent && !app.quit_requested)
+            && let Err(error) = app.save_state()
+        {
+            log::error!("unable to save application state while closing the window: {error}");
         }
     }
 }

@@ -216,6 +216,6 @@ mod tests {
 
         pass(&ctx, vec![questionmark()], |ui| handle(&mut app, ui.ctx()));
         assert!(app.actions.is_empty());
-        app.shutdown();
+        let _ = app.shutdown();
     }
 }
