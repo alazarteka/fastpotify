@@ -609,8 +609,6 @@ impl App {
         remote
     }
 
-    /// Whether the playing context shuffles, honouring a shuffle the
-    /// interface just asked for ahead of Spotify's state.
     /// Whether something plays, as the interface should show it: what it
     /// just asked for, before any state reports back.
     pub fn believed_playing(&self) -> bool {
@@ -624,6 +622,26 @@ impl App {
 
     pub fn playing_context_shuffle(&self) -> bool {
         self.shuffle_wanted
+    }
+
+    /// The playing thing as a playable item, for menus that act on it:
+    /// the cached full track when known, a minimal one otherwise.
+    pub fn now_playing_item(&self) -> Option<PlayableItem> {
+        let now = self.now_playing()?;
+        if now.is_episode {
+            return None;
+        }
+        if let Some(track) = now.id.as_deref().and_then(|id| self.track_cache.get(id)) {
+            return Some(PlayableItem::Track(track.clone()));
+        }
+        Some(PlayableItem::Track(Track {
+            id: now.id.clone(),
+            uri: now.uri.clone(),
+            name: now.title.clone(),
+            artists: now.artists.clone(),
+            duration_ms: now.duration_ms,
+            ..Track::default()
+        }))
     }
 
     pub fn now_playing(&self) -> Option<NowPlaying> {
@@ -2249,7 +2267,13 @@ impl App {
                             Some("track") => {
                                 if self.library.liked.loaded_once {
                                     if saved {
+                                        let total = self
+                                            .library
+                                            .liked
+                                            .total
+                                            .map(|total| total.saturating_add(1));
                                         self.library.liked.reset();
+                                        self.library.liked.total = total;
                                         if matches!(self.page(), Page::LikedSongs) {
                                             self.load_more(Page::LikedSongs);
                                         }
@@ -3921,6 +3945,22 @@ mod tests {
         assert!(!app.settings.sidebar_visible);
         assert!(app.settings_dirty);
         assert!(!app.session_dirty);
+    }
+
+    #[test]
+    fn saving_a_track_preserves_the_liked_count_during_refresh() {
+        let mut app = headless_app();
+        app.library.liked.loaded_once = true;
+        app.library.liked.total = Some(40);
+
+        app.handle_api(ApiResponse::SavedChanged {
+            uris: vec!["spotify:track:new".into()],
+            saved: true,
+            result: Ok(()),
+        });
+
+        assert_eq!(app.library.liked.total, Some(41));
+        assert!(!app.library.liked.loaded_once);
     }
 
     #[test]

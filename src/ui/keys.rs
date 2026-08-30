@@ -62,6 +62,16 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             );
         }
         if !typing {
+            key(
+                Modifiers::NONE,
+                Key::Questionmark,
+                Action::ShowDialog(Dialog::Shortcuts),
+            );
+            key(
+                Modifiers::SHIFT,
+                Key::Questionmark,
+                Action::ShowDialog(Dialog::Shortcuts),
+            );
             key(Modifiers::SHIFT, Key::ArrowLeft, Action::SeekBy(-10_000));
             key(Modifiers::SHIFT, Key::ArrowRight, Action::SeekBy(10_000));
             key(Modifiers::NONE, Key::Space, Action::TogglePlay);
@@ -130,6 +140,82 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+A", "Go to the playing artist"),
     ("Ctrl+Shift+B", "Go to the playing album"),
     ("Ctrl+,", "Settings"),
-    ("Ctrl+/", "Keyboard shortcuts"),
+    ("Ctrl+/ or ?", "Keyboard shortcuts"),
     ("Ctrl+Q", "Quit"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::AppOptions;
+    use crate::backend::Waker;
+    use crate::paths::AppDirs;
+    use crate::settings::Settings;
+
+    fn app() -> App {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-question-shortcut-test-{}",
+            std::process::id()
+        ));
+        App::new(
+            &Waker::default(),
+            AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        )
+    }
+
+    fn pass(ctx: &egui::Context, events: Vec<egui::Event>, run_ui: impl FnMut(&mut egui::Ui)) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, run_ui);
+        output.textures_delta.clear();
+    }
+
+    fn questionmark() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Questionmark,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }
+    }
+
+    #[test]
+    fn questionmark_opens_shortcuts_except_while_typing() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+
+        pass(&ctx, vec![questionmark()], |ui| handle(&mut app, ui.ctx()));
+        assert!(
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::ShowDialog(Dialog::Shortcuts)))
+        );
+
+        app.actions.clear();
+        let mut text = String::new();
+        pass(&ctx, Vec::new(), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        assert!(ctx.memory(|memory| memory.focused().is_some()));
+
+        pass(&ctx, vec![questionmark()], |ui| handle(&mut app, ui.ctx()));
+        assert!(app.actions.is_empty());
+        app.shutdown();
+    }
+}
