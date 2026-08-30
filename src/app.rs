@@ -417,6 +417,7 @@ const GLIDE_STOP: f32 = 40.0;
 impl App {
     pub fn new(waker: &Waker, dirs: AppDirs, mut settings: Settings, options: AppOptions) -> Self {
         settings.normalize_layout();
+        settings.normalize_sidebar_order();
         let engine_config = engine_config(&dirs, &settings);
         let backend = Backend::spawn(
             dirs.clone(),

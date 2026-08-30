@@ -160,6 +160,9 @@ pub struct Settings {
     pub external_services_disclosed: bool,
     /// Context URIs pinned to the top of the sidebar, in pin order.
     pub pinned_contexts: Vec<String>,
+    /// The listener's order for unpinned playlists. Empty keeps the automatic
+    /// recently-played order; dragging a playlist creates this snapshot.
+    pub sidebar_order: Vec<String>,
     /// Interface zoom, egui's zoom factor; Ctrl+plus/minus changes it.
     pub zoom: f32,
 }
@@ -192,6 +195,7 @@ impl Default for Settings {
             lrclib_lyrics: false,
             external_services_disclosed: false,
             pinned_contexts: Vec::new(),
+            sidebar_order: Vec::new(),
             zoom: ZOOM_DEFAULT,
         }
     }
@@ -202,6 +206,7 @@ impl Settings {
         let mut settings = load_private_json(path, MAX_SETTINGS_BYTES, "settings");
         Self::enforce_external_service_consent(&mut settings);
         settings.normalize_layout();
+        settings.normalize_sidebar_order();
         settings
     }
 
@@ -225,6 +230,15 @@ impl Settings {
             PANEL_WIDTH_DEFAULT,
         );
         self.zoom = bounded_f32(self.zoom, ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT);
+    }
+
+    pub(crate) fn normalize_sidebar_order(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.sidebar_order.retain(|uri| {
+            crate::util::spotify_uri(uri).is_some_and(|parsed| {
+                parsed.kind() == crate::util::SpotifyUriKind::Playlist && seen.insert(uri.clone())
+            })
+        });
     }
 
     fn enforce_external_service_consent(settings: &mut Self) {
@@ -363,6 +377,29 @@ mod tests {
         assert_eq!(settings.lyrics_width, PANEL_WIDTH_DEFAULT);
         assert_eq!(settings.queue_width, PANEL_WIDTH_DEFAULT);
         assert_eq!(settings.zoom, ZOOM_DEFAULT);
+        assert!(settings.sidebar_order.is_empty());
+    }
+
+    #[test]
+    fn custom_playlist_order_keeps_only_unique_valid_playlist_uris() {
+        let mut settings = Settings {
+            sidebar_order: vec![
+                "spotify:playlist:one".into(),
+                "spotify:album:not-a-playlist".into(),
+                "spotify:playlist:one".into(),
+                "spotify:playlist:two".into(),
+                "spotify:playlist:bad:extra".into(),
+            ],
+            ..Settings::default()
+        };
+        settings.normalize_sidebar_order();
+        assert_eq!(
+            settings.sidebar_order,
+            vec![
+                "spotify:playlist:one".to_string(),
+                "spotify:playlist:two".to_string(),
+            ]
+        );
     }
 
     #[test]

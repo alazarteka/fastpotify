@@ -26,17 +26,32 @@ time to return to the list's own order.
 
 ## Your Library
 
-The sidebar keeps the playlists you played most recently on top,
-wherever you played them, and remembers that order between runs.
+Pinned entries sit directly under Liked Songs. Pin from a row's menu, or drag
+an album or artist to the top of its shelf; drag within the pinned block to
+reorder it and below the block to unpin it. Podcast rows keep their existing
+menu pinning and are not drag sources.
+
+Unpinned playlists begin in recently-played order. Drag one below the pinned
+block to establish your own order, which is stored between runs. New playlists
+wait below the pins until the next drop places the complete shelf again. Use
+**Sort by recently played** from a playlist's menu to return to automatic
+ordering.
 
 The sidebar is your library: filter it by Playlists, Albums, Artists, or
 Podcasts with the chips, or search it with the magnifier. Liked Songs is
 pinned on top. The current page is highlighted; the playlist that is playing
 carries a small speaker.
 
-**Playlists you own** are fully editable: create one with the **+** button,
-add songs from any row's menu, remove and reorder from the playlist page,
-and rename or delete from its context menu. Playlists you follow can be
+Drag any music track onto Liked Songs to save it, or onto a playlist you own
+or collaborate on to add a copy. A single drag carries one track; episodes and
+podcast rows are not accepted, and Spotify decides whether a playlist may
+contain duplicate tracks.
+
+Playlists you own or collaborate on can be reordered by dragging a track row
+to its new slot. The table must be in its original, unfiltered order so the
+visible positions still match Spotify; the existing row-menu moves remain
+available under the same condition. Playlists you own can also be created with
+the **+** button, renamed, described, or deleted. Playlists you follow can be
 followed and unfollowed.
 
 ## Search

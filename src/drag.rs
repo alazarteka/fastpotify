@@ -166,6 +166,32 @@ pub fn playlist_move(
         })
 }
 
+/// Orders one complete playlist library for the sidebar. Pins always lead;
+/// without a custom order the remainder follows recency, while a custom
+/// order keeps newly discovered playlists between pins and its saved rows.
+pub fn playlist_sidebar_indices(
+    uris: &[&str],
+    recent: &[String],
+    pinned: &[String],
+    custom: &[String],
+) -> Vec<usize> {
+    let rank = |values: &[String], uri: &str| values.iter().position(|held| held == uri);
+    let mut indices: Vec<usize> = (0..uris.len()).collect();
+    indices.sort_by_key(|index| {
+        let uri = uris[*index];
+        if let Some(rank) = rank(pinned, uri) {
+            (0, rank, 0)
+        } else if custom.is_empty() {
+            (1, rank(recent, uri).unwrap_or(usize::MAX), *index)
+        } else if let Some(rank) = rank(custom, uri) {
+            (2, rank, 0)
+        } else {
+            (1, *index, 0)
+        }
+    });
+    indices
+}
+
 fn valid_layout(
     visible: &[String],
     liked_rows: usize,
@@ -370,6 +396,23 @@ mod tests {
             "spotify:album:a2",
         ));
         assert!(!pinned.contains(&"spotify:album:a2".to_string()));
+    }
+
+    #[test]
+    fn playlist_sidebar_order_has_one_pin_recency_and_custom_policy() {
+        let uris = ["p1", "p2", "p3", "new"];
+        let recent = vec!["p3".into(), "p1".into()];
+        let pinned = vec!["p2".into()];
+        assert_eq!(
+            playlist_sidebar_indices(&uris, &recent, &pinned, &[]),
+            vec![1, 2, 0, 3]
+        );
+
+        let custom = vec!["p1".into(), "p3".into()];
+        assert_eq!(
+            playlist_sidebar_indices(&uris, &recent, &pinned, &custom),
+            vec![1, 3, 0, 2]
+        );
     }
 
     #[test]

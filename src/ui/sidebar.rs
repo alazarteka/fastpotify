@@ -4,8 +4,13 @@ use egui::{Align, CornerRadius, Frame, Layout, Margin, Rect, Sense, Vec2, pos2, 
 
 use crate::api::models::pick_image;
 use crate::app::App;
+use crate::drag::{
+    ContextPayload, TrackPayload, drop_pinned_context, drop_playlist_context,
+    playlist_sidebar_indices,
+};
 use crate::model::{Action, Dialog, Loadable, Page};
 use crate::theme::{self, Icon, Palette};
+use crate::util::SpotifyUriKind;
 
 const ROW_HEIGHT: f32 = 60.0;
 
@@ -18,6 +23,17 @@ enum Filter {
     Podcasts,
 }
 
+impl Filter {
+    const fn drag_kind(self) -> Option<SpotifyUriKind> {
+        match self {
+            Self::Playlists => Some(SpotifyUriKind::Playlist),
+            Self::Albums => Some(SpotifyUriKind::Album),
+            Self::Artists => Some(SpotifyUriKind::Artist),
+            Self::Podcasts => None,
+        }
+    }
+}
+
 struct Entry {
     image: Option<String>,
     name: String,
@@ -27,6 +43,7 @@ struct Entry {
     round: bool,
     liked: bool,
     owned: bool,
+    editable: bool,
     playlist_index: Option<usize>,
 }
 
@@ -242,26 +259,28 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     round: false,
                     liked: true,
                     owned: false,
+                    editable: false,
                     playlist_index: None,
                 });
             }
             match &app.library.playlists {
                 Loadable::Loaded(playlists) => {
-                    // Recently played first, the way Spotify orders its own
-                    // sidebar; the rest keep the library's order.
-                    let rank = |uri: &str| {
-                        app.recent_contexts
-                            .iter()
-                            .position(|held| held == uri)
-                            .unwrap_or(usize::MAX)
-                    };
-                    let mut ordered: Vec<_> = playlists.iter().enumerate().collect();
-                    ordered.sort_by_key(|(index, playlist)| (rank(&playlist.uri), *index));
-                    for (index, playlist) in ordered {
+                    let uris: Vec<&str> = playlists
+                        .iter()
+                        .map(|playlist| playlist.uri.as_str())
+                        .collect();
+                    for index in playlist_sidebar_indices(
+                        &uris,
+                        &app.recent_contexts,
+                        &app.settings.pinned_contexts,
+                        &app.settings.sidebar_order,
+                    ) {
+                        let playlist = &playlists[index];
                         if !needle.is_empty() && !playlist.name.to_lowercase().contains(&needle) {
                             continue;
                         }
                         let owned = playlist.owned_by(&user_id);
+                        let editable = owned || playlist.collaborative;
                         entries.push(Entry {
                             image: pick_image(&playlist.images, 64).map(str::to_string),
                             name: playlist.name.clone(),
@@ -271,6 +290,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             round: false,
                             liked: false,
                             owned,
+                            editable,
                             playlist_index: Some(index),
                         });
                     }
@@ -306,6 +326,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     round: false,
                     liked: false,
                     owned: false,
+                    editable: false,
                     playlist_index: None,
                 });
             }
@@ -329,6 +350,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     round: true,
                     liked: false,
                     owned: false,
+                    editable: false,
                     playlist_index: None,
                 });
             }
@@ -353,6 +375,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     round: false,
                     liked: false,
                     owned: false,
+                    editable: false,
                     playlist_index: None,
                 });
             }
@@ -364,8 +387,8 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // Pinned entries sit on top, in the order they were pinned; Liked
-    // Songs stays above them, and everyone else keeps their order.
+    // Non-playlist shelves have only the global pin order. Playlist ordering
+    // already came from the shared pin/recency/custom policy above.
     let pin_rank = |uri: &str| {
         app.settings
             .pinned_contexts
@@ -373,16 +396,24 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             .position(|held| held == uri)
             .unwrap_or(usize::MAX)
     };
-    entries.sort_by_key(|entry| {
-        if entry.liked {
-            (0, 0)
-        } else {
-            match pin_rank(&entry.uri) {
-                usize::MAX => (2, 0),
-                rank => (1, rank),
+    let custom_order = filter == Filter::Playlists && !app.settings.sidebar_order.is_empty();
+    if filter != Filter::Playlists {
+        entries.sort_by_key(|entry| {
+            if entry.liked {
+                (0, 0)
+            } else {
+                match pin_rank(&entry.uri) {
+                    usize::MAX => (2, 0),
+                    rank => (1, rank),
+                }
             }
-        }
-    });
+        });
+    }
+    let liked_rows = entries.iter().take_while(|entry| entry.liked).count();
+    let pinned_rows = entries
+        .iter()
+        .filter(|entry| !entry.liked && pin_rank(&entry.uri) != usize::MAX)
+        .count();
     let playing_context = app.playing_context_uri();
     let current_page = app.page().clone();
 
@@ -408,15 +439,68 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     },
                 );
             }
+            let list_top = ui.cursor().top();
+            let pointer = ui
+                .ctx()
+                .pointer_latest_pos()
+                .filter(|pos| ui.clip_rect().contains(*pos));
+            let dragging_track = egui::DragAndDrop::payload::<TrackPayload>(ui.ctx())
+                .is_some_and(|payload| payload.belongs_to(app.drag_scope()));
+            let drop_target = dragging_track
+                .then_some(pointer)
+                .flatten()
+                .map(|pos| ((pos.y - list_top) / ROW_HEIGHT).floor())
+                .filter(|row| *row >= 0.0 && *row < entries.len() as f32)
+                .map(|row| row as usize)
+                .filter(|row| entries[*row].liked || entries[*row].editable);
+            let reordering =
+                egui::DragAndDrop::payload::<ContextPayload>(ui.ctx()).is_some_and(|payload| {
+                    payload.belongs_to(app.drag_scope())
+                        && filter.drag_kind() == Some(payload.kind())
+                });
+            let reorder_slot = reordering.then_some(pointer).flatten().map(|pos| {
+                (((pos.y - list_top) / ROW_HEIGHT).round().max(0.0) as usize)
+                    .clamp(liked_rows, entries.len())
+            });
             super::widgets::virtual_rows(ui, entries.len(), ROW_HEIGHT, |ui, index| {
                 let entry = &entries[index];
+                let droppable = entry.liked || entry.editable;
+                let drop_hover = drop_target == Some(index);
                 let active = entry.page == current_page;
                 let playing =
                     !entry.uri.is_empty() && playing_context.as_deref() == Some(entry.uri.as_str());
                 let pinned =
                     !entry.uri.is_empty() && app.settings.pinned_contexts.contains(&entry.uri);
-                let (rect, response) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+                let (rect, response) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), ROW_HEIGHT),
+                    Sense::click_and_drag(),
+                );
+                if !entry.liked
+                    && filter.drag_kind().is_some()
+                    && response.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(payload) = ContextPayload::new(
+                        entry.uri.clone(),
+                        entry.name.clone(),
+                        entry.image.clone(),
+                        app.drag_scope(),
+                    )
+                {
+                    egui::DragAndDrop::set_payload(ui.ctx(), payload);
+                }
+                let shift = ui.ctx().animate_value_with_time(
+                    ui.id().with(("drop-shift", index)),
+                    if let Some(slot) = reorder_slot {
+                        if index < slot { -4.0 } else { 4.0 }
+                    } else {
+                        match drop_target {
+                            Some(target) if index < target => -4.0,
+                            Some(target) if index > target => 4.0,
+                            _ => 0.0,
+                        }
+                    },
+                    0.12,
+                );
+                let rect = rect.translate(vec2(0.0, shift));
                 if ui.is_rect_visible(rect) {
                     if active {
                         ui.painter()
@@ -426,6 +510,19 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             rect,
                             CornerRadius::same(6),
                             palette.surface_hover.gamma_multiply(0.6),
+                        );
+                    }
+                    if drop_hover {
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(6),
+                            palette.accent.gamma_multiply(0.18),
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            CornerRadius::same(6),
+                            egui::Stroke::new(1.5, palette.accent),
+                            egui::StrokeKind::Inside,
                         );
                     }
                     let cover_rect = Rect::from_center_size(
@@ -535,6 +632,30 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             });
                         }
                     }
+                    if dragging_track && !droppable {
+                        ui.painter().rect_filled(
+                            rect,
+                            CornerRadius::same(6),
+                            palette.panel.gamma_multiply(0.5),
+                        );
+                    }
+                }
+                if dragging_track
+                    && droppable
+                    && let Some(track) = response.dnd_release_payload::<TrackPayload>()
+                {
+                    if entry.liked {
+                        if app.is_saved(track.uri()) != Some(true) {
+                            app.actions
+                                .push(Action::ToggleSaved(track.uri().to_owned()));
+                        }
+                    } else if let Page::Playlist(id) = &entry.page {
+                        app.actions.push(Action::AddToPlaylist {
+                            playlist_id: id.clone(),
+                            playlist_name: entry.name.clone(),
+                            uris: vec![track.uri().to_owned()],
+                        });
+                    }
                 }
                 if response.clicked() {
                     app.actions.push(Action::Open(entry.page.clone()));
@@ -578,7 +699,19 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                         .retain(|held| held != &entry.uri);
                                 } else {
                                     app.settings.pinned_contexts.push(entry.uri.clone());
+                                    app.settings.sidebar_order.retain(|held| held != &entry.uri);
                                 }
+                                app.mark_settings_dirty();
+                            }
+                            if custom_order
+                                && super::widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(Icon::Clock),
+                                    "Sort by recently played",
+                                )
+                            {
+                                app.settings.sidebar_order.clear();
                                 app.mark_settings_dirty();
                             }
                         });
@@ -599,10 +732,76 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 }
                 response.on_hover_cursor(egui::CursorIcon::PointingHand);
             });
+            if let Some(slot) = reorder_slot {
+                let y = list_top + slot as f32 * ROW_HEIGHT;
+                ui.painter().hline(
+                    ui.max_rect().x_range().shrink(6.0),
+                    y,
+                    egui::Stroke::new(2.0, palette.accent),
+                );
+                if ui.input(|input| input.pointer.any_released())
+                    && let Some(payload) =
+                        egui::DragAndDrop::take_payload::<ContextPayload>(ui.ctx())
+                    && payload.belongs_to(app.drag_scope())
+                    && filter.drag_kind() == Some(payload.kind())
+                {
+                    let visible: Vec<String> =
+                        entries.iter().map(|entry| entry.uri.clone()).collect();
+                    let changed = match filter {
+                        Filter::Playlists => {
+                            let full_order = full_playlist_order(app);
+                            drop_playlist_context(
+                                &mut app.settings.pinned_contexts,
+                                &mut app.settings.sidebar_order,
+                                &visible,
+                                &full_order,
+                                liked_rows,
+                                pinned_rows,
+                                slot,
+                                payload.uri(),
+                            )
+                        }
+                        Filter::Albums | Filter::Artists => drop_pinned_context(
+                            &mut app.settings.pinned_contexts,
+                            &visible,
+                            liked_rows,
+                            pinned_rows,
+                            slot,
+                            payload.uri(),
+                        ),
+                        Filter::Podcasts => false,
+                    };
+                    if changed {
+                        app.mark_settings_dirty();
+                    }
+                }
+            }
             if let Some(page) = more_page {
                 super::widgets::load_more_when_near_end(ui, app, page, true);
             }
         });
+}
+
+/// Every loaded playlist in the order the complete, unfiltered shelf uses.
+/// Pinned contexts are excluded because they live in their own list.
+fn full_playlist_order(app: &App) -> Vec<String> {
+    let Some(playlists) = app.library.playlists.get() else {
+        return Vec::new();
+    };
+    let uris: Vec<&str> = playlists
+        .iter()
+        .map(|playlist| playlist.uri.as_str())
+        .collect();
+    playlist_sidebar_indices(
+        &uris,
+        &app.recent_contexts,
+        &app.settings.pinned_contexts,
+        &app.settings.sidebar_order,
+    )
+    .into_iter()
+    .map(|index| playlists[index].uri.clone())
+    .filter(|uri| !app.settings.pinned_contexts.contains(uri))
+    .collect()
 }
 
 /// The purple-to-blue Liked Songs tile.

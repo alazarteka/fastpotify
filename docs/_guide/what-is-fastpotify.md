@@ -52,7 +52,8 @@ This is a young project, and it says so:
   Web API app is an optional third authorization. [How it connects](/how-it-connects/)
   explains why.
 - No video podcasts or social features.
-- Playlist reordering is a menu action, not drag-and-drop.
+- There is no external file drop or multi-song drag; music drags one Spotify
+  track or library context at a time.
 - Fastpotify is an **unofficial** client built on Spotify's public Web API
   and librespot. Spotify changes these from time to time; when they do,
   features can break until the client catches up.

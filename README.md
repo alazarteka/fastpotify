@@ -34,8 +34,9 @@ as one ordinary desktop application rather than a shell plugin.
 - **Artist pages** with popular songs, a filterable discography, and related
   artists. **Album**, **playlist**, and **podcast** pages with everything
   playable from any row.
-- **Playlists you own** can be created, renamed, described, reordered, and
-  edited: add from any row's menu, remove from the playlist page.
+- **Editable playlists** accept songs from a row menu or by dragging a song
+  onto them. Reorder an unfiltered playlist by dragging its rows; playlists
+  you own can also be created, renamed, described, and deleted.
 - **Queue** as a side panel or a page; add anything to it from a row menu.
 - **Album-art colour.** Pages and the player bar take a tint from the cover
   of what you are looking at or listening to. Turn it off in Settings.

@@ -113,6 +113,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui, compact: bool) {
             app,
             TrackRow {
                 index: 0,
+                playlist_index: None,
                 number: Some(1),
                 item: current,
                 context: &context,
@@ -157,6 +158,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui, compact: bool) {
             app,
             TrackRow {
                 index,
+                playlist_index: None,
                 number: Some(index + 1),
                 item: &items[index],
                 context: &context,

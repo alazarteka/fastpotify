@@ -98,6 +98,8 @@ One readable JSON file, written atomically. The interesting fields:
 | `lrclib_lyrics` | `false` | Ask LRCLIB when Spotify lyrics are unavailable |
 | `external_services_disclosed` | `false` | Records that the external-service choices were made after their disclosure was shown |
 | `web_client_id` | none | Optional personal Spotify app id used alongside the shared app |
+| `pinned_contexts` | `[]` | Context URIs pinned in sidebar order |
+| `sidebar_order` | `[]` | Custom unpinned playlist order; empty uses recently played |
 
 Both external-service options are off by default. Older settings written
 before the disclosure marker existed are migrated with both options off, even

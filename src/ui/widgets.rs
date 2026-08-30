@@ -460,6 +460,10 @@ pub fn context_menu_items(
 /// Describes one row of a track table.
 pub struct TrackRow<'a> {
     pub index: usize,
+    /// Authoritative server position when this row can be reordered in its
+    /// playlist. This is absent for transformed views and lists with
+    /// unrenderable source entries.
+    pub playlist_index: Option<usize>,
     pub number: Option<usize>,
     pub item: &'a PlayableItem,
     pub context: &'a RowContext,
@@ -536,12 +540,18 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     if !ui.is_rect_visible(rect) {
         return;
     }
+    #[cfg(test)]
+    ui.data_mut(|data| {
+        data.insert_temp(egui::Id::new(("track-row-test-rect", row.item.uri())), rect);
+    });
     if row.item.is_track() && response.drag_started_by(egui::PointerButton::Primary) {
         let origin = match row.context {
             RowContext::Context {
                 uri,
                 editable_playlist: Some((id, _)),
-            } => PlaylistOrigin::from_context(uri, id, row.index),
+            } => row
+                .playlist_index
+                .and_then(|index| PlaylistOrigin::from_context(uri, id, index)),
             _ => None,
         };
         if let Some(payload) = TrackPayload::new(
@@ -824,7 +834,7 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
         egui::Popup::menu(&more)
             .id(menu_id)
             .frame(menu_frame(&palette))
-            .show(|ui| item_menu(ui, app, row.item, Some(row.context), Some(row.index)));
+            .show(|ui| item_menu(ui, app, row.item, Some(row.context), row.playlist_index));
     }
 
     // Row interactions.
@@ -857,7 +867,12 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     }
     egui::Popup::context_menu(&response)
         .frame(menu_frame(&palette))
-        .show(|ui| item_menu(ui, app, row.item, Some(row.context), Some(row.index)));
+        .show(|ui| item_menu(ui, app, row.item, Some(row.context), row.playlist_index));
+}
+
+#[cfg(test)]
+pub(crate) fn track_row_rect(ctx: &egui::Context, uri: &str) -> Option<Rect> {
+    ctx.data(|data| data.get_temp(egui::Id::new(("track-row-test-rect", uri))))
 }
 
 /// The compact chip that follows a dragged track or library context.
