@@ -346,6 +346,7 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
                 added_by: added_by.as_deref(),
                 show_added_by: table.show_added_by,
                 compact: false,
+                shift: 0.0,
             },
         );
     });

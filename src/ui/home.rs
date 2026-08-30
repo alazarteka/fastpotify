@@ -359,6 +359,7 @@ fn track_list(
                 added_by: None,
                 show_added_by: false,
                 compact: false,
+                shift: 0.0,
             },
         );
     }

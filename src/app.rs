@@ -14,6 +14,7 @@ use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
     RemoteAction, Waker,
 };
+use crate::drag::{ContextPayload, Scope as DragScope, TrackPayload};
 use crate::media::{MediaCommand, MediaState, MediaTrack};
 use crate::media_controls::MediaService;
 use crate::model::*;
@@ -322,6 +323,8 @@ pub struct App {
     pub show_devices: bool,
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
+    /// Navigation/auth identity for any pointer payload currently in flight.
+    drag_scope: DragScope,
     volume_before_mute: Option<u8>,
     /// What was just asked to play, until Spotify visibly reacts: the keys
     /// (context and track URIs) whose play buttons show a spinner.
@@ -507,6 +510,7 @@ impl App {
             show_devices: false,
             toasts: Vec::new(),
             actions: Vec::new(),
+            drag_scope: DragScope::default(),
             volume_before_mute: None,
             pending_play_keys: Vec::new(),
             pending_play_at: None,
@@ -1028,7 +1032,10 @@ impl App {
                 Event::UserName { id, name } => {
                     self.user_names.insert(id, name);
                 }
-                Event::WebApp { client_id } => self.web_app = client_id,
+                Event::WebApp { client_id } => {
+                    self.invalidate_drag_scope();
+                    self.web_app = client_id;
+                }
                 Event::UpdateAvailable { version, url } => {
                     let notice = crate::updates::Release { version, url };
                     if self.update.as_ref() != Some(&notice) {
@@ -1115,6 +1122,7 @@ impl App {
     }
 
     fn reset_data(&mut self) {
+        self.invalidate_drag_scope();
         self.library = Library::default();
         self.home = HomeData::default();
         self.playlist_pages.clear();
@@ -2821,11 +2829,30 @@ impl App {
 
     // ---- navigation ------------------------------------------------------------
 
+    pub(crate) const fn drag_scope(&self) -> DragScope {
+        self.drag_scope
+    }
+
+    fn invalidate_drag_scope(&mut self) {
+        self.drag_scope = self.drag_scope.next();
+    }
+
+    fn clear_stale_drag_payload(&self, ctx: &egui::Context) {
+        let stale_track = egui::DragAndDrop::payload::<TrackPayload>(ctx)
+            .is_some_and(|payload| !payload.belongs_to(self.drag_scope));
+        let stale_context = egui::DragAndDrop::payload::<ContextPayload>(ctx)
+            .is_some_and(|payload| !payload.belongs_to(self.drag_scope));
+        if stale_track || stale_context {
+            egui::DragAndDrop::clear_payload(ctx);
+        }
+    }
+
     pub fn open(&mut self, page: Page) {
         if *self.page() == page {
             self.ensure_loaded(page);
             return;
         }
+        self.invalidate_drag_scope();
         self.history.truncate(self.history_index + 1);
         self.history.push(page.clone());
         if self.history.len() > 60 {
@@ -3607,6 +3634,7 @@ impl App {
             }
             Action::Back => {
                 if self.can_go_back() {
+                    self.invalidate_drag_scope();
                     self.history_index -= 1;
                     self.mark_session_dirty();
                     let page = self.page().clone();
@@ -3615,6 +3643,7 @@ impl App {
             }
             Action::Forward => {
                 if self.can_go_forward() {
+                    self.invalidate_drag_scope();
                     self.history_index += 1;
                     self.mark_session_dirty();
                     let page = self.page().clone();
@@ -3898,8 +3927,12 @@ impl App {
                 }
             }
             Action::Reload(page) => self.reload(page),
-            Action::SignIn => self.backend.send(Command::SignIn),
+            Action::SignIn => {
+                self.invalidate_drag_scope();
+                self.backend.send(Command::SignIn);
+            }
             Action::CancelSignIn => {
+                self.invalidate_drag_scope();
                 self.backend.send(Command::CancelSignIn);
                 self.sign_in_url = None;
                 self.auth = AuthStatus::SignedOut;
@@ -3909,11 +3942,13 @@ impl App {
                     self.toast_error(format!("Couldn't save settings: {error}"));
                     return;
                 }
+                self.invalidate_drag_scope();
                 self.backend.send(Command::ConfigurePersonalWebApp(
                     self.settings.web_client_id.clone(),
                 ));
             }
             Action::SignOut => {
+                self.invalidate_drag_scope();
                 self.backend.send(Command::SignOut);
                 self.history = vec![Page::Home];
                 self.history_index = 0;
@@ -4075,16 +4110,19 @@ impl App {
         self.handle_tray();
         self.tick(ctx);
         self.apply_actions(ctx);
+        self.clear_stale_drag_payload(ctx);
         self.sync_media_controls();
     }
 
     pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.clear_stale_drag_payload(ctx);
         self.apply_theme(ctx);
         self.lock_scroll_axis(ctx);
         crate::ui::show(self, ui);
         self.apply_actions(ctx);
+        self.clear_stale_drag_payload(ctx);
         self.sync_media_controls();
 
         let mut geometry_dirty = false;
@@ -4528,6 +4566,54 @@ mod tests {
     fn egui_pass(ctx: &egui::Context, run_ui: impl FnMut(&mut egui::Ui)) {
         let mut output = ctx.run_ui(Default::default(), run_ui);
         output.textures_delta.clear();
+    }
+
+    fn drag_track(app: &App) -> TrackPayload {
+        TrackPayload::new(
+            "spotify:track:held".into(),
+            "Held".into(),
+            None,
+            None,
+            app.drag_scope(),
+        )
+        .expect("valid drag track")
+    }
+
+    #[test]
+    fn navigation_and_auth_resets_retire_pointer_payloads() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        egui::DragAndDrop::set_payload(&ctx, drag_track(&app));
+        app.clear_stale_drag_payload(&ctx);
+        assert!(egui::DragAndDrop::has_payload_of_type::<TrackPayload>(&ctx));
+
+        app.open(Page::Search);
+        app.clear_stale_drag_payload(&ctx);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+
+        let context = ContextPayload::new(
+            "spotify:album:held".into(),
+            "Held album".into(),
+            None,
+            app.drag_scope(),
+        )
+        .expect("valid drag context");
+        egui::DragAndDrop::set_payload(&ctx, context);
+        app.reset_data();
+        app.clear_stale_drag_payload(&ctx);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+    }
+
+    #[test]
+    fn personal_session_reconfiguration_retires_pointer_payloads() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        egui::DragAndDrop::set_payload(&ctx, drag_track(&app));
+        app.actions.push(Action::ConfigurePersonalWebApp);
+        app.apply_actions(&ctx);
+        app.clear_stale_drag_payload(&ctx);
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
     }
 
     fn snapshot_at(percent: u8) -> LocalState {

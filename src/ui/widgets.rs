@@ -7,6 +7,7 @@ use egui::{
 
 use crate::api::models::*;
 use crate::app::App;
+use crate::drag::{ContextPayload, PlaylistOrigin, TrackPayload};
 use crate::model::{Action, Dialog, Page, RowContext};
 use crate::theme::{self, Icon, Palette};
 use crate::util;
@@ -469,6 +470,8 @@ pub struct TrackRow<'a> {
     pub added_by: Option<&'a str>,
     pub show_added_by: bool,
     pub compact: bool,
+    /// Vertical offset while a neighbouring row opens a drop slot.
+    pub shift: f32,
 }
 
 /// Column widths of the track table, computed from the available width.
@@ -528,9 +531,28 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
         theme::ROW_HEIGHT
     };
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, row_height), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, row_height), Sense::click_and_drag());
+    let rect = rect.translate(vec2(0.0, row.shift));
     if !ui.is_rect_visible(rect) {
         return;
+    }
+    if row.item.is_track() && response.drag_started_by(egui::PointerButton::Primary) {
+        let origin = match row.context {
+            RowContext::Context {
+                uri,
+                editable_playlist: Some((id, _)),
+            } => PlaylistOrigin::from_context(uri, id, row.index),
+            _ => None,
+        };
+        if let Some(payload) = TrackPayload::new(
+            row.item.uri().to_owned(),
+            row.item.name().to_owned(),
+            row.item.image(64).map(str::to_owned),
+            origin,
+            app.drag_scope(),
+        ) {
+            egui::DragAndDrop::set_payload(ui.ctx(), payload);
+        }
     }
     let now_playing = app.now_playing();
     let is_current = now_playing
@@ -836,6 +858,61 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) {
     egui::Popup::context_menu(&response)
         .frame(menu_frame(&palette))
         .show(|ui| item_menu(ui, app, row.item, Some(row.context), Some(row.index)));
+}
+
+/// The compact chip that follows a dragged track or library context.
+pub fn drag_ghost(ctx: &egui::Context, palette: &Palette) {
+    let chip = egui::DragAndDrop::payload::<TrackPayload>(ctx)
+        .map(|track| (track.title().to_owned(), track.image().map(str::to_owned)))
+        .or_else(|| {
+            egui::DragAndDrop::payload::<ContextPayload>(ctx)
+                .map(|entry| (entry.title().to_owned(), entry.image().map(str::to_owned)))
+        });
+    let Some((title, image)) = chip else {
+        return;
+    };
+    // egui keeps the payload through the release frame so a target can take
+    // it; the visual should stop with the pointer itself.
+    if !ctx.input(|input| input.pointer.any_down()) {
+        return;
+    }
+    let Some(pos) = ctx.pointer_latest_pos() else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("drag-ghost"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .fixed_pos(pos + vec2(16.0, 6.0))
+        .show(ctx, |ui| {
+            ui.set_opacity(0.9);
+            egui::Frame::new()
+                .fill(palette.overlay)
+                .stroke(Stroke::new(1.0, palette.outline))
+                .corner_radius(CornerRadius::same(theme::RADIUS))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 16,
+                    spread: 0,
+                    color: palette.shadow,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_max_width(280.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        cover(ui, palette, image.as_deref(), 24.0, 4.0, Icon::Music);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title)
+                                    .font(theme::medium(13.0))
+                                    .color(palette.text),
+                            )
+                            .truncate()
+                            .selectable(false),
+                        );
+                    });
+                });
+        });
 }
 
 pub fn explicit_badge(ui: &mut Ui, palette: &Palette) {

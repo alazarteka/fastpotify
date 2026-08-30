@@ -80,15 +80,107 @@ pub fn format_date(iso: &str) -> String {
     }
 }
 
-/// Tears the id out of `spotify:track:abc` and friends.
-pub fn uri_id(uri: &str) -> Option<&str> {
-    uri.rsplit(':').next().filter(|id| !id.is_empty())
+/// A bounded, public Spotify URI type accepted by Fastpotify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpotifyUriKind {
+    Track,
+    Album,
+    Playlist,
+    Artist,
+    Show,
+    Episode,
+    Audiobook,
 }
 
-pub fn uri_kind(uri: &str) -> Option<&str> {
-    let mut parts = uri.split(':');
-    parts.next()?;
-    parts.next()
+impl SpotifyUriKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Track => "track",
+            Self::Album => "album",
+            Self::Playlist => "playlist",
+            Self::Artist => "artist",
+            Self::Show => "show",
+            Self::Episode => "episode",
+            Self::Audiobook => "audiobook",
+        }
+    }
+
+    /// Types the local control protocol intentionally allows to start.
+    pub const fn is_music(self) -> bool {
+        matches!(
+            self,
+            Self::Track | Self::Album | Self::Playlist | Self::Artist
+        )
+    }
+
+    /// Music contexts that can be reordered in the library sidebar.
+    pub const fn is_sidebar_music(self) -> bool {
+        matches!(self, Self::Album | Self::Playlist | Self::Artist)
+    }
+}
+
+/// A parsed Spotify URI. The borrowed text is kept so callers do not need to
+/// split or rebuild identifiers independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpotifyUri<'a> {
+    raw: &'a str,
+    kind: SpotifyUriKind,
+    id: &'a str,
+}
+
+impl<'a> SpotifyUri<'a> {
+    pub const fn as_str(self) -> &'a str {
+        self.raw
+    }
+
+    pub const fn kind(self) -> SpotifyUriKind {
+        self.kind
+    }
+
+    pub const fn id(self) -> &'a str {
+        self.id
+    }
+}
+
+/// Parses the bounded three-part public URI shape used by API objects and
+/// external controls. Local tracks and user collection pseudo-URIs have
+/// different shapes and are deliberately not accepted as transferable items.
+pub fn spotify_uri(text: &str) -> Option<SpotifyUri<'_>> {
+    let mut parts = text.split(':');
+    if parts.next()? != "spotify" {
+        return None;
+    }
+    let kind = match parts.next()? {
+        "track" => SpotifyUriKind::Track,
+        "album" => SpotifyUriKind::Album,
+        "playlist" => SpotifyUriKind::Playlist,
+        "artist" => SpotifyUriKind::Artist,
+        "show" => SpotifyUriKind::Show,
+        "episode" => SpotifyUriKind::Episode,
+        "audiobook" => SpotifyUriKind::Audiobook,
+        _ => return None,
+    };
+    let id = parts.next()?;
+    let valid_id = !id.is_empty()
+        && parts.next().is_none()
+        && text.len() <= 128
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '%' | '+')
+        });
+    valid_id.then_some(SpotifyUri {
+        raw: text,
+        kind,
+        id,
+    })
+}
+
+/// Tears the id out of a validated `spotify:track:abc`-shaped URI.
+pub fn uri_id(uri: &str) -> Option<&str> {
+    spotify_uri(uri).map(SpotifyUri::id)
+}
+
+pub fn uri_kind(uri: &str) -> Option<&'static str> {
+    spotify_uri(uri).map(|uri| uri.kind().as_str())
 }
 
 pub fn open_spotify_url(uri: &str) -> Option<String> {
@@ -200,6 +292,36 @@ mod tests {
             open_spotify_url("spotify:album:z").as_deref(),
             Some("https://open.spotify.com/album/z")
         );
+    }
+
+    #[test]
+    fn spotify_uris_are_typed_and_strictly_bounded() {
+        let track = spotify_uri("spotify:track:aZ09-_.%+").expect("valid track");
+        assert_eq!(track.as_str(), "spotify:track:aZ09-_.%+");
+        assert_eq!(track.kind(), SpotifyUriKind::Track);
+        assert_eq!(track.id(), "aZ09-_.%+");
+        assert!(track.kind().is_music());
+        assert!(!SpotifyUriKind::Episode.is_music());
+        assert!(SpotifyUriKind::Album.is_sidebar_music());
+        assert!(!SpotifyUriKind::Show.is_sidebar_music());
+
+        for invalid in [
+            "",
+            "track:x",
+            "https:track:x",
+            "spotify:track:",
+            "spotify:unknown:x",
+            "spotify:track:x:extra",
+            "spotify:user:x:collection",
+            "spotify:track:has space",
+            "spotify:track:bad\u{9b}",
+            "spotify:track:café",
+        ] {
+            assert_eq!(spotify_uri(invalid), None, "accepted {invalid:?}");
+        }
+        let oversized = format!("spotify:track:{}", "x".repeat(120));
+        assert!(oversized.len() > 128);
+        assert_eq!(spotify_uri(&oversized), None);
     }
 
     #[test]

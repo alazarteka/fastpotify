@@ -619,20 +619,9 @@ fn authenticate<'a>(line: &'a str, expected: &str) -> Option<&'a str> {
 /// playback are not part of this protocol.
 #[cfg(any(test, not(target_os = "linux")))]
 fn spotify_music_uri(text: &str) -> Option<String> {
-    let mut parts = text.split(':');
-    let shaped = matches!(parts.next(), Some("spotify"))
-        && matches!(
-            parts.next(),
-            Some("track" | "album" | "playlist" | "artist")
-        );
-    let id = parts.next()?;
-    let valid_id = !id.is_empty()
-        && parts.next().is_none()
-        && text.len() <= 128
-        && id.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '%' | '+')
-        });
-    (shaped && valid_id).then(|| text.to_owned())
+    crate::util::spotify_uri(text)
+        .filter(|uri| uri.kind().is_music())
+        .map(|uri| uri.as_str().to_owned())
 }
 
 /// Spotify Connect device ids are opaque, bounded tokens supplied by the API.

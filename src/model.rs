@@ -71,15 +71,13 @@ impl Page {
 
     /// Opens whatever a Spotify URI points at.
     pub fn from_uri(uri: &str) -> Option<Self> {
-        let mut parts = uri.split(':');
-        let _ = parts.next()?;
-        let kind = parts.next()?;
-        let id = parts.next()?.to_string();
-        Some(match kind {
-            "playlist" => Page::Playlist(id),
-            "album" => Page::Album(id),
-            "artist" => Page::Artist(id),
-            "show" => Page::Show(id),
+        let uri = crate::util::spotify_uri(uri)?;
+        let id = uri.id().to_string();
+        Some(match uri.kind() {
+            crate::util::SpotifyUriKind::Playlist => Page::Playlist(id),
+            crate::util::SpotifyUriKind::Album => Page::Album(id),
+            crate::util::SpotifyUriKind::Artist => Page::Artist(id),
+            crate::util::SpotifyUriKind::Show => Page::Show(id),
             _ => return None,
         })
     }
